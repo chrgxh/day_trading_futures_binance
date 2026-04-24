@@ -1,4 +1,4 @@
-"""Trading strategies. Consume market data from utils.py; return trade signals."""
+"""Technical indicators and signal types."""
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,19 +16,15 @@ class Signal(Enum):
 
 @dataclass
 class TradeSignal:
-    """Encapsulates a strategy's output for a single evaluation cycle."""
+    """Output of a single strategy evaluation."""
     signal: Signal
     symbol: str
     reason: str
     suggested_quantity: Optional[Decimal] = None
 
 
-# ---------------------------------------------------------------------------
-# Moving-average crossover strategy
-# ---------------------------------------------------------------------------
-
 def moving_average_crossover(
-    klines: list[list],
+    candles: list[dict],
     symbol: str,
     fast_period: int = 9,
     slow_period: int = 21,
@@ -39,15 +35,15 @@ def moving_average_crossover(
     crosses below, and HOLD otherwise.
 
     Args:
-        klines: Raw kline data as returned by utils.get_klines().
-        symbol: Trading pair these klines belong to.
+        candles: OHLCV dicts as returned by market.get_ohlcv().
+        symbol: Trading pair these candles belong to.
         fast_period: Lookback window for the fast moving average.
         slow_period: Lookback window for the slow moving average.
 
     Returns:
         TradeSignal with BUY, SELL, or HOLD.
     """
-    closes = [Decimal(k[4]) for k in klines]  # index 4 = close price
+    closes = [c["close"] for c in candles]
 
     if len(closes) < slow_period + 1:
         logger.warning(

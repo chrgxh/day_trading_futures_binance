@@ -4,69 +4,78 @@ Context file for Claude Code. Read this before suggesting changes or generating 
 
 ## Project goal
 
-A day trading bot that places trades on Binance based on configurable strategies.
+A futures day trading bot that places trades on Binance Futures based on configurable strategies.
 
 ## Tech stack
 
 - **Language:** Python 3.11+
-- **Exchange API:** Binance (via the official `python-binance` client unless a reason arises to switch)
+- **Exchange API:** Binance Futures (via the official `python-binance` client)
 - **Logging:** loguru
 - **Runtime:** Docker (single container, `docker compose` for local dev)
-- **Config:** `.env` for secrets, a separate non-secret config file (e.g. `config.yaml`) for strategy parameters
+- **Config:** `.env` for secrets, `config.yaml` for strategy parameters
 
 ## File layout
 
 ```
 day-trading-bot/
-├── bot.py              # Entry point — the actual bot loop / orchestration
-├── strategies.py       # Trading strategies; consumes functions from utils
-├── utils.py            # Binance API wrapper (trades, stop-loss, balances, etc.)
-├── config.yaml         # Non-secret runtime config (symbols, thresholds, intervals)
-├── .env                # Secrets ONLY (API key, API secret) — never committed, never baked into image
-├── .env.example        # Template with placeholder values, safe to commit
-├── .gitignore          # Must exclude .env, logs/, __pycache__, .venv, etc.
-├── .dockerignore       # Must exclude .env, logs/, .git, .venv, __pycache__
+├── bot.py                   # Entry point — bot loop, orchestration, risk controls
+├── utils/
+│   ├── __init__.py
+│   ├── exchange.py          # Authenticated Binance actions (positions, orders, connection)
+│   ├── market.py            # Public market data (OHLCV, mark price)
+│   └── indicators.py        # Signal types and technical indicators (MA, etc.)
+├── config.yaml              # Non-secret runtime config (symbols, intervals, risk limits)
+├── .env                     # Secrets ONLY (API key, API secret) — never committed
+├── .env.example             # Placeholder template, safe to commit
+├── .gitignore
+├── .dockerignore
 ├── Dockerfile
-├── docker-compose.yml  # Mounts ./logs into the container
+├── docker-compose.yml       # Mounts ./logs into the container
 ├── requirements.txt
-├── logs/               # Log output; mounted as a volume, not in the image
-└── tests/              # Unit tests, especially for strategies
+├── logs/                    # Log output; mounted volume, not baked into image
+└── tests/
+    ├── test_exchange.py     # Unit tests for utils/exchange.py (mocked)
+    ├── test_market.py       # Unit tests for utils/market.py (mocked)
+    ├── test_indicators.py   # Unit tests for utils/indicators.py
+    └── test_integration.py  # Live testnet tests (requires credentials, -m integration)
 ```
 
 ## Hard rules
 
-1. **Secrets never leave `.env`.** Do not hardcode API keys anywhere. `.env` must be in both `.gitignore` and `.dockerignore`. The Docker image must not contain `.env` — secrets are passed in at runtime (via `env_file:` in `docker-compose.yml` or `-e` flags).
-2. **All Binance API calls go through `utils.py`.** `strategies.py` and `bot.py` must not import `binance` directly.
-3. **Every API action and every bot decision is logged via loguru** to both stdout and a file in `logs/`. That file must be on a mounted volume so logs survive container restarts.
-4. **The log file is not in the Docker image.** It's created at runtime in a mounted volume.
+1. **Secrets never leave `.env`.** Do not hardcode API keys anywhere. `.env` must be in both `.gitignore` and `.dockerignore`. Secrets are passed at runtime via `env_file:` in `docker-compose.yml`.
+2. **All Binance API calls go through `utils/exchange.py` or `utils/market.py`.** `bot.py` and `utils/indicators.py` must not import `binance` directly.
+3. **Futures only.** Use futures endpoints exclusively (`futures_*` methods on the client). No spot trading.
+4. **Every API action and every bot decision is logged via loguru** to both stdout and a file in `logs/`. Logs must survive container restarts via a mounted volume.
+5. **The log file is not in the Docker image.** It is created at runtime in the mounted volume.
 
-## Design decisions carried over from planning
+## Design decisions
 
-- **Testnet vs mainnet toggle.** Config-driven (e.g. `BINANCE_TESTNET=true` in `.env`). Default to testnet for safety.
-- **Dry-run mode.** A flag that makes the bot log what it *would* trade without actually calling the order endpoints. Useful during development.
-- **Risk controls live in `bot.py`**, wrapping the strategy layer: max position size, max daily loss, and a kill switch. Strategies decide intent; the bot enforces limits before anything reaches `utils.py`.
-- **Rate limiting and reconnection logic live in `utils.py`.** Retries with backoff are centralized so strategies don't each reinvent them.
-- **State persistence on crash.** On startup, re-query Binance for open orders/positions rather than trusting a local cache. Any local state (e.g. last-seen candle) goes in a small SQLite or JSON file under a mounted volume.
-- **Config separation.** Secrets in `.env`, strategy parameters (symbols, thresholds, intervals, risk limits) in `config.yaml`. Makes tweaking safe to commit.
-- **Tests.** `tests/` folder with unit tests for the strategy layer at minimum. Mock `utils.py` rather than hitting Binance.
+- **Testnet vs mainnet toggle.** `BINANCE_TESTNET=true` in `.env`. Default to testnet for safety.
+- **Dry-run mode.** `DRY_RUN=true` in `.env`. Bot logs intended trades without calling order endpoints.
+- **Risk controls live in `bot.py`** — max position size, max daily loss, kill switch. Indicators decide intent; `bot.py` enforces limits before anything reaches `utils/exchange.py`.
+- **Retry with backoff lives in `utils/exchange.py`** via `with_retry()`. Centralised so nothing else reinvents it.
+- **State persistence on crash.** On startup, re-query Binance for open positions rather than trusting a local cache.
+- **Config separation.** Secrets in `.env`, everything else (symbols, intervals, risk limits) in `config.yaml`.
 
 ## Execution boundaries
 
 - Claude must NOT run shell commands. Propose them in chat; the user runs them.
-- Claude must NOT run git commands (including `git add`, `git commit`, `git push`). The user handles all version control.
-- Claude may create, edit, and delete files in the project. The user reviews diffs and commits.
-- If a task requires running code (tests, installs, Docker builds), Claude should output the exact command for the user to run, then wait for results.
+- Claude must NOT run git commands. The user handles all version control.
+- Claude may create, edit, and delete files in the project.
+- If a task requires running code, Claude outputs the exact command and waits for results.
 
 ## Coding conventions
 
 - Type hints on all public functions.
-- Docstrings on anything in `utils.py` and `strategies.py`.
+- Docstrings on all public functions in `utils/`.
 - No `print()` — always loguru.
-- Keep `bot.py` thin: it orchestrates, it doesn't implement strategy logic or API calls.
+- Keep `bot.py` thin: orchestration only, no strategy logic or direct API calls.
 
 ## When generating code
 
-- If a new dependency is needed, add it to `requirements.txt` and explain why.
-- If a change touches Docker, update both `Dockerfile` and `docker-compose.yml` consistently.
-- If a change touches secrets handling, re-verify that `.gitignore` and `.dockerignore` still cover it.
+- New dependencies go in `requirements.txt` with an explanation.
+- Changes touching Docker must update both `Dockerfile` and `docker-compose.yml`.
+- Changes touching secrets handling must re-verify `.gitignore` and `.dockerignore` coverage.
 - Prefer editing existing files over creating new ones unless a new module clearly belongs.
+- Mock `utils/exchange.py` and `utils/market.py` in unit tests — never hit the real API.
+- **After every change, check whether `CLAUDE.md` and `README.md` need updating.** If the file layout, hard rules, design decisions, dependencies, configuration, or usage instructions are affected — update them as part of the same task, not as a follow-up.

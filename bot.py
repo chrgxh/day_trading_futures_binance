@@ -9,8 +9,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-import utils
-import strategies
+from utils import exchange, market, indicators
 
 
 # ---------------------------------------------------------------------------
@@ -60,19 +59,17 @@ class RiskGuard:
         self.kill_switch = kill_switch
         self.daily_loss: Decimal = Decimal("0")
 
-    def check(self, signal: strategies.TradeSignal, price: Decimal) -> bool:
+    def check(self, signal: indicators.TradeSignal, price: Decimal) -> bool:
         """Return True if the trade is permitted under current risk limits."""
         if self.kill_switch:
             logger.warning("Kill switch is active — all trades blocked.")
             return False
-
         if self.daily_loss >= self.max_daily_loss_usdt:
             logger.warning(
                 "Daily loss limit reached ({} / {}). Blocking trade.",
                 self.daily_loss, self.max_daily_loss_usdt,
             )
             return False
-
         return True
 
     def record_loss(self, amount_usdt: Decimal) -> None:
@@ -98,7 +95,7 @@ def run() -> None:
 
     logger.info("Bot starting. testnet={} dry_run={}", env["testnet"], env["dry_run"])
 
-    client = utils.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
+    client = exchange.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
 
     risk = RiskGuard(
         max_position_usdt=cfg["risk"]["max_position_size_usdt"],
@@ -113,24 +110,25 @@ def run() -> None:
     while True:
         for symbol in symbols:
             try:
-                klines = utils.get_klines(client, symbol, interval)
-                signal = strategies.moving_average_crossover(klines, symbol)
+                candles = market.get_ohlcv(client, symbol, interval)
+                signal = indicators.moving_average_crossover(candles, symbol)
 
                 logger.info("{} signal: {} — {}", symbol, signal.signal.value, signal.reason)
 
-                if signal.signal == strategies.Signal.HOLD:
+                if signal.signal == indicators.Signal.HOLD:
                     continue
 
-                price = utils.get_symbol_ticker(client, symbol)
+                price = market.get_symbol_ticker(client, symbol)
                 if not risk.check(signal, price):
                     continue
 
                 quantity = (risk.max_position_usdt / price).quantize(Decimal("0.00001"))
-
-                if signal.signal == strategies.Signal.BUY:
-                    utils.place_market_buy(client, symbol, quantity, dry_run=env["dry_run"])
-                elif signal.signal == strategies.Signal.SELL:
-                    utils.place_market_sell(client, symbol, quantity, dry_run=env["dry_run"])
+                logger.info(
+                    "[{}] {} {} qty={}",
+                    "DRY RUN" if env["dry_run"] else "LIVE",
+                    signal.signal.value, symbol, quantity,
+                )
+                # TODO: place futures order via exchange module
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
