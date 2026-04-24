@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
-from utils.exchange import check_connection, get_open_positions
+from utils.exchange import check_connection, get_futures_balance, get_open_positions
 
 
 def _mock_client() -> MagicMock:
@@ -51,6 +51,52 @@ class TestCheckConnection:
         client = _mock_client()
         client.futures_ping.side_effect = BinanceRequestException("network error")
         assert check_connection(client) is False
+
+
+# ---------------------------------------------------------------------------
+# get_futures_balance
+# ---------------------------------------------------------------------------
+
+class TestGetFuturesBalance:
+    def _make_balance(self, asset: str, balance: str, available: str = None, pnl: str = "0.0") -> dict:
+        return {
+            "asset": asset,
+            "balance": balance,
+            "availableBalance": available or balance,
+            "crossUnPnl": pnl,
+        }
+
+    def test_filters_zero_balance_assets(self):
+        client = _mock_client()
+        client.futures_account_balance.return_value = [
+            self._make_balance("USDT", "1000.0"),
+            self._make_balance("BTC", "0.0"),
+        ]
+        result = get_futures_balance(client)
+        assert len(result) == 1
+        assert result[0]["asset"] == "USDT"
+
+    def test_returns_expected_keys(self):
+        client = _mock_client()
+        client.futures_account_balance.return_value = [self._make_balance("USDT", "500.0")]
+        result = get_futures_balance(client)
+        assert set(result[0].keys()) == {"asset", "balance", "available", "unrealized_pnl"}
+
+    def test_values_are_decimal(self):
+        client = _mock_client()
+        client.futures_account_balance.return_value = [
+            self._make_balance("USDT", "1000.50", available="800.25", pnl="-12.5"),
+        ]
+        result = get_futures_balance(client)
+        assert result[0]["balance"] == Decimal("1000.50")
+        assert result[0]["available"] == Decimal("800.25")
+        assert result[0]["unrealized_pnl"] == Decimal("-12.5")
+
+    def test_raises_on_api_exception(self):
+        client = _mock_client()
+        client.futures_account_balance.side_effect = _api_exc(code=-2015, status=401)
+        with pytest.raises(BinanceAPIException):
+            get_futures_balance(client)
 
 
 # ---------------------------------------------------------------------------

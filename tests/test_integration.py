@@ -12,6 +12,7 @@ import pytest
 from dotenv import load_dotenv
 
 from utils import exchange, market
+from utils.exchange import get_futures_balance
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -60,6 +61,18 @@ def test_ohlcv_with_start_str(client):
     candles = market.get_ohlcv(client, "BTCUSDT", "1d", limit=5, start_str="1 Jan 2024")
     assert len(candles) > 0
     assert candles[0]["close"] > 0
+
+
+def test_futures_balance_returns_list(client):
+    balances = get_futures_balance(client)
+    assert isinstance(balances, list)
+
+
+def test_futures_balance_structure(client):
+    balances = get_futures_balance(client)
+    for b in balances:
+        assert set(b.keys()) == {"asset", "balance", "available", "unrealized_pnl"}
+        assert b["balance"] > 0
 
 
 def test_open_positions_returns_list(client):

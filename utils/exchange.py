@@ -44,6 +44,35 @@ def check_connection(client: Client) -> bool:
         return False
 
 
+def get_futures_balance(client: Client) -> list[dict]:
+    """Return futures wallet balances for all assets with a non-zero balance.
+
+    Args:
+        client: Authenticated Binance client.
+
+    Returns:
+        List of dicts with keys: asset, balance, available, unrealized_pnl (all Decimal).
+    """
+    try:
+        raw = client.futures_account_balance()
+        balances = []
+        for b in raw:
+            balance = Decimal(b["balance"])
+            if balance == 0:
+                continue
+            balances.append({
+                "asset": b["asset"],
+                "balance": balance,
+                "available": Decimal(b["availableBalance"]),
+                "unrealized_pnl": Decimal(b["crossUnPnl"]),
+            })
+        logger.info("Futures balances: {} assets", len(balances))
+        return balances
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_futures_balance failed: {}", exc)
+        raise
+
+
 def get_open_positions(client: Client, symbol: Optional[str] = None) -> list[dict]:
     """Return all open futures positions (non-zero positionAmt).
 
