@@ -1,12 +1,35 @@
 """Public market data — no authentication required."""
 
+import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-from binance.helpers import date_to_milliseconds
+from dateutil import parser as dateutil_parser
 from loguru import logger
+
+
+def _to_ms(date_str: str) -> int:
+    """Convert a date string to milliseconds since UTC epoch.
+
+    Supports ISO dates ("1 Jan 2024", "2024-01-01") and relative strings
+    ("2 hours ago UTC", "1 day ago UTC").
+    """
+    match = re.match(r"(\d+)\s+(minute|hour|day|week)s?\s+ago", date_str, re.IGNORECASE)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        delta = {"minute": timedelta(minutes=amount), "hour": timedelta(hours=amount),
+                 "day": timedelta(days=amount), "week": timedelta(weeks=amount)}[unit]
+        dt = datetime.now(timezone.utc) - delta
+    else:
+        dt = dateutil_parser.parse(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return int((dt - epoch).total_seconds() * 1000)
 
 
 def get_futures_ohlcv(
@@ -34,9 +57,9 @@ def get_futures_ohlcv(
     try:
         kwargs: dict = {"symbol": symbol, "interval": interval, "limit": limit}
         if start_str is not None:
-            kwargs["startTime"] = date_to_milliseconds(start_str)
+            kwargs["startTime"] = _to_ms(start_str)
         if end_str is not None:
-            kwargs["endTime"] = date_to_milliseconds(end_str)
+            kwargs["endTime"] = _to_ms(end_str)
         raw = client.futures_klines(**kwargs)
         candles = [
             {
