@@ -10,3 +10,5 @@ build/
 .pytest_cache/
 *.db
 *.sqlite
+*.ipynb
+.ipynb_checkpoints/
