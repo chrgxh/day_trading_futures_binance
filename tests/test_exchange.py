@@ -37,19 +37,19 @@ def _make_futures_position(symbol: str, amt: str, entry: str = "45000.0") -> dic
 class TestCheckConnection:
     def test_returns_true_on_success(self):
         client = _mock_client()
-        client.get_server_time.return_value = {"serverTime": 1700000000000}
+        client.futures_time.return_value = {"serverTime": 1700000000000}
         assert check_connection(client) is True
-        client.ping.assert_called_once()
-        client.get_server_time.assert_called_once()
+        client.futures_ping.assert_called_once()
+        client.futures_time.assert_called_once()
 
     def test_returns_false_on_api_exception(self):
         client = _mock_client()
-        client.ping.side_effect = _api_exc()
+        client.futures_ping.side_effect = _api_exc()
         assert check_connection(client) is False
 
     def test_returns_false_on_request_exception(self):
         client = _mock_client()
-        client.ping.side_effect = BinanceRequestException("network error")
+        client.futures_ping.side_effect = BinanceRequestException("network error")
         assert check_connection(client) is False
 
 

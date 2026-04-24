@@ -37,7 +37,7 @@ def get_ohlcv(
             kwargs["startTime"] = date_to_milliseconds(start_str)
         if end_str is not None:
             kwargs["endTime"] = date_to_milliseconds(end_str)
-        raw = client.get_klines(**kwargs)
+        raw = client.futures_klines(**kwargs)
         candles = [
             {
                 "open_time": row[0],

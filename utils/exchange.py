@@ -35,12 +35,12 @@ def check_connection(client: Client) -> bool:
         True on success, False on any API or network error.
     """
     try:
-        client.ping()
-        ts = client.get_server_time()
-        logger.info("Binance connection OK — server time: {}", ts["serverTime"])
+        client.futures_ping()
+        ts = client.futures_time()
+        logger.info("Binance Futures connection OK — server time: {}", ts["serverTime"])
         return True
     except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("Binance connection check failed: {}", exc)
+        logger.error("Binance Futures connection check failed: {}", exc)
         return False
 
 
