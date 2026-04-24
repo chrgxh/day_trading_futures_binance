@@ -9,7 +9,7 @@ from binance.helpers import date_to_milliseconds
 from loguru import logger
 
 
-def get_ohlcv(
+def get_futures_ohlcv(
     client: Client,
     symbol: str,
     interval: str,
@@ -57,7 +57,7 @@ def get_ohlcv(
         raise
 
 
-def get_symbol_ticker(client: Client, symbol: str) -> Decimal:
+def get_futures_mark_price(client: Client, symbol: str) -> Decimal:
     """Return the latest futures mark price for a symbol.
 
     Args:

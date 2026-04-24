@@ -25,7 +25,7 @@ def build_client(api_key: str, api_secret: str, testnet: bool = True) -> Client:
     return client
 
 
-def check_connection(client: Client) -> bool:
+def check_futures_connection(client: Client) -> bool:
     """Ping Binance and log the server time. Returns True if reachable.
 
     Args:
@@ -73,7 +73,7 @@ def get_futures_balance(client: Client) -> list[dict]:
         raise
 
 
-def get_open_positions(client: Client, symbol: Optional[str] = None) -> list[dict]:
+def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[dict]:
     """Return all open futures positions (non-zero positionAmt).
 
     Args:

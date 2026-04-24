@@ -30,23 +30,23 @@ def client():
 pytestmark = pytest.mark.integration
 
 
-def test_connection(client):
-    assert exchange.check_connection(client) is True
+def test_futures_connection(client):
+    assert exchange.check_futures_connection(client) is True
 
 
-def test_btcusdt_price_is_positive(client):
-    price = market.get_symbol_ticker(client, "BTCUSDT")
+def test_futures_mark_price_is_positive(client):
+    price = market.get_futures_mark_price(client, "BTCUSDT")
     assert isinstance(price, Decimal)
     assert price > 0
 
 
-def test_ohlcv_btcusdt_returns_correct_count(client):
-    candles = market.get_ohlcv(client, "BTCUSDT", "1h", limit=10)
+def test_futures_ohlcv_returns_correct_count(client):
+    candles = market.get_futures_ohlcv(client, "BTCUSDT", "1h", limit=10)
     assert len(candles) == 10
 
 
-def test_ohlcv_candle_structure_is_valid(client):
-    candles = market.get_ohlcv(client, "BTCUSDT", "1h", limit=1)
+def test_futures_ohlcv_candle_structure_is_valid(client):
+    candles = market.get_futures_ohlcv(client, "BTCUSDT", "1h", limit=1)
     c = candles[0]
     assert c["high"] >= c["low"]
     assert c["high"] >= c["open"]
@@ -57,8 +57,8 @@ def test_ohlcv_candle_structure_is_valid(client):
     assert c["close_time"] > c["open_time"]
 
 
-def test_ohlcv_with_start_str(client):
-    candles = market.get_ohlcv(client, "BTCUSDT", "1d", limit=5, start_str="1 Jan 2024")
+def test_futures_ohlcv_with_start_str(client):
+    candles = market.get_futures_ohlcv(client, "BTCUSDT", "1d", limit=5, start_str="1 Jan 2024")
     assert len(candles) > 0
     assert candles[0]["close"] > 0
 
@@ -75,13 +75,13 @@ def test_futures_balance_structure(client):
         assert b["balance"] > 0
 
 
-def test_open_positions_returns_list(client):
-    positions = exchange.get_open_positions(client)
+def test_futures_positions_returns_list(client):
+    positions = exchange.get_futures_positions(client)
     assert isinstance(positions, list)
 
 
-def test_open_positions_structure(client):
-    positions = exchange.get_open_positions(client)
+def test_futures_positions_structure(client):
+    positions = exchange.get_futures_positions(client)
     for p in positions:
         assert p["side"] in ("LONG", "SHORT")
         assert p["amount"] != 0

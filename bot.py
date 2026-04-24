@@ -110,7 +110,7 @@ def run() -> None:
     while True:
         for symbol in symbols:
             try:
-                candles = market.get_ohlcv(client, symbol, interval)
+                candles = market.get_futures_ohlcv(client, symbol, interval)
                 signal = indicators.moving_average_crossover(candles, symbol)
 
                 logger.info("{} signal: {} — {}", symbol, signal.signal.value, signal.reason)
@@ -118,7 +118,7 @@ def run() -> None:
                 if signal.signal == indicators.Signal.HOLD:
                     continue
 
-                price = market.get_symbol_ticker(client, symbol)
+                price = market.get_futures_mark_price(client, symbol)
                 if not risk.check(signal, price):
                     continue
 
