@@ -6,6 +6,7 @@ from typing import Optional
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
+from binance.helpers import date_to_milliseconds
 from loguru import logger
 
 
@@ -26,44 +27,96 @@ def build_client(api_key: str, api_secret: str, testnet: bool = True) -> Client:
 
 
 # ---------------------------------------------------------------------------
+# Connectivity
+# ---------------------------------------------------------------------------
+
+def check_connection(client: Client) -> bool:
+    """Ping Binance and log the server time. Returns True if reachable.
+
+    Args:
+        client: Authenticated Binance client.
+
+    Returns:
+        True on success, False on any API or network error.
+    """
+    try:
+        client.ping()
+        ts = client.get_server_time()
+        logger.info("Binance connection OK — server time: {}", ts["serverTime"])
+        return True
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("Binance connection check failed: {}", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Market data
 # ---------------------------------------------------------------------------
 
-def get_klines(client: Client, symbol: str, interval: str, limit: int = 100) -> list[list]:
-    """Fetch candlestick (kline) data for a symbol.
+def get_ohlcv(
+    client: Client,
+    symbol: str,
+    interval: str,
+    limit: int = 100,
+    start_str: Optional[str] = None,
+    end_str: Optional[str] = None,
+) -> list[dict]:
+    """Fetch OHLCV candle data as a list of named dicts.
 
     Args:
         client: Authenticated Binance client.
         symbol: Trading pair, e.g. "BTCUSDT".
-        interval: Kline interval string, e.g. "1m", "5m", "1h".
-        limit: Number of candles to return (max 1000).
+        interval: Kline interval, e.g. "1m", "5m", "1h", "1d".
+        limit: Max candles to return (1–1000). Ignored when start_str is set
+            and the date range contains more candles than the limit.
+        start_str: Optional start time parseable by Binance helpers, e.g.
+            "1 Jan 2024", "2024-01-01", "2 hours ago UTC".
+        end_str: Optional end time in the same format as start_str.
 
     Returns:
-        List of kline lists as returned by the Binance API.
+        List of dicts with keys: open_time, open, high, low, close, volume,
+        close_time. Prices and volume are Decimal.
     """
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        logger.debug("Fetched {} klines for {} @ {}", len(klines), symbol, interval)
-        return klines
+        kwargs: dict = {"symbol": symbol, "interval": interval, "limit": limit}
+        if start_str is not None:
+            kwargs["startTime"] = date_to_milliseconds(start_str)
+        if end_str is not None:
+            kwargs["endTime"] = date_to_milliseconds(end_str)
+        raw = client.get_klines(**kwargs)
+        candles = [
+            {
+                "open_time": row[0],
+                "open": Decimal(row[1]),
+                "high": Decimal(row[2]),
+                "low": Decimal(row[3]),
+                "close": Decimal(row[4]),
+                "volume": Decimal(row[5]),
+                "close_time": row[6],
+            }
+            for row in raw
+        ]
+        logger.debug("Fetched {} OHLCV candles for {} @ {}", len(candles), symbol, interval)
+        return candles
     except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("get_klines failed for {}: {}", symbol, exc)
+        logger.error("get_ohlcv failed for {}: {}", symbol, exc)
         raise
 
 
 def get_symbol_ticker(client: Client, symbol: str) -> Decimal:
-    """Return the latest price for a symbol as a Decimal.
+    """Return the latest futures mark price for a symbol as a Decimal.
 
     Args:
         client: Authenticated Binance client.
         symbol: Trading pair, e.g. "BTCUSDT".
 
     Returns:
-        Current price as Decimal.
+        Current mark price as Decimal.
     """
     try:
-        ticker = client.get_symbol_ticker(symbol=symbol)
-        price = Decimal(ticker["price"])
-        logger.debug("Ticker {} = {}", symbol, price)
+        ticker = client.futures_mark_price(symbol=symbol)
+        price = Decimal(ticker["markPrice"])
+        logger.debug("Futures mark price {} = {}", symbol, price)
         return price
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_symbol_ticker failed for {}: {}", symbol, exc)
@@ -71,153 +124,43 @@ def get_symbol_ticker(client: Client, symbol: str) -> Decimal:
 
 
 # ---------------------------------------------------------------------------
-# Account / balances
+# Account / positions
 # ---------------------------------------------------------------------------
 
-def get_asset_balance(client: Client, asset: str) -> Decimal:
-    """Return the free (available) balance for an asset.
+def get_open_positions(client: Client, symbol: Optional[str] = None) -> list[dict]:
+    """Return all open futures positions (non-zero positionAmt).
 
     Args:
         client: Authenticated Binance client.
-        asset: Asset ticker, e.g. "USDT", "BTC".
+        symbol: Optional trading pair to filter by, e.g. "BTCUSDT". If None,
+            returns all symbols with an open position.
 
     Returns:
-        Free balance as Decimal.
+        List of dicts with keys: symbol, side (LONG/SHORT), amount, entry_price,
+        mark_price, unrealized_pnl, leverage, liquidation_price (all prices Decimal).
     """
     try:
-        balance = client.get_asset_balance(asset=asset)
-        free = Decimal(balance["free"])
-        logger.debug("Balance {} free = {}", asset, free)
-        return free
+        kwargs = {"symbol": symbol} if symbol else {}
+        raw = client.futures_position_information(**kwargs)
+        positions = []
+        for p in raw:
+            amt = Decimal(p["positionAmt"])
+            if amt == 0:
+                continue
+            positions.append({
+                "symbol": p["symbol"],
+                "side": "LONG" if amt > 0 else "SHORT",
+                "amount": amt,
+                "entry_price": Decimal(p["entryPrice"]),
+                "mark_price": Decimal(p["markPrice"]),
+                "unrealized_pnl": Decimal(p["unRealizedProfit"]),
+                "leverage": int(p["leverage"]),
+                "liquidation_price": Decimal(p["liquidationPrice"]),
+            })
+        logger.info("Open futures positions: {}", len(positions))
+        return positions
     except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("get_asset_balance failed for {}: {}", asset, exc)
-        raise
-
-
-def get_open_orders(client: Client, symbol: str) -> list[dict]:
-    """Return all open orders for a symbol.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-
-    Returns:
-        List of open order dicts.
-    """
-    try:
-        orders = client.get_open_orders(symbol=symbol)
-        logger.debug("Open orders for {}: {}", symbol, len(orders))
-        return orders
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("get_open_orders failed for {}: {}", symbol, exc)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Order placement
-# ---------------------------------------------------------------------------
-
-def place_market_buy(
-    client: Client,
-    symbol: str,
-    quantity: Decimal,
-    dry_run: bool = True,
-) -> Optional[dict]:
-    """Place a market buy order.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-        quantity: Quantity to buy (in base asset units).
-        dry_run: If True, logs the order but does not submit it.
-
-    Returns:
-        Order response dict, or None in dry-run mode.
-    """
-    if dry_run:
-        logger.info("[DRY RUN] market BUY {} qty={}", symbol, quantity)
-        return None
-    try:
-        order = client.order_market_buy(symbol=symbol, quantity=str(quantity))
-        logger.info("Market BUY placed: {} qty={} orderId={}", symbol, quantity, order["orderId"])
-        return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_market_buy failed for {} qty={}: {}", symbol, quantity, exc)
-        raise
-
-
-def place_market_sell(
-    client: Client,
-    symbol: str,
-    quantity: Decimal,
-    dry_run: bool = True,
-) -> Optional[dict]:
-    """Place a market sell order.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-        quantity: Quantity to sell (in base asset units).
-        dry_run: If True, logs the order but does not submit it.
-
-    Returns:
-        Order response dict, or None in dry-run mode.
-    """
-    if dry_run:
-        logger.info("[DRY RUN] market SELL {} qty={}", symbol, quantity)
-        return None
-    try:
-        order = client.order_market_sell(symbol=symbol, quantity=str(quantity))
-        logger.info("Market SELL placed: {} qty={} orderId={}", symbol, quantity, order["orderId"])
-        return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_market_sell failed for {} qty={}: {}", symbol, quantity, exc)
-        raise
-
-
-def place_stop_loss(
-    client: Client,
-    symbol: str,
-    quantity: Decimal,
-    stop_price: Decimal,
-    dry_run: bool = True,
-) -> Optional[dict]:
-    """Place a stop-loss (STOP_LOSS_LIMIT) sell order.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-        quantity: Quantity to sell on trigger.
-        stop_price: Price at which the stop triggers.
-        dry_run: If True, logs but does not submit.
-
-    Returns:
-        Order response dict, or None in dry-run mode.
-    """
-    limit_price = stop_price * Decimal("0.999")  # 0.1% slippage buffer
-    if dry_run:
-        logger.info(
-            "[DRY RUN] STOP_LOSS_LIMIT SELL {} qty={} stop={} limit={}",
-            symbol, quantity, stop_price, limit_price,
-        )
-        return None
-    try:
-        order = client.create_order(
-            symbol=symbol,
-            side=Client.SIDE_SELL,
-            type=Client.ORDER_TYPE_STOP_LOSS_LIMIT,
-            timeInForce=Client.TIME_IN_FORCE_GTC,
-            quantity=str(quantity),
-            stopPrice=str(stop_price),
-            price=str(limit_price),
-        )
-        logger.info(
-            "Stop-loss placed: {} qty={} stop={} orderId={}",
-            symbol, quantity, stop_price, order["orderId"],
-        )
-        return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_stop_loss failed for {}: {}", symbol, exc)
+        logger.error("get_open_positions failed: {}", exc)
         raise
 
 
