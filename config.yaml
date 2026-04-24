@@ -1,0 +1,17 @@
+trading:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  interval: "1m"
+  loop_interval_seconds: 60
+
+risk:
+  max_position_size_usdt: 100.0
+  max_daily_loss_usdt: 50.0
+  kill_switch: false
+
+logging:
+  level: INFO
+  log_file: logs/bot.log
+  rotation: "10 MB"
+  retention: "7 days"
