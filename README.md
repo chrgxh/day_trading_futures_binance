@@ -5,20 +5,27 @@ Automated futures trading bot for Binance. Evaluates technical indicators on a c
 ## Structure
 
 ```
-bot.py              — main loop, risk controls (RiskGuard)
+bot.py                   — main loop, orchestration, risk controls
 utils/
-  exchange.py       — authenticated actions: positions, orders, connection
-  market.py         — public data: OHLCV candles, mark price
-  indicators.py     — signal types (Signal, TradeSignal) and indicators (MA crossover)
-config.yaml         — symbols, interval, risk limits (safe to commit)
-.env                — API keys and runtime flags (never commit)
-tests/              — unit tests (mocked) + integration tests (testnet)
-logs/               — runtime log output, mounted volume
+  general.py             — shared primitives: build_client, with_retry, order normalizers
+  account.py             — account state: connection, balances, positions, symbol info, leverage
+  orders.py              — regular orders: market, limit, get_open_orders, cancel, cancel_all
+  algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
+  positions.py           — position management: close_position
+  market.py              — public data: OHLCV candles, mark price
+  indicators.py          — signal types (Signal, TradeSignal) and indicators (MA crossover)
+config.yaml              — symbols, interval, risk limits (safe to commit)
+.env                     — mainnet API keys and runtime flags (never commit)
+.env.testnet             — testnet API keys for integration tests (never commit)
+tests/
+  integration/           — testnet integration tests, one file per module
+logs/                    — runtime log output, mounted volume
+sandbox.ipynb            — manual testnet notebook for ad-hoc scenario testing
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your testnet credentials:
+Copy `.env.example` to `.env` and fill in your credentials:
 
 ```
 BINANCE_API_KEY=
@@ -26,6 +33,8 @@ BINANCE_API_SECRET=
 BINANCE_TESTNET=true   # set to false for mainnet
 DRY_RUN=true           # set to false to place real orders
 ```
+
+For integration tests, copy `.env.testnet.example` to `.env.testnet` and fill in your testnet credentials.
 
 Strategy parameters (symbols, interval, risk limits) live in `config.yaml`.
 
@@ -43,15 +52,21 @@ docker compose up --build
 
 ## Testing
 
-Unit tests (no network required):
+Integration tests run against the live Binance testnet and require `.env.testnet`:
+
 ```bash
-pytest tests/test_exchange.py tests/test_market.py tests/test_indicators.py -v
+pytest -m integration
 ```
 
-Live testnet integration tests:
+Run a specific module's tests:
+
 ```bash
-pytest tests/test_integration.py -v -m integration
+pytest tests/integration/test_orders.py -m integration -v
+pytest tests/integration/test_algo_orders.py -m integration -v
+pytest tests/integration/test_positions.py -m integration -v
 ```
+
+Plain `pytest` (no `-m integration`) skips all integration tests.
 
 ## Safety defaults
 
