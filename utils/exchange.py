@@ -31,6 +31,7 @@ def _normalize_algo_order(raw: dict) -> dict:
     The creation response is minimal (algoId, code, msg only). Placement functions
     enrich it with the original params before calling this so all fields are present.
     Query responses (get_open_orders) include the full set of fields.
+    Algo orders use WORKING instead of NEW for active status.
     """
     return {
         "order_id": raw["algoId"],
@@ -121,6 +122,7 @@ def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[
     Returns:
         List of dicts with keys: symbol, side (LONG/SHORT), amount, entry_price,
         mark_price, unrealized_pnl, leverage, liquidation_price (all prices Decimal).
+        leverage and liquidation_price may be None depending on the API response version.
     """
     try:
         kwargs = {"symbol": symbol} if symbol else {}
@@ -143,7 +145,7 @@ def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[
         logger.info("Open futures positions: {}", len(positions))
         return positions
     except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("get_open_positions failed: {}", exc)
+        logger.error("get_futures_positions failed: {}", exc)
         raise
 
 
@@ -197,8 +199,8 @@ def get_symbol_info(client: Client, symbol: str) -> dict:
         lot_size = filters.get("LOT_SIZE", {})
         min_notional = filters.get("MIN_NOTIONAL", {})
 
-        tick_size = Decimal(price_filter.get("tickSize", "0"))
-        step_size = Decimal(lot_size.get("stepSize", "0"))
+        tick_size = Decimal(price_filter.get("tickSize", "0")).normalize()
+        step_size = Decimal(lot_size.get("stepSize", "0")).normalize()
 
         result = {
             "symbol": symbol,
@@ -296,8 +298,6 @@ def place_stop_market_order(
     side: str,
     quantity: Decimal,
     stop_price: Decimal,
-    reduce_only: bool = True,
-    position_side: Optional[str] = None,
 ) -> dict:
     """Place a stop-market order (triggers a market fill when stop_price is hit).
 
@@ -310,11 +310,9 @@ def place_stop_market_order(
         side: "BUY" or "SELL" — typically opposite to the open position side.
         quantity: Order quantity in base asset units.
         stop_price: Price that triggers the order.
-        reduce_only: One-way Mode only — if True, order can only reduce an existing position.
-        position_side: Hedge Mode only — "LONG" or "SHORT". When set, reduce_only is ignored.
 
     Returns:
-        Normalised order dict (see _normalize_algo_order).
+        Normalised order dict (see _normalize_algo_order). status will be "WORKING".
     """
     try:
         params: dict = dict(
@@ -324,11 +322,8 @@ def place_stop_market_order(
             algoType="CONDITIONAL",
             quantity=str(quantity),
             triggerPrice=str(stop_price),
+            reduceOnly=True,
         )
-        if position_side is not None:
-            params["positionSide"] = position_side
-        else:
-            params["reduceOnly"] = reduce_only
         raw = with_retry(lambda: client.futures_create_algo_order(**params))
         order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
         logger.info("Stop-market order placed: {} {} {} @ stop {} | id={} status={}", side, quantity, symbol, stop_price, order["order_id"], order["status"])
@@ -344,8 +339,6 @@ def place_take_profit_market_order(
     side: str,
     quantity: Decimal,
     stop_price: Decimal,
-    reduce_only: bool = True,
-    position_side: Optional[str] = None,
 ) -> dict:
     """Place a take-profit market order (triggers a market fill when stop_price is hit).
 
@@ -358,11 +351,9 @@ def place_take_profit_market_order(
         side: "BUY" or "SELL" — typically opposite to the open position side.
         quantity: Order quantity in base asset units.
         stop_price: Price that triggers the take-profit.
-        reduce_only: One-way Mode only — if True, order can only reduce an existing position.
-        position_side: Hedge Mode only — "LONG" or "SHORT". When set, reduce_only is ignored.
 
     Returns:
-        Normalised order dict (see _normalize_algo_order).
+        Normalised order dict (see _normalize_algo_order). status will be "WORKING".
     """
     try:
         params: dict = dict(
@@ -372,11 +363,8 @@ def place_take_profit_market_order(
             algoType="CONDITIONAL",
             quantity=str(quantity),
             triggerPrice=str(stop_price),
+            reduceOnly=True,
         )
-        if position_side is not None:
-            params["positionSide"] = position_side
-        else:
-            params["reduceOnly"] = reduce_only
         raw = with_retry(lambda: client.futures_create_algo_order(**params))
         order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
         logger.info("Take-profit order placed: {} {} {} @ stop {} | id={} status={}", side, quantity, symbol, stop_price, order["order_id"], order["status"])
@@ -386,93 +374,12 @@ def place_take_profit_market_order(
         raise
 
 
-def place_stop_limit_order(
-    client: Client,
-    symbol: str,
-    side: str,
-    quantity: Decimal,
-    stop_price: Decimal,
-    limit_price: Decimal,
-    reduce_only: bool = True,
-) -> dict:
-    """Place a stop-limit order (triggers a limit order when stop_price is hit).
-
-    Prefer place_stop_market_order — a limit order risks not filling if price gaps
-    through the limit. Uses the Algo Order API like all conditional order types.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-        side: "BUY" or "SELL" — typically opposite to the open position side.
-        quantity: Order quantity in base asset units.
-        stop_price: Price that triggers the order.
-        limit_price: Limit price after trigger (set below stop for SELL, above for BUY).
-        reduce_only: If True, the order can only reduce an existing position.
-
-    Returns:
-        Normalised order dict (see _normalize_algo_order).
-    """
-    try:
-        params = dict(
-            symbol=symbol, side=side, type="STOP", algoType="CONDITIONAL",
-            quantity=str(quantity), triggerPrice=str(stop_price), price=str(limit_price),
-            reduceOnly=reduce_only,
-        )
-        raw = with_retry(lambda: client.futures_create_algo_order(**params))
-        order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
-        logger.info("Stop-limit order placed: {} {} {} @ stop {} limit {} | id={} status={}", side, quantity, symbol, stop_price, limit_price, order["order_id"], order["status"])
-        return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_stop_limit_order failed ({} {} {} stop {} limit {}): {}", side, quantity, symbol, stop_price, limit_price, exc)
-        raise
-
-
-def place_take_profit_limit_order(
-    client: Client,
-    symbol: str,
-    side: str,
-    quantity: Decimal,
-    stop_price: Decimal,
-    limit_price: Decimal,
-    reduce_only: bool = True,
-) -> dict:
-    """Place a take-profit limit order (triggers a limit order when stop_price is hit).
-
-    Prefer place_take_profit_market_order — a limit order risks not filling if price
-    gaps through the limit. Uses the Algo Order API like all conditional order types.
-
-    Args:
-        client: Authenticated Binance client.
-        symbol: Trading pair, e.g. "BTCUSDT".
-        side: "BUY" or "SELL" — typically opposite to the open position side.
-        quantity: Order quantity in base asset units.
-        stop_price: Price that triggers the take-profit.
-        limit_price: Limit price after trigger (set above stop for SELL, below for BUY).
-        reduce_only: If True, the order can only reduce an existing position.
-
-    Returns:
-        Normalised order dict (see _normalize_algo_order).
-    """
-    try:
-        params = dict(
-            symbol=symbol, side=side, type="TAKE_PROFIT", algoType="CONDITIONAL",
-            quantity=str(quantity), triggerPrice=str(stop_price), price=str(limit_price),
-            reduceOnly=reduce_only,
-        )
-        raw = with_retry(lambda: client.futures_create_algo_order(**params))
-        order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
-        logger.info("Take-profit limit order placed: {} {} {} @ stop {} limit {} | id={} status={}", side, quantity, symbol, stop_price, limit_price, order["order_id"], order["status"])
-        return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_take_profit_limit_order failed ({} {} {} stop {} limit {}): {}", side, quantity, symbol, stop_price, limit_price, exc)
-        raise
-
-
 def get_open_orders(client: Client, symbol: str) -> list[dict]:
     """Return all open orders for a symbol, including conditional algo orders.
 
     Fetches from both /fapi/v1/openOrders (regular) and /fapi/v1/openAlgoOrders
-    (conditional), since conditional orders no longer appear in the regular endpoint.
+    (conditional), since conditional orders no longer appear in the regular endpoint
+    after Binance's 2025-12-09 migration.
 
     Args:
         client: Authenticated Binance client.
@@ -496,8 +403,8 @@ def get_open_orders(client: Client, symbol: str) -> list[dict]:
 def cancel_order(client: Client, symbol: str, order_id: int) -> dict:
     """Cancel a specific regular (non-algo) open order.
 
-    For cancelling conditional orders placed via place_stop_market_order or
-    place_take_profit_market_order, use cancel_algo_order instead.
+    For cancelling conditional orders (stop-market, take-profit-market),
+    use cancel_algo_order instead.
 
     Args:
         client: Authenticated Binance client.
@@ -521,8 +428,7 @@ def cancel_algo_order(client: Client, symbol: str, algo_id: int) -> dict:
     """Cancel a conditional algo order by its algo ID.
 
     Use this for orders placed via place_stop_market_order or
-    place_take_profit_market_order (they return is_algo=True and their
-    order_id is the algoId).
+    place_take_profit_market_order (they return is_algo=True, order_id is the algoId).
 
     Args:
         client: Authenticated Binance client.
