@@ -6,6 +6,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
+from utils.algo_orders import cancel_algo_order
 from utils.general import _normalize_algo_order, _normalize_order, with_retry
 
 
@@ -127,7 +128,7 @@ def cancel_all_orders(client: Client, symbol: str) -> None:
         algo_resp = with_retry(lambda: client.futures_get_open_algo_orders(symbol=symbol))
         algo_orders = algo_resp.get("orders", []) if isinstance(algo_resp, dict) else algo_resp
         for o in algo_orders:
-            with_retry(lambda algo_id=o["algoId"]: client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id))
+            cancel_algo_order(client, symbol, o["algoId"])
         logger.info("All open orders cancelled for {} (algo={})", symbol, len(algo_orders))
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("cancel_all_orders failed for {}: {}", symbol, exc)
