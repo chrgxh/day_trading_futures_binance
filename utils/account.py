@@ -1,4 +1,4 @@
-"""Authenticated Binance account layer — connection, balances, positions, symbol info."""
+"""Binance account state layer — connection, balances, positions, symbol info, leverage."""
 
 from decimal import Decimal
 from typing import Optional

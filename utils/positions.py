@@ -6,7 +6,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
-from utils.exchange import get_futures_positions
+from utils.account import get_futures_positions
 from utils.general import _normalize_order, with_retry
 
 

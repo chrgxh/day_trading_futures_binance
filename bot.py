@@ -9,7 +9,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from utils import exchange, market, indicators
+from utils import general, market, indicators
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ def run() -> None:
 
     logger.info("Bot starting. testnet={} dry_run={}", env["testnet"], env["dry_run"])
 
-    client = exchange.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
+    client = general.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
 
     risk = RiskGuard(
         max_position_usdt=cfg["risk"]["max_position_size_usdt"],
