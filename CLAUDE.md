@@ -21,7 +21,11 @@ day-trading-bot/
 ├── bot.py                   # Entry point — bot loop, orchestration, risk controls
 ├── utils/
 │   ├── __init__.py
-│   ├── exchange.py          # Authenticated Binance actions (positions, orders, connection)
+│   ├── general.py           # Shared primitives — build_client, with_retry, order normalizers
+│   ├── exchange.py          # Account layer — connection, balances, positions, symbol info
+│   ├── orders.py            # Regular orders — market, limit, get_open_orders, cancel, cancel_all
+│   ├── algo_orders.py       # Conditional orders — stop/TP market and limit variants, cancel_algo
+│   ├── positions.py         # Position management — close_position
 │   ├── market.py            # Public market data (OHLCV, mark price)
 │   └── indicators.py        # Signal types and technical indicators (MA, etc.)
 ├── config.yaml              # Non-secret runtime config (symbols, intervals, risk limits)
@@ -33,17 +37,13 @@ day-trading-bot/
 ├── docker-compose.yml       # Mounts ./logs into the container
 ├── requirements.txt
 ├── logs/                    # Log output; mounted volume, not baked into image
-└── tests/
-    ├── test_exchange.py     # Unit tests for utils/exchange.py (mocked)
-    ├── test_market.py       # Unit tests for utils/market.py (mocked)
-    ├── test_indicators.py   # Unit tests for utils/indicators.py
-    └── test_integration.py  # Live testnet tests (requires credentials, -m integration)
+└── sandbox.ipynb            # Manual testnet notebook — runs all scenarios against the live testnet
 ```
 
 ## Hard rules
 
 1. **Secrets never leave `.env`.** Do not hardcode API keys anywhere. `.env` must be in both `.gitignore` and `.dockerignore`. Secrets are passed at runtime via `env_file:` in `docker-compose.yml`.
-2. **All Binance API calls go through `utils/exchange.py` or `utils/market.py`.** `bot.py` and `utils/indicators.py` must not import `binance` directly.
+2. **All Binance API calls go through `utils/exchange.py`, `utils/orders.py`, `utils/algo_orders.py`, `utils/positions.py`, or `utils/market.py`.** `bot.py` and `utils/indicators.py` must not import `binance` directly.
 3. **Futures only.** Use futures endpoints exclusively (`futures_*` methods on the client). No spot trading.
 4. **Every API action and every bot decision is logged via loguru** to both stdout and a file in `logs/`. Logs must survive container restarts via a mounted volume.
 5. **The log file is not in the Docker image.** It is created at runtime in the mounted volume.
@@ -53,7 +53,7 @@ day-trading-bot/
 - **Testnet vs mainnet toggle.** `BINANCE_TESTNET=true` in `.env`. Default to testnet for safety.
 - **Dry-run mode.** `DRY_RUN=true` in `.env`. Bot logs intended trades without calling order endpoints.
 - **Risk controls live in `bot.py`** — max position size, max daily loss, kill switch. Indicators decide intent; `bot.py` enforces limits before anything reaches `utils/exchange.py`.
-- **Retry with backoff lives in `utils/exchange.py`** via `with_retry()`. Centralised so nothing else reinvents it.
+- **Retry with backoff lives in `utils/general.py`** via `with_retry()`. All order and account modules import it from there — nothing else reinvents it.
 - **State persistence on crash.** On startup, re-query Binance for open positions rather than trusting a local cache.
 - **Config separation.** Secrets in `.env`, everything else (symbols, intervals, risk limits) in `config.yaml`.
 
