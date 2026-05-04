@@ -31,11 +31,22 @@ day-trading-bot/
 ├── config.yaml              # Non-secret runtime config (symbols, intervals, risk limits)
 ├── .env                     # Secrets ONLY (API key, API secret) — never committed
 ├── .env.example             # Placeholder template, safe to commit
+├── .env.testnet             # Testnet secrets for integration tests — never committed
+├── .env.testnet.example     # Testnet placeholder template, safe to commit
 ├── .gitignore
 ├── .dockerignore
 ├── Dockerfile
 ├── docker-compose.yml       # Mounts ./logs into the container
 ├── requirements.txt
+├── pytest.ini               # Registers integration marker; plain pytest skips integration tests
+├── tests/
+│   └── integration/         # Testnet integration tests — run with: pytest -m integration
+│       ├── conftest.py      # Loads .env.testnet, client/sym_info/open_position fixtures
+│       ├── test_account.py
+│       ├── test_market.py
+│       ├── test_orders.py
+│       ├── test_algo_orders.py
+│       └── test_positions.py
 ├── logs/                    # Log output; mounted volume, not baked into image
 └── sandbox.ipynb            # Manual testnet notebook — runs all scenarios against the live testnet
 ```

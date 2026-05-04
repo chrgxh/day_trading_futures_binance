@@ -1,4 +1,5 @@
 .env
+.env.testnet
 logs/
 .git/
 .venv/
