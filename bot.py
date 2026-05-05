@@ -9,22 +9,17 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from utils import general, market, indicators
+from utils import account, general, market, orders
+from utils import positions as pos_utils
+from utils.indicators import Position, Signal, TradeSignal
+from strategies import STRATEGIES
 
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
 def configure_logging(log_file: str, level: str, rotation: str, retention: str) -> None:
     logger.remove()
     logger.add(sys.stdout, level=level)
     logger.add(log_file, level=level, rotation=rotation, retention=retention, enqueue=True)
 
-
-# ---------------------------------------------------------------------------
-# Config / env loading
-# ---------------------------------------------------------------------------
 
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
@@ -42,13 +37,8 @@ def load_env() -> dict:
         "api_key": os.environ["BINANCE_API_KEY"],
         "api_secret": os.environ["BINANCE_API_SECRET"],
         "testnet": os.getenv("BINANCE_TESTNET", "true").lower() == "true",
-        "dry_run": os.getenv("DRY_RUN", "true").lower() == "true",
     }
 
-
-# ---------------------------------------------------------------------------
-# Risk controls
-# ---------------------------------------------------------------------------
 
 class RiskGuard:
     """Enforces per-trade and daily loss limits before any order is placed."""
@@ -59,7 +49,7 @@ class RiskGuard:
         self.kill_switch = kill_switch
         self.daily_loss: Decimal = Decimal("0")
 
-    def check(self, signal: indicators.TradeSignal, price: Decimal) -> bool:
+    def check(self, signal: TradeSignal) -> bool:
         """Return True if the trade is permitted under current risk limits."""
         if self.kill_switch:
             logger.warning("Kill switch is active — all trades blocked.")
@@ -77,10 +67,6 @@ class RiskGuard:
         logger.info("Daily loss updated: {} / {}", self.daily_loss, self.max_daily_loss_usdt)
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
 def run() -> None:
     cfg = load_config()
     env = load_env()
@@ -93,7 +79,7 @@ def run() -> None:
         retention=log_cfg["retention"],
     )
 
-    logger.info("Bot starting. testnet={} dry_run={}", env["testnet"], env["dry_run"])
+    logger.info("Bot starting. testnet={}", env["testnet"])
 
     client = general.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
 
@@ -106,29 +92,43 @@ def run() -> None:
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
     loop_sleep: int = cfg["trading"]["loop_interval_seconds"]
+    strategy_name: str = cfg["trading"]["strategy"]
+    strategy_params: dict = cfg["trading"].get("strategy_params", {})
+    strategy_fn = STRATEGIES[strategy_name]
+    logger.info("Strategy: {}", strategy_name)
+
+    # Re-query Binance for open positions so state survives restarts
+    open_positions: dict[str, Position] = {s: Position.NONE for s in symbols}
+    for pos in account.get_futures_positions(client):
+        if pos["symbol"] in open_positions:
+            open_positions[pos["symbol"]] = Position[pos["side"]]
+            logger.info("Recovered open {} position for {}", pos["side"], pos["symbol"])
 
     while True:
         for symbol in symbols:
             try:
+                position = open_positions[symbol]
                 candles = market.get_futures_ohlcv(client, symbol, interval)
-                signal = indicators.moving_average_crossover(candles, symbol)
+                signal = strategy_fn(candles, symbol, position, strategy_params)
 
-                logger.info("{} signal: {} — {}", symbol, signal.signal.value, signal.reason)
+                logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
 
-                if signal.signal == indicators.Signal.HOLD:
+                if signal.signal == Signal.HOLD:
                     continue
 
-                price = market.get_futures_mark_price(client, symbol)
-                if not risk.check(signal, price):
+                if not risk.check(signal):
                     continue
 
-                quantity = (risk.max_position_usdt / price).quantize(Decimal("0.00001"))
-                logger.info(
-                    "[{}] {} {} qty={}",
-                    "DRY RUN" if env["dry_run"] else "LIVE",
-                    signal.signal.value, symbol, quantity,
-                )
-                # TODO: place futures order via exchange module
+                if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
+                    price = market.get_futures_mark_price(client, symbol)
+                    quantity = (risk.max_position_usdt / price).quantize(Decimal("0.00001"))
+                    side = "BUY" if signal.signal == Signal.OPEN_LONG else "SELL"
+                    orders.place_market_order(client, symbol, side, quantity)
+                    open_positions[symbol] = Position.LONG if signal.signal == Signal.OPEN_LONG else Position.SHORT
+
+                elif signal.signal == Signal.CLOSE:
+                    pos_utils.close_position(client, symbol)
+                    open_positions[symbol] = Position.NONE
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)

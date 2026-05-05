@@ -4,6 +4,10 @@ trading:
     - ETHUSDT
   interval: "1m"
   loop_interval_seconds: 60
+  strategy: ma_crossover
+  strategy_params:
+    fast_period: 9
+    slow_period: 21
 
 risk:
   max_position_size_usdt: 100.0
