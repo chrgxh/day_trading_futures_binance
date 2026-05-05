@@ -89,6 +89,10 @@ def run() -> None:
         kill_switch=cfg["risk"]["kill_switch"],
     )
 
+    leverage: int = cfg["risk"]["leverage"]
+    for symbol in cfg["trading"]["symbols"]:
+        account.set_leverage(client, symbol, leverage)
+
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
     loop_sleep: int = cfg["trading"]["loop_interval_seconds"]

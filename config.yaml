@@ -13,6 +13,7 @@ risk:
   max_position_size_usdt: 100.0
   max_daily_loss_usdt: 50.0
   kill_switch: false
+  leverage: 10
 
 logging:
   level: INFO
