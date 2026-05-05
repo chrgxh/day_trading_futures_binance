@@ -125,7 +125,11 @@ def run() -> None:
     logger.info("Bot starting. testnet={}", env["testnet"])
 
     client = general.build_client(env["api_key"], env["api_secret"], testnet=env["testnet"])
-    risk = RiskGuard(**cfg["risk"])
+    risk = RiskGuard(
+        max_position_usdt=cfg["risk"]["max_position_size_usdt"],
+        max_daily_loss_usdt=cfg["risk"]["max_daily_loss_usdt"],
+        kill_switch=cfg["risk"]["kill_switch"],
+    )
 
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
