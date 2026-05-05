@@ -118,6 +118,15 @@ class RiskGuard:
 # ---------------------------------------------------------------------------
 
 def run() -> None:
+    try:
+        _run()
+    except Exception as exc:
+        logger.critical("Bot crashed: {}", exc)
+        general.send_crash_email(exc)
+        raise
+
+
+def _run() -> None:
     cfg = load_config()
     env = load_env()
     configure_logging(**cfg["logging"])

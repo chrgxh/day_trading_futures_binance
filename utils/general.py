@@ -1,11 +1,53 @@
 """Shared primitives — client factory, retry wrapper, and order normalizers."""
 
+import os
 import time
+import traceback
 from decimal import Decimal
 
+import resend
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
+
+
+def send_crash_email(exc: BaseException) -> str | None:
+    """Send a crash notification email via Resend.
+
+    Reads RESEND_API_KEY, CRASH_NOTIFY_EMAIL, and CRASH_NOTIFY_FROM_EMAIL
+    from the environment. Logs a warning and returns None if any are missing
+    so a misconfigured notifier never masks the original crash.
+
+    Args:
+        exc: The exception that caused the crash.
+
+    Returns:
+        The Resend email ID on success, or None if skipped or failed.
+    """
+    api_key = os.getenv("RESEND_API_KEY")
+    to_email = os.getenv("CRASH_NOTIFY_EMAIL")
+    from_email = os.getenv("CRASH_NOTIFY_FROM_EMAIL")
+    if not api_key or not to_email or not from_email:
+        logger.warning("Crash email not sent — RESEND_API_KEY, CRASH_NOTIFY_EMAIL, or CRASH_NOTIFY_FROM_EMAIL not set.")
+        return None
+
+    resend.api_key = api_key
+    tb = traceback.format_exc()
+    body = f"<pre>{type(exc).__name__}: {exc}\n\n{tb}</pre>"
+
+    try:
+        response = resend.Emails.send({
+            "from": from_email,
+            "to": [to_email],
+            "subject": f"[Bot Crash] {type(exc).__name__}: {exc}",
+            "html": body,
+        })
+        email_id = response["id"]
+        logger.info("Crash notification email sent to {}. id={}", to_email, email_id)
+        return email_id
+    except Exception as mail_exc:
+        logger.error("Failed to send crash email: {}", mail_exc)
+        return None
 
 
 def build_client(api_key: str, api_secret: str, testnet: bool = True) -> Client:
