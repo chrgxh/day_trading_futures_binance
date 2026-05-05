@@ -10,7 +10,7 @@ trading:
     slow_period: 21
 
 risk:
-  max_position_size_usdt: 100.0
+  max_position_size_usdt: 1000.0
   max_daily_loss_usdt: 50.0
   kill_switch: false
   leverage: 10
