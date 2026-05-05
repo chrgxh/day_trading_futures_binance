@@ -8,7 +8,7 @@ Automated futures trading bot for Binance. Evaluates technical indicators on a c
 bot.py                   — main loop, orchestration, risk controls
 strategies.py            — pluggable strategy functions + STRATEGIES registry
 utils/
-  general.py             — shared primitives: build_client, with_retry, order normalizers
+  general.py             — shared primitives: build_client, with_retry, send_crash_email, order normalizers
   account.py             — account state: connection, balances, positions, symbol info, leverage
   orders.py              — regular orders: market, limit, get_open_orders, cancel, cancel_all
   algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
@@ -31,10 +31,15 @@ Copy `.env.example` to `.env` and fill in your credentials:
 ```
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
-BINANCE_TESTNET=true   # set to false for mainnet
+BINANCE_TESTNET=true        # set to false for mainnet
+
+# optional — crash email notifications via Resend
+RESEND_API_KEY=
+CRASH_NOTIFY_EMAIL=
+CRASH_NOTIFY_FROM_EMAIL=    # must be a verified sender domain in Resend
 ```
 
-For integration tests, copy `.env.testnet.example` to `.env.testnet` and fill in your testnet credentials.
+For integration tests, copy `.env.testnet.example` to `.env.testnet` and fill in your testnet credentials (including the Resend vars if you want to run `test_notifications`).
 
 Strategy selection and parameters live in `config.yaml` under `trading.strategy` and `trading.strategy_params`. Available strategies:
 
@@ -71,6 +76,7 @@ Run a specific module's tests:
 pytest tests/integration/test_orders.py -m integration -v
 pytest tests/integration/test_algo_orders.py -m integration -v
 pytest tests/integration/test_positions.py -m integration -v
+pytest tests/integration/test_notifications.py -m integration -v
 ```
 
 Plain `pytest` (no `-m integration`) skips all integration tests.

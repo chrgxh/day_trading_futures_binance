@@ -11,6 +11,7 @@ A futures day trading bot that places trades on Binance Futures based on configu
 - **Language:** Python 3.11+
 - **Exchange API:** Binance Futures (via the official `python-binance` client)
 - **Logging:** loguru
+- **Notifications:** Resend (crash emails via `resend` SDK)
 - **Runtime:** Docker (single container, `docker compose` for local dev)
 - **Config:** `.env` for secrets, `config.yaml` for strategy parameters
 
@@ -22,7 +23,7 @@ day-trading-bot/
 ├── strategies.py            # Pluggable strategy functions + STRATEGIES registry
 ├── utils/
 │   ├── __init__.py
-│   ├── general.py           # Shared primitives — build_client, with_retry, order normalizers
+│   ├── general.py           # Shared primitives — build_client, with_retry, send_crash_email, order normalizers
 │   ├── account.py           # Account state layer — connection, balances, positions, symbol info, leverage
 │   ├── orders.py            # Regular orders — market, limit, get_open_orders, cancel, cancel_all
 │   ├── algo_orders.py       # Conditional orders — stop/TP market and limit variants, cancel_algo
@@ -47,7 +48,8 @@ day-trading-bot/
 │       ├── test_market.py
 │       ├── test_orders.py
 │       ├── test_algo_orders.py
-│       └── test_positions.py
+│       ├── test_positions.py
+│       └── test_notifications.py
 ├── logs/                    # Log output; mounted volume, not baked into image
 └── sandbox.ipynb            # Manual testnet notebook — runs all scenarios against the live testnet
 ```
@@ -69,6 +71,7 @@ day-trading-bot/
 - **Config separation.** Secrets in `.env`, everything else (symbols, intervals, risk limits, strategy selection and params) in `config.yaml`.
 - **Strategy selection.** `config.yaml` sets `trading.strategy` (key into `STRATEGIES` in `strategies.py`) and `trading.strategy_params`. To add a new strategy, write a function in `strategies.py` and register it in `STRATEGIES` — no other file changes needed.
 - **One position at a time.** The bot tracks one `Position` state per symbol (`NONE/LONG/SHORT`). The strategy receives this state on every tick and must return the correct action (`OPEN_LONG`, `OPEN_SHORT`, `CLOSE`, `HOLD`). A new position is only opened when `Position.NONE`. State survives restarts by re-querying Binance on startup.
+- **Crash notifications via Resend.** `run()` in `bot.py` wraps `_run()` in a try/except. Any unhandled exception calls `general.send_crash_email()`, which sends the exception type, message, and full traceback to `CRASH_NOTIFY_EMAIL` via the Resend API, then re-raises. Per-symbol errors caught in the inner loop do not trigger an email — only bot-killing crashes do. `load_dotenv()` is called inside `_run()` before anything can crash, so env vars are always loaded by the time the crash handler runs.
 
 ## Execution boundaries
 
