@@ -12,6 +12,7 @@ from loguru import logger
 
 from utils import account, algo_orders, general, market, orders
 from utils.general import PostOnlyRejected
+
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
 from strategies import STRATEGIES
@@ -76,85 +77,108 @@ def attempt_limit_entry(
     quantity: Decimal,
     tick_size: Decimal,
     signal_price: Decimal,
-    timeout_secs: int,
+    gtx_timeout_secs: int,
+    gtx_attempts: int,
     max_deviation_pct: Decimal,
-    max_retries: int,
 ) -> dict | None:
-    """Try to fill a GTX (post-only) limit entry order, retrying if the order times out or is rejected.
+    """Two-stage limit entry: GTX (post-only) at bid/ask first, then IOC chase until filled or price drifts too far.
 
-    Places a limit order at the current mark price. If the order isn't filled within
-    timeout_secs, it is cancelled and a new attempt is made at the new mark price —
-    provided the price hasn't drifted more than max_deviation_pct from signal_price.
-    A GTX post-only rejection (order would have been taker) also triggers an immediate retry.
+    Stage 1 — GTX at best bid (BUY) / best ask (SELL): passive maker attempt, repeated up to
+    gtx_attempts times with a gtx_timeout_secs wait each. An instant GTX rejection (price already
+    crossing the spread) counts as one attempt and moves straight to the next without waiting.
+    Exits early to IOC if price drifts beyond max_deviation_pct from signal_price.
+
+    Stage 2 — IOC chase at best ask (BUY) / best bid (SELL): keeps retrying with a fresh
+    ask/bid on every iteration. The only exit conditions are a fill or price drifting beyond
+    max_deviation_pct. Criteria cannot change before the next candle closes, so deviation
+    is the only meaningful abort.
 
     Returns the filled order dict on success, or None if entry was aborted.
     """
-    for attempt in range(1, max_retries + 1):
-        best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
-        ref_price = best_bid if side == "BUY" else best_ask
-        deviation = abs(ref_price - signal_price) / signal_price
-
-        if deviation > max_deviation_pct:
+    def _within_deviation(ref: Decimal) -> bool:
+        dev = float(abs(ref - signal_price) / signal_price)
+        if dev > float(max_deviation_pct):
             logger.warning(
-                "{} Limit entry aborted: price moved {:.4f}% from signal price {} (max {:.4f}%)",
-                symbol, float(deviation * 100), signal_price, float(max_deviation_pct * 100),
+                "{} Entry aborted: price moved {:.4f}% from signal {} (max {:.4f}%)",
+                symbol, dev * 100, signal_price, float(max_deviation_pct * 100),
             )
+            return False
+        return True
+
+    # --- Stage 1: GTX (post-only) at best bid (BUY) or best ask (SELL) ---
+    for attempt in range(1, gtx_attempts + 1):
+        best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
+        passive_ref = best_bid if side == "BUY" else best_ask
+        if not _within_deviation(passive_ref):
             return None
 
-        limit_price = _round_price(ref_price, tick_size)
+        limit_price = _round_price(passive_ref, tick_size)
         logger.info(
             "{} Placing GTX limit {} {} @ {} (attempt {}/{})",
-            symbol, side, quantity, limit_price, attempt, max_retries,
+            symbol, side, quantity, limit_price, attempt, gtx_attempts,
         )
 
         try:
             order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="GTX")
         except PostOnlyRejected:
-            logger.warning(
-                "{} GTX order rejected on attempt {}/{}: order at {} would be taker",
-                symbol, attempt, max_retries, limit_price,
-            )
+            logger.info("{} GTX rejected (would be taker) on attempt {}/{}", symbol, attempt, gtx_attempts)
             continue
-        except Exception:
-            raise
 
-        # Poll for fill until timeout
-        deadline = time.monotonic() + timeout_secs
+        deadline = time.monotonic() + gtx_timeout_secs
         filled_order: dict | None = None
         while time.monotonic() < deadline:
             time.sleep(2)
             try:
                 status = orders.get_order(client, symbol, order["order_id"])
             except Exception as exc:
-                logger.warning("{} Could not poll order {}: {}", symbol, order["order_id"], exc)
+                logger.warning("{} Could not poll GTX order {}: {}", symbol, order["order_id"], exc)
                 break
-
             if status["status"] == "FILLED":
                 filled_order = status
                 break
             if status["status"] in ("CANCELED", "EXPIRED"):
-                logger.info("{} Limit order {} was cancelled/expired — retrying", symbol, order["order_id"])
                 break
 
+        if filled_order is None:
+            try:
+                latest = orders.get_order(client, symbol, order["order_id"])
+                if latest["status"] == "FILLED":
+                    filled_order = latest
+                elif latest["status"] not in ("CANCELED", "EXPIRED"):
+                    orders.cancel_order(client, symbol, order["order_id"])
+            except Exception as exc:
+                logger.warning("{} Could not cancel GTX order {}: {}", symbol, order["order_id"], exc)
+
         if filled_order is not None:
-            logger.info("{} Limit entry filled @ {} (attempt {})", symbol, limit_price, attempt)
+            logger.info("{} GTX limit filled @ {} (attempt {})", symbol, limit_price, attempt)
             return filled_order
 
-        # Cancel the order if it's still open before retrying.
-        # Re-fetch status first — the order may have filled in the gap since the last poll.
-        try:
-            latest = orders.get_order(client, symbol, order["order_id"])
-            if latest["status"] == "FILLED":
-                logger.info("{} Limit entry filled @ {} (detected at cancel-check, attempt {})", symbol, limit_price, attempt)
-                return latest
-            if latest["status"] not in ("CANCELED", "EXPIRED"):
-                orders.cancel_order(client, symbol, order["order_id"])
-                logger.info("{} Cancelled unfilled limit order {} after {}s timeout", symbol, order["order_id"], timeout_secs)
-        except Exception as exc:
-            logger.warning("{} Could not cancel order {}: {}", symbol, order["order_id"], exc)
+    logger.info("{} GTX unfilled after {} attempts — switching to IOC chase", symbol, gtx_attempts)
 
-    logger.warning("{} Limit entry gave up after {} attempts", symbol, max_retries)
-    return None
+    # --- Stage 2: IOC chase until filled or price exceeds deviation ---
+    ioc_attempt = 0
+    while True:
+        ioc_attempt += 1
+        best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
+        aggressive_ref = best_ask if side == "BUY" else best_bid
+        if not _within_deviation(aggressive_ref):
+            return None
+
+        limit_price = _round_price(aggressive_ref, tick_size)
+        logger.info(
+            "{} Placing IOC limit {} {} @ {} (ioc attempt {})",
+            symbol, side, quantity, limit_price, ioc_attempt,
+        )
+        ioc_order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="IOC")
+
+        time.sleep(0.5)
+        try:
+            status = orders.get_order(client, symbol, ioc_order["order_id"])
+            if status["status"] == "FILLED":
+                logger.info("{} IOC filled @ {} (ioc attempt {})", symbol, limit_price, ioc_attempt)
+                return status
+        except Exception as exc:
+            logger.warning("{} Could not check IOC order {}: {}", symbol, ioc_order["order_id"], exc)
 
 
 def execute_signal(
@@ -170,9 +194,9 @@ def execute_signal(
     sl_market_pct: Decimal,
     ttp_activation_pct: Decimal,
     ttp_callback_rate: Decimal,
-    entry_timeout_secs: int,
+    entry_gtx_timeout_secs: int,
+    entry_gtx_attempts: int,
     max_entry_deviation_pct: Decimal,
-    entry_max_retries: int,
 ) -> None:
     """Place the order for a non-HOLD signal, set stop losses + trailing TP on open, cancel on close."""
     if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
@@ -186,7 +210,7 @@ def execute_signal(
 
         filled_order = attempt_limit_entry(
             client, symbol, side, quantity, tick_size,
-            signal_price, entry_timeout_secs, max_entry_deviation_pct, entry_max_retries,
+            signal_price, entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct,
         )
 
         if filled_order is None:
@@ -309,9 +333,10 @@ def _run() -> None:
     ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
 
     entry_cfg = cfg.get("entry", {})
-    entry_timeout_secs: int = int(entry_cfg.get("limit_order_timeout_secs", 20))
+    entry_gtx_timeout_secs: int = int(entry_cfg.get("gtx_timeout_secs", 5))
+    entry_gtx_attempts: int = int(entry_cfg.get("gtx_attempts", 3))
     max_entry_deviation_pct = Decimal(str(entry_cfg.get("max_price_deviation_pct", 0.3))) / 100
-    entry_max_retries: int = int(entry_cfg.get("max_retries", 3))
+
 
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
     open_positions = recover_positions(client, symbols)
@@ -383,7 +408,7 @@ def _run() -> None:
                                sym_info[symbol], open_positions, stop_order_ids,
                                trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
                                ttp_activation_pct, ttp_callback_rate,
-                               entry_timeout_secs, max_entry_deviation_pct, entry_max_retries)
+                               entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
 
                 # Immediately re-evaluate on the same candle after a close.
                 # Handles trend reversals (close short → open long) and RSI flush re-entries
@@ -396,7 +421,7 @@ def _run() -> None:
                                        sym_info[symbol], open_positions, stop_order_ids,
                                        trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
                                        ttp_activation_pct, ttp_callback_rate,
-                                       entry_timeout_secs, max_entry_deviation_pct, entry_max_retries)
+                                       entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)

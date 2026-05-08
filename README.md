@@ -95,11 +95,11 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
 - `BINANCE_TESTNET=true` — connects to testnet by default
 - Kill switch in `config.yaml` (`risk.kill_switch: true`) blocks all trades instantly
 - Max position size and max daily loss enforced in `bot.py` before any order reaches the exchange
-- **GTX (Post-Only) limit entry** — positions are opened with a maker-only limit order instead of a market order:
-  - `entry.limit_order_timeout_secs` (default `20`) — seconds to wait for a fill before cancelling and retrying
-  - `entry.max_price_deviation_pct` (default `0.3`) — abort entry if price drifts more than this % from the signal price
-  - `entry.max_retries` (default `3`) — max placement attempts before giving up on the signal
-  - GTX orders are auto-cancelled by Binance if they would fill as a taker; the bot retries at the new price
+- **Two-stage limit entry** — GTX (post-only) maker attempt first, IOC taker chase as fallback:
+  - `entry.gtx_timeout_secs` (default `5`) — seconds to wait per GTX attempt before cancelling and retrying
+  - `entry.gtx_attempts` (default `3`) — number of GTX attempts before switching to IOC chase
+  - `entry.max_price_deviation_pct` (default `0.3`) — abort entry if price drifts more than this % from the signal price; applies to both stages
+  - IOC chase retries indefinitely at the current best ask/bid until filled or deviation limit is hit
 - Dual stop losses placed automatically on every position open:
   - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred exit with less slippage
   - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
