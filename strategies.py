@@ -121,10 +121,18 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     cross_up = fast_prev <= slow_prev and fast_now > slow_now
     cross_down = fast_prev >= slow_prev and fast_now < slow_now
 
-    logger.debug(
-        "{} EMA{}={:.4f} EMA{}={:.4f} trend1h={:.4f} price={:.4f} RSI={:.2f} RVOL={:.2f}x",
+    logger.info(
+        "{} EMA{}={:.4f} EMA{}={:.4f} trend1h={:.4f} price={:.4f} RSI={:.2f} RVOL={:.2f}x"
+        " | ema={}{} trend={} vol={} rsi={}",
         symbol, fast_period, float(fast_now), slow_period, float(slow_now),
         float(trend_ema), float(current_price), float(current_rsi), rvol,
+        "bull" if ema_bullish else "bear" if ema_bearish else "flat",
+        "(cross-up)" if cross_up else "(cross-down)" if cross_down else "",
+        "above" if above_trend else "below",
+        "SPIKE" if vol_spike else "low",
+        ("long-zone" if rsi_long_low <= current_rsi <= rsi_long_high
+         else "short-zone" if rsi_short_low <= current_rsi <= rsi_short_high
+         else "neutral"),
     )
 
     # --- Exit logic ---

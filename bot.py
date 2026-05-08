@@ -343,6 +343,17 @@ def _run() -> None:
                     buf.pop(0)
 
             try:
+                # Reconcile position state against Binance before every decision
+                # so a stop-loss or trailing TP that fired silently is picked up.
+                binance_pos = account.get_futures_positions(client, symbol=symbol)
+                binance_state = Position[binance_pos[0]["side"]] if binance_pos else Position.NONE
+                if binance_state != open_positions[symbol]:
+                    logger.warning(
+                        "{} Position mismatch: bot={} Binance={} — syncing.",
+                        symbol, open_positions[symbol].value, binance_state.value,
+                    )
+                    open_positions[symbol] = binance_state
+
                 position = open_positions[symbol]
                 signal = strategy_fn(buf, symbol, position, strategy_params)
 
