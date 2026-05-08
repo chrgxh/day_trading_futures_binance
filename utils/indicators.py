@@ -98,6 +98,71 @@ def macd(
     return macd_trimmed, sig_line, histogram
 
 
+def rsi(prices: list[Decimal], period: int = 14) -> Decimal:
+    """Relative Strength Index using Wilder's smoothing.
+
+    Returns 50 (neutral) if there are fewer than period + 1 prices.
+
+    Args:
+        prices: Closing prices in chronological order.
+        period: RSI period (default 14).
+    """
+    if len(prices) < period + 1:
+        return Decimal("50")
+
+    changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [c if c > 0 else Decimal("0") for c in changes]
+    losses = [-c if c < 0 else Decimal("0") for c in changes]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return Decimal("100")
+    rs = avg_gain / avg_loss
+    return Decimal("100") - Decimal("100") / (1 + rs)
+
+
+def resample_to_1h(candles: list[dict]) -> list[dict]:
+    """Aggregate sub-hourly OHLCV candles into complete 1h bars.
+
+    Groups candles by their UTC hour and builds OHLCV for each hour.
+    The last bar is dropped because it may be partially formed.
+
+    Args:
+        candles: OHLCV dicts with open_time in milliseconds.
+
+    Returns:
+        List of 1h OHLCV dicts sorted by open_time, excluding the latest (potentially partial) bar.
+    """
+    hourly: dict[int, dict] = {}
+    ms_per_hour = 3_600_000
+    for c in candles:
+        hour_ts = (c["open_time"] // ms_per_hour) * ms_per_hour
+        if hour_ts not in hourly:
+            hourly[hour_ts] = {
+                "open_time": hour_ts,
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "volume": c["volume"],
+            }
+        else:
+            bar = hourly[hour_ts]
+            bar["high"] = max(bar["high"], c["high"])
+            bar["low"] = min(bar["low"], c["low"])
+            bar["close"] = c["close"]
+            bar["volume"] += c["volume"]
+
+    bars = sorted(hourly.values(), key=lambda x: x["open_time"])
+    return bars[:-1] if bars else []
+
+
 def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
     """Average Directional Index using Wilder's smoothing.
 

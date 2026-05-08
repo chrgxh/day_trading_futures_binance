@@ -2,11 +2,24 @@ trading:
   symbols:
     - BTCUSDT
     - ETHUSDT
-  interval: "5m"
-  strategy: ma_crossover
+  interval: "15m"
+  # 840 candles ≈ 210 complete 1h bars after resampling — required by ema_trend_momentum
+  # for the 1h 200 EMA trend filter. Reduce to 200 if switching back to ma_crossover.
+  candle_limit: 840
+  strategy: ema_trend_momentum
   strategy_params:
-    fast_period: 9
-    slow_period: 21
+    fast_period: 9              # Fast EMA period on 15m
+    slow_period: 21             # Slow EMA period on 15m
+    trend_period: 200           # EMA period on 1h for trend gate
+    rsi_period: 14              # RSI lookback
+    volume_lookback: 20         # Candles used to compute RVOL baseline
+    volume_multiplier: 1.2      # Current candle volume must exceed baseline by this multiple
+    rsi_long_low: 50            # RSI floor for long entry
+    rsi_long_high: 70           # RSI ceiling for long entry
+    rsi_short_low: 30           # RSI floor for short entry
+    rsi_short_high: 50          # RSI ceiling for short entry
+    rsi_exit_overbought: 80     # Force-exit long when RSI reaches this
+    rsi_exit_oversold: 20       # Force-exit short when RSI reaches this
 
 entry:
   limit_order_timeout_secs: 20      # Seconds to wait for a GTX limit order to fill before cancelling and retrying
@@ -18,10 +31,10 @@ risk:
   max_daily_loss_usdt: 50.0
   kill_switch: false
   leverage: 10
-  stop_loss_limit_pct: 1.0                   # Stop-limit SL: preferred exit, less slippage
-  stop_loss_market_pct: 2.0                  # Stop-market SL: safety net if price gaps past limit
-  trailing_take_profit_activation_pct: 1.0   # % move in profit before trailing TP activates
-  trailing_take_profit_callback_rate: 0.2    # % price reversal from peak that triggers the trailing TP
+  stop_loss_limit_pct: 1.5                   # Hard SL: 1.5% against entry (preferred exit, less slippage)
+  stop_loss_market_pct: 1.8                  # Safety-net SL: slightly wider to survive price gaps
+  trailing_take_profit_activation_pct: 3.0   # Activate trailing TP at 3% profit (2:1 reward at 1.5% SL)
+  trailing_take_profit_callback_rate: 0.5    # Trail by 0.5% from peak before triggering
 
 logging:
   level: INFO

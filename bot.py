@@ -310,7 +310,7 @@ def _run() -> None:
     trailing_tp_order_ids: dict[str, int | None] = {s: None for s in symbols}
 
     # Pre-fetch candle history so strategies have enough data on the first tick.
-    candle_limit = 200
+    candle_limit: int = int(cfg["trading"].get("candle_limit", 200))
     candle_buffers: dict[str, list[dict]] = {}
     for symbol in symbols:
         candle_buffers[symbol] = market.get_futures_ohlcv(client, symbol, interval, limit=candle_limit)
@@ -356,6 +356,19 @@ def _run() -> None:
                                trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
                                ttp_activation_pct, ttp_callback_rate,
                                entry_timeout_secs, max_entry_deviation_pct, entry_max_retries)
+
+                # Immediately re-evaluate on the same candle after a close.
+                # Handles trend reversals (close short → open long) and RSI flush re-entries
+                # without waiting for the next candle.
+                if signal.signal == Signal.CLOSE and open_positions[symbol] == Position.NONE and risk.check():
+                    reentry = strategy_fn(buf, symbol, Position.NONE, strategy_params)
+                    logger.info("{} [NONE] {} — {} (re-entry check)", symbol, reentry.signal.value, reentry.reason)
+                    if reentry.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
+                        execute_signal(client, symbol, reentry, risk.max_position_usdt,
+                                       sym_info[symbol], open_positions, stop_order_ids,
+                                       trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
+                                       ttp_activation_pct, ttp_callback_rate,
+                                       entry_timeout_secs, max_entry_deviation_pct, entry_max_retries)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
