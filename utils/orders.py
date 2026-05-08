@@ -158,12 +158,12 @@ def place_trailing_stop_order(
             reduceOnly=True,
         )
         if activation_price is not None:
-            params["activationPrice"] = str(activation_price)
+            params["activatePrice"] = str(activation_price)
         raw = with_retry(lambda: client.futures_create_order(**params))
         order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
         logger.info(
-            "Trailing stop order placed: {} {} {} callback={}% activation={} | id={} status={}",
-            side, quantity, symbol, callback_rate, activation_price, order["order_id"], order["status"],
+            "Trailing stop order placed: {} {} {} callback={}% activation_sent={} activation_confirmed={} | id={} status={}",
+            side, quantity, symbol, callback_rate, activation_price, raw.get("activatePrice"), order["order_id"], order["status"],
         )
         return order
     except (BinanceAPIException, BinanceRequestException) as exc:
