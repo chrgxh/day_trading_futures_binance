@@ -7,7 +7,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
 from utils.algo_orders import cancel_algo_order
-from utils.general import _normalize_algo_order, _normalize_order, with_retry
+from utils.general import PostOnlyRejected, _normalize_algo_order, _normalize_order, with_retry
 
 
 def place_market_order(client: Client, symbol: str, side: str, quantity: Decimal) -> dict:
@@ -37,8 +37,15 @@ def place_market_order(client: Client, symbol: str, side: str, quantity: Decimal
         raise
 
 
-def place_limit_order(client: Client, symbol: str, side: str, quantity: Decimal, price: Decimal) -> dict:
-    """Place a futures limit order (GTC).
+def place_limit_order(
+    client: Client,
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    price: Decimal,
+    time_in_force: str = "GTC",
+) -> dict:
+    """Place a futures limit order.
 
     Args:
         client: Authenticated Binance client.
@@ -46,24 +53,45 @@ def place_limit_order(client: Client, symbol: str, side: str, quantity: Decimal,
         side: "BUY" or "SELL".
         quantity: Order quantity in base asset units.
         price: Limit price.
+        time_in_force: "GTC" (default) keeps the order open until cancelled.
+            "GTX" (Post-Only) is cancelled immediately if it would execute as a
+            taker; raises PostOnlyRejected in that case rather than retrying.
 
     Returns:
         Normalised order dict (see _normalize_order).
+
+    Raises:
+        PostOnlyRejected: Only when time_in_force="GTX" and the order would
+            fill immediately as a taker.
     """
     try:
-        raw = with_retry(lambda: client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type="LIMIT",
-            timeInForce="GTC",
-            quantity=str(quantity),
-            price=str(price),
-        ))
+        if time_in_force == "GTX":
+            # Post-only: do not retry on rejection — it is deterministic, not transient.
+            raw = client.futures_create_order(
+                symbol=symbol, side=side, type="LIMIT",
+                timeInForce="GTX", quantity=str(quantity), price=str(price),
+            )
+        else:
+            raw = with_retry(lambda: client.futures_create_order(
+                symbol=symbol, side=side, type="LIMIT",
+                timeInForce=time_in_force, quantity=str(quantity), price=str(price),
+            ))
         order = _normalize_order(raw)
-        logger.info("Limit order placed: {} {} {} @ {} | id={} status={}", side, quantity, symbol, price, order["order_id"], order["status"])
+        logger.info(
+            "Limit order placed: {} {} {} @ {} tif={} | id={} status={}",
+            side, quantity, symbol, price, time_in_force, order["order_id"], order["status"],
+        )
         return order
-    except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("place_limit_order failed ({} {} {} @ {}): {}", side, quantity, symbol, price, exc)
+    except BinanceAPIException as exc:
+        if time_in_force == "GTX" and (
+            "GTX" in str(exc) or getattr(exc, "code", None) == -4129
+        ):
+            logger.info("GTX post-only order rejected (would be taker): {} {} {} @ {}", side, quantity, symbol, price)
+            raise PostOnlyRejected(str(exc)) from exc
+        logger.error("place_limit_order failed ({} {} {} @ {} tif={}): {}", side, quantity, symbol, price, time_in_force, exc)
+        raise
+    except BinanceRequestException as exc:
+        logger.error("place_limit_order failed ({} {} {} @ {} tif={}): {}", side, quantity, symbol, price, time_in_force, exc)
         raise
 
 
@@ -143,6 +171,27 @@ def place_trailing_stop_order(
             "place_trailing_stop_order failed ({} {} {} callback={}%): {}",
             side, quantity, symbol, callback_rate, exc,
         )
+        raise
+
+
+def get_order(client: Client, symbol: str, order_id: int) -> dict:
+    """Fetch the current status of a specific order.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+        order_id: The order ID to query.
+
+    Returns:
+        Normalised order dict (see _normalize_order).
+    """
+    try:
+        raw = with_retry(lambda: client.futures_get_order(symbol=symbol, orderId=order_id))
+        order = _normalize_order(raw)
+        logger.debug("Order {} status: {} for {}", order_id, order["status"], symbol)
+        return order
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_order failed (id={} {}): {}", order_id, symbol, exc)
         raise
 
 

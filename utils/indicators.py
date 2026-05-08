@@ -28,6 +28,7 @@ class TradeSignal:
     symbol: str
     reason: str
     suggested_quantity: Optional[Decimal] = None
+    entry_price: Optional[Decimal] = None
 
 
 def sma(prices: list[Decimal], period: int) -> Decimal:

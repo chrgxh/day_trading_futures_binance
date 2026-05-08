@@ -5,6 +5,10 @@ import time
 import traceback
 from decimal import Decimal
 
+
+class PostOnlyRejected(RuntimeError):
+    """Raised when a GTX (post-only) limit order is rejected because it would execute as a taker."""
+
 import resend
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException

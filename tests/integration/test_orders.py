@@ -48,6 +48,33 @@ def test_cancel_all_orders(client, symbol, sym_info, clean_orders):
     assert orders.get_open_orders(client, symbol) == []
 
 
+def test_get_order(client, symbol, sym_info, clean_orders):
+    mark = market.get_futures_mark_price(client, symbol)
+    price = (mark * Decimal("0.85")).quantize(sym_info["tick_size"])
+    qty = max(Decimal("0.001"), sym_info["min_qty"]).quantize(sym_info["step_size"])
+
+    order = orders.place_limit_order(client, symbol, "BUY", qty, price)
+    fetched = orders.get_order(client, symbol, order["order_id"])
+
+    assert fetched["order_id"] == order["order_id"]
+    assert fetched["status"] == "NEW"
+    assert fetched["is_algo"] is False
+
+
+def test_place_post_only_limit_order_maker(client, symbol, sym_info, clean_orders):
+    """GTX order placed well below market should sit as a maker (not be rejected)."""
+    mark = market.get_futures_mark_price(client, symbol)
+    price = (mark * Decimal("0.85")).quantize(sym_info["tick_size"])
+    qty = max(Decimal("0.001"), sym_info["min_qty"]).quantize(sym_info["step_size"])
+
+    order = orders.place_limit_order(client, symbol, "BUY", qty, price, time_in_force="GTX")
+    assert order["is_algo"] is False
+    assert order["order_id"] is not None
+
+    fetched = orders.get_order(client, symbol, order["order_id"])
+    assert fetched["status"] == "NEW"
+
+
 def test_place_trailing_stop_order(client, symbol, sym_info, open_position):
     mark = market.get_futures_mark_price(client, symbol)
     qty = abs(open_position["amount"]).quantize(sym_info["step_size"])

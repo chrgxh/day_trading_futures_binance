@@ -3,6 +3,7 @@
 import os
 import queue
 import sys
+import time
 from decimal import Decimal
 
 import yaml
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from utils import account, algo_orders, general, market, orders
+from utils.general import PostOnlyRejected
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal
 from strategies import STRATEGIES
@@ -67,6 +69,86 @@ def _round_price(price: Decimal, tick_size: Decimal) -> Decimal:
     return (price / tick_size).to_integral_value() * tick_size
 
 
+def attempt_limit_entry(
+    client,
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    tick_size: Decimal,
+    signal_price: Decimal,
+    timeout_secs: int,
+    max_deviation_pct: Decimal,
+    max_retries: int,
+) -> dict | None:
+    """Try to fill a GTX (post-only) limit entry order, retrying if the order times out or is rejected.
+
+    Places a limit order at the current mark price. If the order isn't filled within
+    timeout_secs, it is cancelled and a new attempt is made at the new mark price —
+    provided the price hasn't drifted more than max_deviation_pct from signal_price.
+    A GTX post-only rejection (order would have been taker) also triggers an immediate retry.
+
+    Returns the filled order dict on success, or None if entry was aborted.
+    """
+    for attempt in range(1, max_retries + 1):
+        current_price = market.get_futures_mark_price(client, symbol)
+        deviation = abs(current_price - signal_price) / signal_price
+
+        if deviation > max_deviation_pct:
+            logger.warning(
+                "{} Limit entry aborted: price moved {:.4f}% from signal price {} (max {:.4f}%)",
+                symbol, float(deviation * 100), signal_price, float(max_deviation_pct * 100),
+            )
+            return None
+
+        limit_price = _round_price(current_price, tick_size)
+        logger.info(
+            "{} Placing GTX limit {} {} @ {} (attempt {}/{})",
+            symbol, side, quantity, limit_price, attempt, max_retries,
+        )
+
+        try:
+            order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="GTX")
+        except PostOnlyRejected:
+            logger.info("{} GTX order rejected (would be taker), retrying immediately", symbol)
+            continue
+        except Exception:
+            raise
+
+        # Poll for fill until timeout
+        deadline = time.monotonic() + timeout_secs
+        filled_order: dict | None = None
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            try:
+                status = orders.get_order(client, symbol, order["order_id"])
+            except Exception as exc:
+                logger.warning("{} Could not poll order {}: {}", symbol, order["order_id"], exc)
+                break
+
+            if status["status"] == "FILLED":
+                filled_order = status
+                break
+            if status["status"] in ("CANCELED", "EXPIRED"):
+                logger.info("{} Limit order {} was cancelled/expired — retrying", symbol, order["order_id"])
+                break
+
+        if filled_order is not None:
+            logger.info("{} Limit entry filled @ {} (attempt {})", symbol, limit_price, attempt)
+            return filled_order
+
+        # Cancel the order if it's still open before retrying
+        try:
+            latest = orders.get_order(client, symbol, order["order_id"])
+            if latest["status"] not in ("CANCELED", "EXPIRED", "FILLED"):
+                orders.cancel_order(client, symbol, order["order_id"])
+                logger.info("{} Cancelled unfilled limit order {} after {}s timeout", symbol, order["order_id"], timeout_secs)
+        except Exception as exc:
+            logger.warning("{} Could not cancel order {}: {}", symbol, order["order_id"], exc)
+
+    logger.warning("{} Limit entry gave up after {} attempts", symbol, max_retries)
+    return None
+
+
 def execute_signal(
     client,
     symbol: str,
@@ -80,28 +162,42 @@ def execute_signal(
     sl_market_pct: Decimal,
     ttp_activation_pct: Decimal,
     ttp_callback_rate: Decimal,
+    entry_timeout_secs: int,
+    max_entry_deviation_pct: Decimal,
+    entry_max_retries: int,
 ) -> None:
     """Place the order for a non-HOLD signal, set stop losses + trailing TP on open, cancel on close."""
     if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
-        price = market.get_futures_mark_price(client, symbol)
+        signal_price = signal.entry_price or market.get_futures_mark_price(client, symbol)
         step_size = sym_info["step_size"]
         tick_size = sym_info["tick_size"]
-        quantity = (max_usdt / price // step_size) * step_size
+        quantity = (max_usdt / signal_price // step_size) * step_size
         is_long = signal.signal == Signal.OPEN_LONG
         side = "BUY" if is_long else "SELL"
         stop_side = "SELL" if is_long else "BUY"
 
-        orders.place_market_order(client, symbol, side, quantity)
+        filled_order = attempt_limit_entry(
+            client, symbol, side, quantity, tick_size,
+            signal_price, entry_timeout_secs, max_entry_deviation_pct, entry_max_retries,
+        )
+
+        if filled_order is None:
+            logger.info("{} Limit entry aborted — no position opened.", symbol)
+            return
+
         open_positions[symbol] = Position.LONG if is_long else Position.SHORT
 
+        # Base stop losses and trailing TP on the actual fill price
+        fill_price = filled_order["price"] if filled_order["price"] > 0 else signal_price
+
         if is_long:
-            sl_limit_trigger = _round_price(price * (1 - sl_limit_pct), tick_size)
-            sl_market_trigger = _round_price(price * (1 - sl_market_pct), tick_size)
-            ttp_activation = _round_price(price * (1 + ttp_activation_pct), tick_size)
+            sl_limit_trigger = _round_price(fill_price * (1 - sl_limit_pct), tick_size)
+            sl_market_trigger = _round_price(fill_price * (1 - sl_market_pct), tick_size)
+            ttp_activation = _round_price(fill_price * (1 + ttp_activation_pct), tick_size)
         else:
-            sl_limit_trigger = _round_price(price * (1 + sl_limit_pct), tick_size)
-            sl_market_trigger = _round_price(price * (1 + sl_market_pct), tick_size)
-            ttp_activation = _round_price(price * (1 - ttp_activation_pct), tick_size)
+            sl_limit_trigger = _round_price(fill_price * (1 + sl_limit_pct), tick_size)
+            sl_market_trigger = _round_price(fill_price * (1 + sl_market_pct), tick_size)
+            ttp_activation = _round_price(fill_price * (1 - ttp_activation_pct), tick_size)
 
         sl_limit_order = algo_orders.place_stop_limit_order(
             client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
@@ -203,6 +299,11 @@ def _run() -> None:
     ttp_activation_pct = Decimal(str(cfg["risk"].get("trailing_take_profit_activation_pct", 1.0))) / 100
     ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
 
+    entry_cfg = cfg.get("entry", {})
+    entry_timeout_secs: int = int(entry_cfg.get("limit_order_timeout_secs", 20))
+    max_entry_deviation_pct = Decimal(str(entry_cfg.get("max_price_deviation_pct", 0.3))) / 100
+    entry_max_retries: int = int(entry_cfg.get("max_retries", 3))
+
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
     open_positions = recover_positions(client, symbols)
     stop_order_ids: dict[str, list[int]] = {s: [] for s in symbols}
@@ -253,7 +354,8 @@ def _run() -> None:
                 execute_signal(client, symbol, signal, risk.max_position_usdt,
                                sym_info[symbol], open_positions, stop_order_ids,
                                trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
-                               ttp_activation_pct, ttp_callback_rate)
+                               ttp_activation_pct, ttp_callback_rate,
+                               entry_timeout_secs, max_entry_deviation_pct, entry_max_retries)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)

@@ -67,9 +67,9 @@ def ma_crossover(candles: list[dict], symbol: str, position: Position, params: d
 
     # No position — look for entry
     if cross_up:
-        return TradeSignal(signal=Signal.OPEN_LONG, symbol=symbol, reason="fast SMA crossed above slow SMA")
+        return TradeSignal(signal=Signal.OPEN_LONG, symbol=symbol, reason="fast SMA crossed above slow SMA", entry_price=closes[-1])
     if cross_down:
-        return TradeSignal(signal=Signal.OPEN_SHORT, symbol=symbol, reason="fast SMA crossed below slow SMA")
+        return TradeSignal(signal=Signal.OPEN_SHORT, symbol=symbol, reason="fast SMA crossed below slow SMA", entry_price=closes[-1])
     return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="no crossover")
 
 

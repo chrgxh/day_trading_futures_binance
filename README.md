@@ -86,11 +86,16 @@ Plain `pytest` (no `-m integration`) skips all integration tests.
 - `BINANCE_TESTNET=true` — connects to testnet by default
 - Kill switch in `config.yaml` (`risk.kill_switch: true`) blocks all trades instantly
 - Max position size and max daily loss enforced in `bot.py` before any order reaches the exchange
+- **GTX (Post-Only) limit entry** — positions are opened with a maker-only limit order instead of a market order:
+  - `entry.limit_order_timeout_secs` (default `20`) — seconds to wait for a fill before cancelling and retrying
+  - `entry.max_price_deviation_pct` (default `0.3`) — abort entry if price drifts more than this % from the crossover price
+  - `entry.max_retries` (default `3`) — max placement attempts before giving up on the signal
+  - GTX orders are auto-cancelled by Binance if they would fill as a taker (protecting against high maker fees); the bot retries at the new price
 - Dual stop losses placed automatically on every position open:
   - `risk.stop_loss_limit_pct` (default `1.0`) — stop-limit, preferred exit with less slippage
   - `risk.stop_loss_market_pct` (default `2.0`) — stop-market, safety net if price gaps past the limit
   - Both are cancelled automatically when the strategy signals a close
 - Trailing take profit placed automatically on every position open (Binance `TRAILING_STOP_MARKET`):
   - `risk.trailing_take_profit_activation_pct` (default `1.0`) — % move in profit before trailing activates
-  - `risk.trailing_take_profit_callback_rate` (default `2.0`) — % reversal from peak that triggers the close
+  - `risk.trailing_take_profit_callback_rate` (default `0.2`) — % reversal from peak that triggers the close
   - Cancelled automatically when the strategy signals a close
