@@ -1,8 +1,8 @@
 """Entry point. Orchestrates the bot loop and enforces risk controls."""
 
 import os
+import queue
 import sys
-import time
 from decimal import Decimal
 
 import yaml
@@ -194,7 +194,6 @@ def _run() -> None:
 
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
-    loop_sleep: int = cfg["trading"]["loop_interval_seconds"]
     strategy_fn = STRATEGIES[cfg["trading"]["strategy"]]
     strategy_params: dict = cfg["trading"].get("strategy_params", {})
     logger.info("Strategy: {}", cfg["trading"]["strategy"])
@@ -209,12 +208,42 @@ def _run() -> None:
     stop_order_ids: dict[str, list[int]] = {s: [] for s in symbols}
     trailing_tp_order_ids: dict[str, int | None] = {s: None for s in symbols}
 
-    while True:
-        for symbol in symbols:
+    # Pre-fetch candle history so strategies have enough data on the first tick.
+    candle_limit = 200
+    candle_buffers: dict[str, list[dict]] = {}
+    for symbol in symbols:
+        candle_buffers[symbol] = market.get_futures_ohlcv(client, symbol, interval, limit=candle_limit)
+        logger.info("Prefetched {} candles for {}", len(candle_buffers[symbol]), symbol)
+
+    # WebSocket callbacks run in background threads — route events through a queue
+    # so all state mutations happen on the main thread.
+    event_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+    def on_closed_candle(symbol: str, candle: dict) -> None:
+        event_queue.put((symbol, candle))
+
+    twm = market.start_kline_streams(
+        env["api_key"], env["api_secret"], env["testnet"],
+        symbols, interval, on_closed_candle,
+    )
+
+    try:
+        while True:
+            symbol, candle = event_queue.get()
+
+            buf = candle_buffers[symbol]
+            # The last REST candle may have been open at prefetch time; replace it if
+            # the closed WS candle covers the same period, otherwise append.
+            if buf and candle["open_time"] == buf[-1]["open_time"]:
+                buf[-1] = candle
+            else:
+                buf.append(candle)
+                if len(buf) > candle_limit:
+                    buf.pop(0)
+
             try:
                 position = open_positions[symbol]
-                candles = market.get_futures_ohlcv(client, symbol, interval)
-                signal = strategy_fn(candles, symbol, position, strategy_params)
+                signal = strategy_fn(buf, symbol, position, strategy_params)
 
                 logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
 
@@ -229,8 +258,9 @@ def _run() -> None:
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
 
-        logger.debug("Loop complete. Sleeping {}s.", loop_sleep)
-        time.sleep(loop_sleep)
+    finally:
+        twm.stop()
+        logger.info("WebSocket streams stopped.")
 
 
 if __name__ == "__main__":

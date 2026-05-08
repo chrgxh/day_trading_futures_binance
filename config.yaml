@@ -3,7 +3,6 @@ trading:
     - BTCUSDT
     - ETHUSDT
   interval: "5m"
-  loop_interval_seconds: 1
   strategy: ma_crossover
   strategy_params:
     fast_period: 9

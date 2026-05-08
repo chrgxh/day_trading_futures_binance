@@ -3,8 +3,9 @@
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
+from binance import ThreadedWebsocketManager
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from dateutil import parser as dateutil_parser
@@ -78,6 +79,72 @@ def get_futures_ohlcv(
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_ohlcv failed for {}: {}", symbol, exc)
         raise
+
+
+def parse_kline_ws(msg: dict) -> dict | None:
+    """Parse a Binance WebSocket kline event and return the candle dict if the candle is closed.
+
+    Args:
+        msg: Raw message dict from a kline WebSocket stream.
+
+    Returns:
+        Candle dict (open_time, open, high, low, close, volume, close_time) if the
+        candle is closed, otherwise None. Prices and volume are Decimal.
+    """
+    if msg.get("e") != "kline" or not msg["k"]["x"]:
+        return None
+    k = msg["k"]
+    return {
+        "open_time": k["t"],
+        "open": Decimal(k["o"]),
+        "high": Decimal(k["h"]),
+        "low": Decimal(k["l"]),
+        "close": Decimal(k["c"]),
+        "volume": Decimal(k["v"]),
+        "close_time": k["T"],
+    }
+
+
+def start_kline_streams(
+    api_key: str,
+    api_secret: str,
+    testnet: bool,
+    symbols: list[str],
+    interval: str,
+    on_closed_candle: Callable[[str, dict], None],
+) -> ThreadedWebsocketManager:
+    """Subscribe to futures kline streams for each symbol and call on_closed_candle on every close.
+
+    The callback is invoked from a background thread — callers must ensure any shared state
+    they access inside the callback is thread-safe (e.g. by routing through a queue).
+
+    Args:
+        api_key: Binance API key.
+        api_secret: Binance API secret.
+        testnet: If True, connects to the futures testnet WebSocket endpoint.
+        symbols: List of trading pairs to subscribe to.
+        interval: Kline interval, e.g. "5m".
+        on_closed_candle: Called with (symbol, candle_dict) whenever a candle closes.
+
+    Returns:
+        The running ThreadedWebsocketManager. Call .stop() on shutdown.
+    """
+    def make_callback(sym: str) -> Callable[[dict], None]:
+        def handle(msg: dict) -> None:
+            try:
+                candle = parse_kline_ws(msg)
+                if candle is not None:
+                    on_closed_candle(sym, candle)
+            except Exception as exc:
+                logger.error("WS kline handler error for {}: {}", sym, exc)
+        return handle
+
+    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret, testnet=testnet)
+    twm.start()
+    for symbol in symbols:
+        twm.start_kline_futures_socket(callback=make_callback(symbol), symbol=symbol, interval=interval)
+    logger.info("Kline WebSocket streams started for {} @ {}", symbols, interval)
+    return twm
 
 
 def get_futures_mark_price(client: Client, symbol: str) -> Decimal:

@@ -1,6 +1,6 @@
 # Binance Futures Trading Bot
 
-Automated futures trading bot for Binance. Evaluates technical indicators on a configurable interval and places futures orders when a signal triggers, subject to risk controls.
+Automated futures trading bot for Binance. Subscribes to Binance Futures kline WebSocket streams and evaluates technical indicators on every candle close, placing orders when a signal triggers subject to risk controls.
 
 ## Structure
 
@@ -13,7 +13,7 @@ utils/
   orders.py              — regular orders: market, limit, get_open_orders, cancel, cancel_all
   algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
   positions.py           — position management: close_position
-  market.py              — public data: OHLCV candles, mark price
+  market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
   indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX)
 config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
 .env                     — mainnet API keys and runtime flags (never commit)
@@ -48,7 +48,7 @@ Strategy selection and parameters live in `config.yaml` under `trading.strategy`
 | `momentum` | EMA 9/21 crossover confirmed by MACD histogram direction and ADX trend strength |
 | `ma_crossover` | Simple SMA crossover (fast period vs slow period) |
 
-To add a new strategy: write a function `(candles, symbol, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
+To add a new strategy: write a function `(candles, symbol, position, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
 
 ## Running
 
