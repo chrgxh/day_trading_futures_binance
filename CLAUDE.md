@@ -65,7 +65,7 @@ day-trading-bot/
 ## Design decisions
 
 - **Testnet vs mainnet toggle.** `BINANCE_TESTNET=true` in `.env`. Default to testnet for safety.
-- **Risk controls live in `bot.py`** — max position size, max daily loss, kill switch. Strategies decide intent; `bot.py` enforces limits before anything reaches `utils/account.py`.
+- **Risk controls live in `bot.py`** — max position size, max daily loss, kill switch. Strategies decide intent; `bot.py` enforces limits before anything reaches `utils/account.py`. On every position open, `bot.py` places dual stop losses (stop-limit + stop-market via the algo API) and a trailing take profit (`TRAILING_STOP_MARKET` via the regular order API). All three are cancelled explicitly on a CLOSE signal.
 - **Retry with backoff lives in `utils/general.py`** via `with_retry()`. All order and account modules import it from there — nothing else reinvents it.
 - **State persistence on crash.** On startup, re-query Binance for open positions rather than trusting a local cache.
 - **Config separation.** Secrets in `.env`, everything else (symbols, intervals, risk limits, strategy selection and params) in `config.yaml`.

@@ -93,6 +93,59 @@ def get_open_orders(client: Client, symbol: str) -> list[dict]:
         raise
 
 
+def place_trailing_stop_order(
+    client: Client,
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    callback_rate: Decimal,
+    activation_price: Decimal | None = None,
+) -> dict:
+    """Place a trailing-stop-market order that follows price and triggers on reversal.
+
+    The stop price trails the best mark price seen since activation by callback_rate%.
+    For a long (side=SELL): stop trails upward and triggers when price falls back by
+    callback_rate%. For a short (side=BUY): stop trails downward and triggers on reversal.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+        side: "BUY" or "SELL" — opposite to the open position side.
+        quantity: Order quantity in base asset units.
+        callback_rate: Trailing callback percentage (0.1–5.0).
+        activation_price: Mark price at which trailing begins. If None, starts immediately
+            from the best price seen at order placement.
+
+    Returns:
+        Normalised order dict (is_algo=True). Cancel via cancel_algo_order(), not cancel_order().
+        Binance treats TRAILING_STOP_MARKET as a conditional order and returns an algoId.
+    """
+    try:
+        params: dict = dict(
+            symbol=symbol,
+            side=side,
+            type="TRAILING_STOP_MARKET",
+            quantity=str(quantity),
+            callbackRate=str(callback_rate),
+            reduceOnly=True,
+        )
+        if activation_price is not None:
+            params["activationPrice"] = str(activation_price)
+        raw = with_retry(lambda: client.futures_create_order(**params))
+        order = _normalize_algo_order({**params, "origQty": params["quantity"], **raw})
+        logger.info(
+            "Trailing stop order placed: {} {} {} callback={}% activation={} | id={} status={}",
+            side, quantity, symbol, callback_rate, activation_price, order["order_id"], order["status"],
+        )
+        return order
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error(
+            "place_trailing_stop_order failed ({} {} {} callback={}%): {}",
+            side, quantity, symbol, callback_rate, exc,
+        )
+        raise
+
+
 def cancel_order(client: Client, symbol: str, order_id: int) -> dict:
     """Cancel a specific regular (non-algo) open order.
 

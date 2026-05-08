@@ -14,8 +14,10 @@ risk:
   max_daily_loss_usdt: 50.0
   kill_switch: false
   leverage: 10
-  stop_loss_limit_pct: 1.0    # Stop-limit SL: preferred exit, less slippage
-  stop_loss_market_pct: 2.0   # Stop-market SL: safety net if price gaps past limit
+  stop_loss_limit_pct: 1.0                   # Stop-limit SL: preferred exit, less slippage
+  stop_loss_market_pct: 2.0                  # Stop-market SL: safety net if price gaps past limit
+  trailing_take_profit_activation_pct: 1.0   # % move in profit before trailing TP activates
+  trailing_take_profit_callback_rate: 0.2    # % price reversal from peak that triggers the trailing TP
 
 logging:
   level: INFO

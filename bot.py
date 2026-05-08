@@ -75,10 +75,13 @@ def execute_signal(
     sym_info: dict,
     open_positions: dict[str, Position],
     stop_order_ids: dict[str, list[int]],
+    trailing_tp_order_ids: dict[str, int | None],
     sl_limit_pct: Decimal,
     sl_market_pct: Decimal,
+    ttp_activation_pct: Decimal,
+    ttp_callback_rate: Decimal,
 ) -> None:
-    """Place the order for a non-HOLD signal, set dual stop losses on open, cancel on close."""
+    """Place the order for a non-HOLD signal, set stop losses + trailing TP on open, cancel on close."""
     if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
         price = market.get_futures_mark_price(client, symbol)
         step_size = sym_info["step_size"]
@@ -94,9 +97,11 @@ def execute_signal(
         if is_long:
             sl_limit_trigger = _round_price(price * (1 - sl_limit_pct), tick_size)
             sl_market_trigger = _round_price(price * (1 - sl_market_pct), tick_size)
+            ttp_activation = _round_price(price * (1 + ttp_activation_pct), tick_size)
         else:
             sl_limit_trigger = _round_price(price * (1 + sl_limit_pct), tick_size)
             sl_market_trigger = _round_price(price * (1 + sl_market_pct), tick_size)
+            ttp_activation = _round_price(price * (1 - ttp_activation_pct), tick_size)
 
         sl_limit_order = algo_orders.place_stop_limit_order(
             client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
@@ -106,6 +111,11 @@ def execute_signal(
         )
         stop_order_ids[symbol] = [sl_limit_order["order_id"], sl_market_order["order_id"]]
 
+        ttp_order = orders.place_trailing_stop_order(
+            client, symbol, stop_side, quantity, ttp_callback_rate, ttp_activation
+        )
+        trailing_tp_order_ids[symbol] = ttp_order["order_id"]
+
     elif signal.signal == Signal.CLOSE:
         for algo_id in stop_order_ids.get(symbol, []):
             try:
@@ -113,6 +123,14 @@ def execute_signal(
             except Exception as exc:
                 logger.warning("Could not cancel stop order {} for {}: {}", algo_id, symbol, exc)
         stop_order_ids[symbol] = []
+
+        ttp_id = trailing_tp_order_ids.get(symbol)
+        if ttp_id is not None:
+            try:
+                algo_orders.cancel_algo_order(client, symbol, ttp_id)
+            except Exception as exc:
+                logger.warning("Could not cancel trailing TP order {} for {}: {}", ttp_id, symbol, exc)
+            trailing_tp_order_ids[symbol] = None
 
         pos_utils.close_position(client, symbol)
         open_positions[symbol] = Position.NONE
@@ -183,10 +201,13 @@ def _run() -> None:
 
     sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
     sl_market_pct = Decimal(str(cfg["risk"].get("stop_loss_market_pct", 2.0))) / 100
+    ttp_activation_pct = Decimal(str(cfg["risk"].get("trailing_take_profit_activation_pct", 1.0))) / 100
+    ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
 
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
     open_positions = recover_positions(client, symbols)
     stop_order_ids: dict[str, list[int]] = {s: [] for s in symbols}
+    trailing_tp_order_ids: dict[str, int | None] = {s: None for s in symbols}
 
     while True:
         for symbol in symbols:
@@ -202,7 +223,8 @@ def _run() -> None:
 
                 execute_signal(client, symbol, signal, risk.max_position_usdt,
                                sym_info[symbol], open_positions, stop_order_ids,
-                               sl_limit_pct, sl_market_pct)
+                               trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
+                               ttp_activation_pct, ttp_callback_rate)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
