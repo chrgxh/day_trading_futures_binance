@@ -34,11 +34,21 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def load_env() -> dict:
-    load_dotenv()
-    required = ("BINANCE_API_KEY", "BINANCE_API_SECRET")
+    env_path = ".env"
+    if not os.path.exists(env_path):
+        logger.error("Bot cannot start — .env file not found. Copy .env.example to .env and fill in all values.")
+        sys.exit(1)
+    load_dotenv(env_path)
+    required = (
+        "BINANCE_API_KEY",
+        "BINANCE_API_SECRET",
+        "RESEND_API_KEY",
+        "CRASH_NOTIFY_EMAIL",
+        "CRASH_NOTIFY_FROM_EMAIL",
+    )
     missing = [k for k in required if not os.getenv(k)]
     if missing:
-        logger.error("Missing required environment variables: {}", missing)
+        logger.error("Bot cannot start — missing required environment variables: {}", missing)
         sys.exit(1)
     return {
         "api_key": os.environ["BINANCE_API_KEY"],
