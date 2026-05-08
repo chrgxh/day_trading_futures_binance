@@ -84,7 +84,7 @@ def place_limit_order(
         return order
     except BinanceAPIException as exc:
         if time_in_force == "GTX" and (
-            "GTX" in str(exc) or getattr(exc, "code", None) == -4129
+            "GTX" in str(exc) or getattr(exc, "code", None) in (-4129, -5022)
         ):
             logger.info("GTX post-only order rejected (would be taker): {} {} {} @ {}", side, quantity, symbol, price)
             raise PostOnlyRejected(str(exc)) from exc

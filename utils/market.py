@@ -1,17 +1,23 @@
 """Public market data — no authentication required."""
 
+import asyncio
+import json
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 
-from binance import ThreadedWebsocketManager
+import websockets
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from dateutil import parser as dateutil_parser
 from loguru import logger
 
 from utils.general import with_retry
+
+_FSTREAM_URL = "wss://fstream.binance.com"
+_FSTREAM_TESTNET_URL = "wss://stream.binancefuture.com"
 
 
 def _to_ms(date_str: str) -> int:
@@ -146,6 +152,85 @@ def parse_kline_ws(msg: dict) -> dict | None:
     }
 
 
+class _KlineStreamManager:
+    """Direct WebSocket connection to Binance Futures kline streams.
+
+    Replaces ThreadedWebsocketManager, which has a known bug where
+    start_kline_futures_socket() ignores testnet=True and always connects
+    to the mainnet fstream URL (python-binance issues #929, #1040).
+    """
+
+    def __init__(
+        self,
+        testnet: bool,
+        symbols: list[str],
+        interval: str,
+        on_closed_candle: Callable[[str, dict], None],
+    ) -> None:
+        self._testnet = testnet
+        self._symbols = symbols
+        self._interval = interval
+        self._on_closed_candle = on_closed_candle
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._thread_main, daemon=True, name="kline-ws")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+
+    def _thread_main(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._stream_loop())
+        except Exception as exc:
+            if not self._stop.is_set():
+                logger.error("Kline WS thread error: {}", exc)
+        finally:
+            self._loop.close()
+
+    async def _stream_loop(self) -> None:
+        base = _FSTREAM_TESTNET_URL if self._testnet else _FSTREAM_URL
+        streams = "/".join(f"{s.lower()}@kline_{self._interval}" for s in self._symbols)
+        url = f"{base}/stream?streams={streams}"
+
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=60) as ws:
+                    logger.debug("Kline WS connected: {}", url)
+                    async for raw in ws:
+                        if self._stop.is_set():
+                            return
+                        try:
+                            wrapper = json.loads(raw)
+                            data = wrapper.get("data", wrapper)
+                            stream = wrapper.get("stream", "")
+                            symbol = stream.split("@")[0].upper() if "@" in stream else ""
+                            candle = parse_kline_ws(data)
+                            if candle is not None and symbol:
+                                self._on_closed_candle(symbol, candle)
+                        except Exception as exc:
+                            logger.error("WS kline handler error: {}", exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if self._stop.is_set():
+                    return
+                logger.warning("Kline WS disconnected ({}), reconnecting in 5s", exc)
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    return
+
+
 def start_kline_streams(
     api_key: str,
     api_secret: str,
@@ -153,7 +238,7 @@ def start_kline_streams(
     symbols: list[str],
     interval: str,
     on_closed_candle: Callable[[str, dict], None],
-) -> ThreadedWebsocketManager:
+) -> _KlineStreamManager:
     """Subscribe to futures kline streams for each symbol and call on_closed_candle on every close.
 
     The callback is invoked from a background thread — callers must ensure any shared state
@@ -168,24 +253,12 @@ def start_kline_streams(
         on_closed_candle: Called with (symbol, candle_dict) whenever a candle closes.
 
     Returns:
-        The running ThreadedWebsocketManager. Call .stop() on shutdown.
+        The running _KlineStreamManager. Call .stop() on shutdown.
     """
-    def make_callback(sym: str) -> Callable[[dict], None]:
-        def handle(msg: dict) -> None:
-            try:
-                candle = parse_kline_ws(msg)
-                if candle is not None:
-                    on_closed_candle(sym, candle)
-            except Exception as exc:
-                logger.error("WS kline handler error for {}: {}", sym, exc)
-        return handle
-
-    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret, testnet=testnet)
-    twm.start()
-    for symbol in symbols:
-        twm.start_kline_futures_socket(callback=make_callback(symbol), symbol=symbol, interval=interval)
+    mgr = _KlineStreamManager(testnet, symbols, interval, on_closed_candle)
+    mgr.start()
     logger.info("Kline WebSocket streams started for {} @ {}", symbols, interval)
-    return twm
+    return mgr
 
 
 def get_futures_mark_price(client: Client, symbol: str) -> Decimal:
