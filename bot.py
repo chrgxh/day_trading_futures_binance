@@ -35,10 +35,8 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def load_env() -> dict:
     env_path = ".env"
-    if not os.path.exists(env_path):
-        logger.error("Bot cannot start — .env file not found. Copy .env.example to .env and fill in all values.")
-        sys.exit(1)
-    load_dotenv(env_path)
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
     required = (
         "BINANCE_API_KEY",
         "BINANCE_API_SECRET",
