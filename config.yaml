@@ -2,8 +2,8 @@ trading:
   symbols:
     - BTCUSDT
     - ETHUSDT
-  interval: "1m"
-  loop_interval_seconds: 60
+  interval: "5m"
+  loop_interval_seconds: 1
   strategy: ma_crossover
   strategy_params:
     fast_period: 9
@@ -14,6 +14,8 @@ risk:
   max_daily_loss_usdt: 50.0
   kill_switch: false
   leverage: 10
+  stop_loss_limit_pct: 1.0    # Stop-limit SL: preferred exit, less slippage
+  stop_loss_market_pct: 2.0   # Stop-market SL: safety net if price gaps past limit
 
 logging:
   level: INFO

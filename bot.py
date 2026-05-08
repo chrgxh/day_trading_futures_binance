@@ -9,7 +9,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from utils import account, general, market, orders
+from utils import account, algo_orders, general, market, orders
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal
 from strategies import STRATEGIES
@@ -63,23 +63,57 @@ def recover_positions(client, symbols: list[str]) -> dict[str, Position]:
     return open_positions
 
 
+def _round_price(price: Decimal, tick_size: Decimal) -> Decimal:
+    return (price / tick_size).to_integral_value() * tick_size
+
+
 def execute_signal(
     client,
     symbol: str,
     signal: TradeSignal,
     max_usdt: Decimal,
-    step_size: Decimal,
+    sym_info: dict,
     open_positions: dict[str, Position],
+    stop_order_ids: dict[str, list[int]],
+    sl_limit_pct: Decimal,
+    sl_market_pct: Decimal,
 ) -> None:
-    """Place the order for a non-HOLD signal and update open_positions."""
+    """Place the order for a non-HOLD signal, set dual stop losses on open, cancel on close."""
     if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
         price = market.get_futures_mark_price(client, symbol)
+        step_size = sym_info["step_size"]
+        tick_size = sym_info["tick_size"]
         quantity = (max_usdt / price // step_size) * step_size
-        side = "BUY" if signal.signal == Signal.OPEN_LONG else "SELL"
+        is_long = signal.signal == Signal.OPEN_LONG
+        side = "BUY" if is_long else "SELL"
+        stop_side = "SELL" if is_long else "BUY"
+
         orders.place_market_order(client, symbol, side, quantity)
-        open_positions[symbol] = Position.LONG if signal.signal == Signal.OPEN_LONG else Position.SHORT
+        open_positions[symbol] = Position.LONG if is_long else Position.SHORT
+
+        if is_long:
+            sl_limit_trigger = _round_price(price * (1 - sl_limit_pct), tick_size)
+            sl_market_trigger = _round_price(price * (1 - sl_market_pct), tick_size)
+        else:
+            sl_limit_trigger = _round_price(price * (1 + sl_limit_pct), tick_size)
+            sl_market_trigger = _round_price(price * (1 + sl_market_pct), tick_size)
+
+        sl_limit_order = algo_orders.place_stop_limit_order(
+            client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
+        )
+        sl_market_order = algo_orders.place_stop_market_order(
+            client, symbol, stop_side, quantity, sl_market_trigger
+        )
+        stop_order_ids[symbol] = [sl_limit_order["order_id"], sl_market_order["order_id"]]
 
     elif signal.signal == Signal.CLOSE:
+        for algo_id in stop_order_ids.get(symbol, []):
+            try:
+                algo_orders.cancel_algo_order(client, symbol, algo_id)
+            except Exception as exc:
+                logger.warning("Could not cancel stop order {} for {}: {}", algo_id, symbol, exc)
+        stop_order_ids[symbol] = []
+
         pos_utils.close_position(client, symbol)
         open_positions[symbol] = Position.NONE
 
@@ -147,8 +181,12 @@ def _run() -> None:
     strategy_params: dict = cfg["trading"].get("strategy_params", {})
     logger.info("Strategy: {}", cfg["trading"]["strategy"])
 
+    sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
+    sl_market_pct = Decimal(str(cfg["risk"].get("stop_loss_market_pct", 2.0))) / 100
+
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
     open_positions = recover_positions(client, symbols)
+    stop_order_ids: dict[str, list[int]] = {s: [] for s in symbols}
 
     while True:
         for symbol in symbols:
@@ -163,7 +201,8 @@ def _run() -> None:
                     continue
 
                 execute_signal(client, symbol, signal, risk.max_position_usdt,
-                               sym_info[symbol]["step_size"], open_positions)
+                               sym_info[symbol], open_positions, stop_order_ids,
+                               sl_limit_pct, sl_market_pct)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)

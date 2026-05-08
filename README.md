@@ -86,3 +86,7 @@ Plain `pytest` (no `-m integration`) skips all integration tests.
 - `BINANCE_TESTNET=true` — connects to testnet by default
 - Kill switch in `config.yaml` (`risk.kill_switch: true`) blocks all trades instantly
 - Max position size and max daily loss enforced in `bot.py` before any order reaches the exchange
+- Dual stop losses placed automatically on every position open:
+  - `risk.stop_loss_limit_pct` (default `1.0`) — stop-limit, preferred exit with less slippage
+  - `risk.stop_loss_market_pct` (default `2.0`) — stop-market, safety net if price gaps past the limit
+  - Both are cancelled automatically when the strategy signals a close
