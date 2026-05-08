@@ -2,17 +2,18 @@ trading:
   symbols:
     - BTCUSDT
     - ETHUSDT
-  interval: "15m"
-  # 840 candles ≈ 210 complete 1h bars after resampling — required by ema_trend_momentum
-  # for the 1h 200 EMA trend filter. Reduce to 200 if switching back to ma_crossover.
-  candle_limit: 840
+  interval: "1m"
+  # candle_limit is auto-computed from interval: (200 * 60 / interval_minutes) + 50.
+  # Set explicitly here only if you need to override (e.g. candle_limit: 500).
   strategy: ema_trend_momentum
   strategy_params:
-    fast_period: 9              # Fast EMA period on 15m
-    slow_period: 21             # Slow EMA period on 15m
-    trend_period: 200           # EMA period on 1h for trend gate
-    rsi_period: 14              # RSI lookback
-    volume_lookback: 20         # Candles used to compute RVOL baseline
+    reference_interval: "15m"  # All periods below are calibrated to this interval.
+                                # When interval differs, periods scale automatically.
+    fast_period: 9              # Fast EMA period at reference_interval
+    slow_period: 21             # Slow EMA period at reference_interval
+    trend_period: 200           # EMA period on 1h for trend gate (interval-independent)
+    rsi_period: 14              # RSI lookback at reference_interval
+    volume_lookback: 20         # RVOL baseline candles at reference_interval
     volume_multiplier: 1.2      # Current candle volume must exceed baseline by this multiple
     rsi_long_low: 50            # RSI floor for long entry
     rsi_long_high: 70           # RSI ceiling for long entry

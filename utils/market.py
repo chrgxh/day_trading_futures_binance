@@ -11,6 +11,8 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from dateutil import parser as dateutil_parser
 from loguru import logger
 
+from utils.general import with_retry
+
 
 def _to_ms(date_str: str) -> int:
     """Convert a date string to milliseconds since UTC epoch.
@@ -33,6 +35,24 @@ def _to_ms(date_str: str) -> int:
     return int((dt - epoch).total_seconds() * 1000)
 
 
+_BINANCE_KLINE_LIMIT = 1500
+
+
+def _parse_candles(raw: list) -> list[dict]:
+    return [
+        {
+            "open_time": row[0],
+            "open": Decimal(row[1]),
+            "high": Decimal(row[2]),
+            "low": Decimal(row[3]),
+            "close": Decimal(row[4]),
+            "volume": Decimal(row[5]),
+            "close_time": row[6],
+        }
+        for row in raw
+    ]
+
+
 def get_futures_ohlcv(
     client: Client,
     symbol: str,
@@ -43,11 +63,14 @@ def get_futures_ohlcv(
 ) -> list[dict]:
     """Fetch OHLCV candle data as a list of named dicts.
 
+    Paginates automatically when limit > 1500 (Binance's per-request cap),
+    walking backwards from the most recent candle.
+
     Args:
         client: Authenticated Binance client.
         symbol: Trading pair, e.g. "BTCUSDT".
         interval: Kline interval, e.g. "1m", "5m", "1h", "1d".
-        limit: Max candles to return (1–1000).
+        limit: Max candles to return.
         start_str: Optional start time, e.g. "1 Jan 2024", "2 hours ago UTC".
         end_str: Optional end time in the same format as start_str.
 
@@ -56,28 +79,46 @@ def get_futures_ohlcv(
         close_time. Prices and volume are Decimal.
     """
     try:
-        kwargs: dict = {"symbol": symbol, "interval": interval, "limit": limit}
-        if start_str is not None:
-            kwargs["startTime"] = _to_ms(start_str)
-        if end_str is not None:
-            kwargs["endTime"] = _to_ms(end_str)
-        raw = client.futures_klines(**kwargs)
-        candles = [
-            {
-                "open_time": row[0],
-                "open": Decimal(row[1]),
-                "high": Decimal(row[2]),
-                "low": Decimal(row[3]),
-                "close": Decimal(row[4]),
-                "volume": Decimal(row[5]),
-                "close_time": row[6],
-            }
-            for row in raw
-        ]
-        logger.debug("Fetched {} OHLCV candles for {} @ {}", len(candles), symbol, interval)
-        return candles
+        if start_str is not None or end_str is not None:
+            kwargs: dict = {"symbol": symbol, "interval": interval, "limit": min(limit, _BINANCE_KLINE_LIMIT)}
+            if start_str is not None:
+                kwargs["startTime"] = _to_ms(start_str)
+            if end_str is not None:
+                kwargs["endTime"] = _to_ms(end_str)
+            raw = with_retry(lambda: client.futures_klines(**kwargs))
+            candles = _parse_candles(raw)
+            logger.debug("Fetched {} OHLCV candles for {} @ {}", len(candles), symbol, interval)
+            return candles
+
+        all_candles: list[dict] = []
+        end_ms: Optional[int] = None
+        remaining = limit
+        num_requests = 0
+
+        while remaining > 0:
+            batch = min(remaining, _BINANCE_KLINE_LIMIT)
+            end_ts = end_ms
+            raw = with_retry(lambda: client.futures_klines(
+                symbol=symbol, interval=interval, limit=batch,
+                **({'endTime': end_ts} if end_ts is not None else {}),
+            ))
+            num_requests += 1
+            if not raw:
+                break
+            all_candles = _parse_candles(raw) + all_candles
+            remaining -= len(raw)
+            if len(raw) < batch:
+                break
+            end_ms = raw[0][0] - 1
+
+        logger.info(
+            "Prefetched {} OHLCV candles for {} @ {} ({} request{})",
+            len(all_candles), symbol, interval, num_requests, "s" if num_requests != 1 else "",
+        )
+        return all_candles[-limit:]
+
     except (BinanceAPIException, BinanceRequestException) as exc:
-        logger.error("get_ohlcv failed for {}: {}", symbol, exc)
+        logger.error("get_futures_ohlcv failed for {}: {}", symbol, exc)
         raise
 
 

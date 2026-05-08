@@ -30,6 +30,17 @@ def test_get_futures_ohlcv_with_start_str(client, symbol):
     assert all("close" in c for c in candles)
 
 
+def test_get_futures_ohlcv_pagination(client, symbol):
+    """Verify pagination kicks in when limit exceeds Binance's 1500-candle cap."""
+    candles = market.get_futures_ohlcv(client, symbol, "1m", limit=1600)
+    assert len(candles) == 1600
+    # Chronological order
+    assert candles[0]["open_time"] < candles[-1]["open_time"]
+    # No gaps — consecutive 1m open_times are exactly 60 000 ms apart
+    for i in range(1, len(candles)):
+        assert candles[i]["open_time"] == candles[i - 1]["open_time"] + 60_000
+
+
 def test_parse_kline_ws_closed_candle():
     msg = {
         "e": "kline",

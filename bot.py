@@ -13,7 +13,7 @@ from loguru import logger
 from utils import account, algo_orders, general, market, orders
 from utils.general import PostOnlyRejected
 from utils import positions as pos_utils
-from utils.indicators import Position, Signal, TradeSignal
+from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
 from strategies import STRATEGIES
 
 
@@ -291,7 +291,8 @@ def _run() -> None:
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
     strategy_fn = STRATEGIES[cfg["trading"]["strategy"]]
-    strategy_params: dict = cfg["trading"].get("strategy_params", {})
+    # Inject the active interval so strategies can scale their periods automatically.
+    strategy_params: dict = {**cfg["trading"].get("strategy_params", {}), "_interval": interval}
     logger.info("Strategy: {}", cfg["trading"]["strategy"])
 
     sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
@@ -310,7 +311,15 @@ def _run() -> None:
     trailing_tp_order_ids: dict[str, int | None] = {s: None for s in symbols}
 
     # Pre-fetch candle history so strategies have enough data on the first tick.
-    candle_limit: int = int(cfg["trading"].get("candle_limit", 200))
+    # Auto-compute enough candles for 200 complete 1h bars at the chosen interval,
+    # unless the config explicitly overrides it.
+    _cfg_limit = cfg["trading"].get("candle_limit")
+    if _cfg_limit:
+        candle_limit = int(_cfg_limit)
+    else:
+        interval_min = interval_to_minutes(interval)
+        candle_limit = (200 * 60 // interval_min) + 50
+    logger.info("Candle limit: {} (interval={})", candle_limit, interval)
     candle_buffers: dict[str, list[dict]] = {}
     for symbol in symbols:
         candle_buffers[symbol] = market.get_futures_ohlcv(client, symbol, interval, limit=candle_limit)

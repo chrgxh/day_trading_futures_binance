@@ -15,7 +15,7 @@ utils/
   positions.py           — position management: close_position
   market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
   indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h)
-config.yaml              — symbols, interval, candle_limit, risk limits, strategy selection (safe to commit)
+config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
 .env                     — mainnet API keys and runtime flags (never commit)
 .env.testnet             — testnet API keys for integration tests (never commit)
 tests/
@@ -46,10 +46,12 @@ Strategy selection and parameters live in `config.yaml` under `trading.strategy`
 
 | Key | Description |
 |---|---|
-| `ema_trend_momentum` | **(active)** 15m EMA crossover gated by 1h 200 EMA trend, RVOL spike, and RSI momentum band. No fresh crossover required — any tick where all gates pass opens a trade, so cold-starts and post-close re-entries are immediate. Requires `candle_limit: 840`. |
-| `ma_crossover` | Simple SMA crossover (fast period vs slow period). Requires `candle_limit: 200`. |
+| `ema_trend_momentum` | **(active)** EMA crossover gated by 1h 200 EMA trend, RVOL spike, and RSI momentum band. No fresh crossover required — any tick where all gates pass opens a trade, so cold-starts and post-close re-entries are immediate. |
+| `ma_crossover` | Simple SMA crossover (fast period vs slow period). |
 
 To add a new strategy: write a function `(candles, symbol, position, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
+
+**Changing the interval** (`trading.interval` in `config.yaml`) is all that's needed to switch candle size (e.g. `"15m"` → `"5m"` → `"1m"`). The bot auto-computes the candle prefetch limit, paginates REST requests when needed, and scales all period-based strategy params (EMA fast/slow, RSI, RVOL lookback) so that time coverage stays the same across intervals. The `reference_interval` param in `strategy_params` defines what interval the configured periods are calibrated to (default `"15m"`).
 
 ## Running
 

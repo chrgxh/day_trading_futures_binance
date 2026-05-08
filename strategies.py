@@ -19,7 +19,7 @@ from typing import Callable
 
 from loguru import logger
 
-from utils.indicators import Position, Signal, TradeSignal, ema, resample_to_1h, rsi, sma
+from utils.indicators import Position, Signal, TradeSignal, ema, interval_to_minutes, resample_to_1h, rsi, sma
 
 StrategyFn = Callable[[list[dict], str, Position, dict], TradeSignal]
 
@@ -59,11 +59,18 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             rsi_exit_overbought — RSI level to force-exit longs (default 80)
             rsi_exit_oversold   — RSI level to force-exit shorts (default 20)
     """
-    fast_period: int = params.get("fast_period", 9)
-    slow_period: int = params.get("slow_period", 21)
+    # Scale candle-count periods proportionally when the interval differs from the
+    # reference interval so that time coverage stays the same (e.g. EMA9 on 15m ≈
+    # EMA27 on 5m — both cover ~135 minutes). trend_period is 1h-based and unchanged.
+    ref_min = interval_to_minutes(params.get("reference_interval", "15m"))
+    cur_min = interval_to_minutes(params.get("_interval", "15m"))
+    scale = ref_min / cur_min
+
+    fast_period: int = max(2, round(params.get("fast_period", 9) * scale))
+    slow_period: int = max(3, round(params.get("slow_period", 21) * scale))
     trend_period: int = params.get("trend_period", 200)
-    rsi_period: int = params.get("rsi_period", 14)
-    volume_lookback: int = params.get("volume_lookback", 20)
+    rsi_period: int = max(2, round(params.get("rsi_period", 14) * scale))
+    volume_lookback: int = max(2, round(params.get("volume_lookback", 20) * scale))
     volume_multiplier = Decimal(str(params.get("volume_multiplier", "1.2")))
     rsi_long_low = Decimal(str(params.get("rsi_long_low", "50")))
     rsi_long_high = Decimal(str(params.get("rsi_long_high", "70")))

@@ -31,6 +31,12 @@ class TradeSignal:
     entry_price: Optional[Decimal] = None
 
 
+def interval_to_minutes(interval: str) -> int:
+    """Convert a Binance interval string to minutes (e.g. '5m' → 5, '1h' → 60)."""
+    n, unit = int(interval[:-1]), interval[-1]
+    return {"m": n, "h": n * 60, "d": n * 1440}[unit]
+
+
 def sma(prices: list[Decimal], period: int) -> Decimal:
     """Simple moving average of the last `period` prices.
 
