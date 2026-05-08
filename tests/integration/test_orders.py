@@ -75,6 +75,24 @@ def test_place_post_only_limit_order_maker(client, symbol, sym_info, clean_order
     assert fetched["status"] == "NEW"
 
 
+def test_gtx_order_at_best_bid_queues_as_maker(client, symbol, sym_info, clean_orders):
+    """GTX BUY placed at best bid should queue in the book (not be rejected)."""
+    best_bid, _ = market.get_futures_best_bid_ask(client, symbol)
+    price = best_bid.quantize(sym_info["tick_size"])
+    qty = max(Decimal("0.001"), sym_info["min_qty"]).quantize(sym_info["step_size"])
+
+    order = orders.place_limit_order(client, symbol, "BUY", qty, price, time_in_force="GTX")
+    assert order["order_id"] is not None
+
+    fetched = orders.get_order(client, symbol, order["order_id"])
+    assert fetched["status"] == "NEW"
+
+
+# PostOnlyRejected (GTX taker rejection) cannot be reliably triggered on testnet —
+# the order book is too sparse to guarantee an immediate match even when priced above
+# the best ask. This is confirmed to raise APIError(-5022) on mainnet (see bot logs).
+
+
 def test_place_trailing_stop_order(client, symbol, sym_info, open_position):
     mark = market.get_futures_mark_price(client, symbol)
     qty = abs(open_position["amount"]).quantize(sym_info["step_size"])

@@ -90,8 +90,9 @@ def attempt_limit_entry(
     Returns the filled order dict on success, or None if entry was aborted.
     """
     for attempt in range(1, max_retries + 1):
-        current_price = market.get_futures_mark_price(client, symbol)
-        deviation = abs(current_price - signal_price) / signal_price
+        best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
+        ref_price = best_bid if side == "BUY" else best_ask
+        deviation = abs(ref_price - signal_price) / signal_price
 
         if deviation > max_deviation_pct:
             logger.warning(
@@ -100,7 +101,7 @@ def attempt_limit_entry(
             )
             return None
 
-        limit_price = _round_price(current_price, tick_size)
+        limit_price = _round_price(ref_price, tick_size)
         logger.info(
             "{} Placing GTX limit {} {} @ {} (attempt {}/{})",
             symbol, side, quantity, limit_price, attempt, max_retries,
@@ -109,7 +110,10 @@ def attempt_limit_entry(
         try:
             order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="GTX")
         except PostOnlyRejected:
-            logger.info("{} GTX order rejected (would be taker), retrying immediately", symbol)
+            logger.warning(
+                "{} GTX order rejected on attempt {}/{}: order at {} would be taker",
+                symbol, attempt, max_retries, limit_price,
+            )
             continue
         except Exception:
             raise
@@ -136,10 +140,14 @@ def attempt_limit_entry(
             logger.info("{} Limit entry filled @ {} (attempt {})", symbol, limit_price, attempt)
             return filled_order
 
-        # Cancel the order if it's still open before retrying
+        # Cancel the order if it's still open before retrying.
+        # Re-fetch status first — the order may have filled in the gap since the last poll.
         try:
             latest = orders.get_order(client, symbol, order["order_id"])
-            if latest["status"] not in ("CANCELED", "EXPIRED", "FILLED"):
+            if latest["status"] == "FILLED":
+                logger.info("{} Limit entry filled @ {} (detected at cancel-check, attempt {})", symbol, limit_price, attempt)
+                return latest
+            if latest["status"] not in ("CANCELED", "EXPIRED"):
                 orders.cancel_order(client, symbol, order["order_id"])
                 logger.info("{} Cancelled unfilled limit order {} after {}s timeout", symbol, order["order_id"], timeout_secs)
         except Exception as exc:

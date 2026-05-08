@@ -261,6 +261,27 @@ def start_kline_streams(
     return mgr
 
 
+def get_futures_best_bid_ask(client: Client, symbol: str) -> tuple[Decimal, Decimal]:
+    """Return the current best bid and ask prices for a futures symbol.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+
+    Returns:
+        Tuple of (best_bid, best_ask) as Decimals.
+    """
+    try:
+        ticker = client.futures_orderbook_ticker(symbol=symbol)
+        bid = Decimal(ticker["bidPrice"])
+        ask = Decimal(ticker["askPrice"])
+        logger.debug("Futures best bid/ask {} = {}/{}", symbol, bid, ask)
+        return bid, ask
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_futures_best_bid_ask failed for {}: {}", symbol, exc)
+        raise
+
+
 def get_futures_mark_price(client: Client, symbol: str) -> Decimal:
     """Return the latest futures mark price for a symbol.
 
