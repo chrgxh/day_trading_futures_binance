@@ -2,7 +2,7 @@ trading:
   symbols:
     - BTCUSDT
     - ETHUSDT
-  interval: "1m"
+  interval: "15m"
   # candle_limit is auto-computed from interval: (200 * 60 / interval_minutes) + 50.
   # Set explicitly here only if you need to override (e.g. candle_limit: 500).
   strategy: ema_trend_momentum
