@@ -5,8 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py strategies.py utils.py config.yaml ./
-
-RUN mkdir -p logs
+COPY bot.py strategies.py config.yaml ./
+COPY utils/ utils/
 
 CMD ["python", "bot.py"]
