@@ -33,13 +33,20 @@ def close_position(client: Client, symbol: str) -> Optional[dict]:
         close_side = "SELL" if pos["side"] == "LONG" else "BUY"
         quantity = abs(pos["amount"])
 
-        raw = with_retry(lambda: client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type="MARKET",
-            quantity=str(quantity),
-            reduceOnly=True,
-        ))
+        try:
+            raw = with_retry(lambda: client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="MARKET",
+                quantity=str(quantity),
+                reduceOnly=True,
+            ))
+        except BinanceAPIException as exc:
+            if exc.code == -2022:
+                # Position was already closed (e.g. a timed-out retry actually went through).
+                logger.warning("close_position: position already gone for {} (-2022) — treating as closed.", symbol)
+                return None
+            raise
         order = _normalize_order(raw)
         logger.info("Position closed: {} {} {} | id={} status={}", close_side, quantity, symbol, order["order_id"], order["status"])
         return order
