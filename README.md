@@ -51,7 +51,7 @@ Strategy selection and parameters live in `config.yaml` under `trading.strategy`
 
 To add a new strategy: write a function `(candles, symbol, position, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
 
-**Changing the interval** (`trading.interval` in `config.yaml`) is all that's needed to switch candle size (e.g. `"15m"` → `"5m"` → `"1m"`). The bot auto-computes the candle prefetch limit, paginates REST requests when needed, and scales all period-based strategy params (EMA fast/slow, RSI, RVOL lookback) so that time coverage stays the same across intervals. The `reference_interval` param in `strategy_params` defines what interval the configured periods are calibrated to (default `"15m"`).
+**Changing the interval** (`trading.interval` in `config.yaml`): the bot auto-computes the candle prefetch limit and paginates REST requests when needed. Strategy params (`fast_period`, `slow_period`, `rsi_period`, `volume_lookback`) are used as-is — update them manually when switching intervals. `config.yaml` contains a tuning guide with recommended values for 1m / 5m / 15m / 1h / 4h.
 
 ## Running
 

@@ -6,14 +6,32 @@ trading:
   # candle_limit is auto-computed from interval: (200 * 60 / interval_minutes) + 50.
   # Set explicitly here only if you need to override (e.g. candle_limit: 500).
   strategy: ema_trend_momentum
+  # ── Strategy parameter tuning guide ────────────────────────────────────────
+  # Periods below are used AS-IS — there is no auto-scaling.
+  # When you change trading.interval, update fast_period / slow_period /
+  # rsi_period / volume_lookback to match. Suggested values by interval:
+  #
+  #   interval │ fast │ slow │ rsi_period │ volume_lookback
+  #   ─────────┼──────┼──────┼────────────┼────────────────
+  #   1m       │  3–5 │ 8–13 │     9      │      10
+  #   5m       │  6–9 │13–21 │    14      │      15
+  #   15m      │   9  │  21  │    14      │      20   ← current
+  #   1h       │ 9–12 │21–26 │    14      │      20
+  #   4h       │ 9–12 │21–26 │    14      │      14
+  #
+  # Rules of thumb:
+  #   • slow / fast ratio ≈ 2–3× (9/21 and 12/26 are classic pairs).
+  #   • RSI 14 is reliable across most intervals; tighten to 9 for 1m–3m.
+  #   • volume_lookback of 20 works for most intervals; drop to 10 for 1m.
+  #   • trend_period (1h 200 EMA) is interval-independent — keep it at 200.
+  #   • RSI entry bands (50–70 long / 30–50 short) are interval-independent.
+  # ────────────────────────────────────────────────────────────────────────────
   strategy_params:
-    reference_interval: "15m"  # All periods below are calibrated to this interval.
-                                # When interval differs, periods scale automatically.
-    fast_period: 9              # Fast EMA period at reference_interval
-    slow_period: 21             # Slow EMA period at reference_interval
+    fast_period: 9              # Fast EMA period
+    slow_period: 21             # Slow EMA period (should be ~2–3× fast_period)
     trend_period: 200           # EMA period on 1h for trend gate (interval-independent)
-    rsi_period: 14              # RSI lookback at reference_interval
-    volume_lookback: 20         # RVOL baseline candles at reference_interval
+    rsi_period: 14              # RSI lookback
+    volume_lookback: 20         # RVOL baseline candles
     volume_multiplier: 1.2      # Current candle volume must exceed baseline by this multiple
     rsi_long_low: 50            # RSI floor for long entry
     rsi_long_high: 70           # RSI ceiling for long entry

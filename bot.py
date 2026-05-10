@@ -357,8 +357,7 @@ def _run() -> None:
     symbols: list[str] = cfg["trading"]["symbols"]
     interval: str = cfg["trading"]["interval"]
     strategy_fn = STRATEGIES[cfg["trading"]["strategy"]]
-    # Inject the active interval so strategies can scale their periods automatically.
-    strategy_params: dict = {**cfg["trading"].get("strategy_params", {}), "_interval": interval}
+    strategy_params: dict = cfg["trading"].get("strategy_params", {})
     logger.info("Strategy: {}", cfg["trading"]["strategy"])
 
     sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
