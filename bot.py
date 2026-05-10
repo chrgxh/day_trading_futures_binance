@@ -187,6 +187,16 @@ def attempt_limit_entry(
         best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
         aggressive_ref = best_ask if side == "BUY" else best_bid
         if not _within_deviation(aggressive_ref):
+            if filled_qty > 0:
+                # Price drifted but we already have a partial fill on Binance.
+                # Return partial fill info so execute_signal places stops — a live
+                # position must never be left without protection.
+                logger.warning(
+                    "{} IOC: price drift abort with {} already filled — "
+                    "returning partial fill so stop/TP orders are placed.",
+                    symbol, filled_qty,
+                )
+                return {"price": signal_price, "executed_qty": filled_qty, "status": "PARTIALLY_FILLED"}
             return None
 
         limit_price = round_price(aggressive_ref, tick_size)
@@ -209,6 +219,8 @@ def attempt_limit_entry(
                 )
             if status["status"] == "FILLED" or remaining_qty <= 0:
                 logger.info("{} IOC fully filled after {} attempt(s)", symbol, ioc_attempt)
+                # Patch executed_qty to reflect cumulative fill across all IOC attempts.
+                status["executed_qty"] = filled_qty
                 return status
         except Exception as exc:
             logger.warning("{} Could not check IOC order {}: {}", symbol, ioc_order["order_id"], exc)
@@ -249,6 +261,13 @@ def execute_signal(
             logger.info("{} Limit entry aborted — no position opened.", symbol)
             return
 
+        # Use actual fill size for reduceOnly stop/TP orders.
+        # For a partial IOC fill (deviation abort), executed_qty < quantity; sizing stops
+        # for the full quantity would cause Binance to reject them as reduceOnly violations.
+        fill_qty = filled_order.get("executed_qty") or quantity
+        if fill_qty <= 0:
+            fill_qty = quantity
+
         # Base all exit orders on the actual fill price
         fill_price = filled_order["price"] if filled_order["price"] > 0 else signal_price
 
@@ -264,22 +283,22 @@ def execute_signal(
             tp_limit_price = round_price(fill_price * (1 - tp_limit_pct), tick_size)
 
         sl_limit_order = algo_orders.place_stop_limit_order(
-            client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
+            client, symbol, stop_side, fill_qty, sl_limit_trigger, sl_limit_trigger
         )
         sl_market_order = algo_orders.place_stop_market_order(
-            client, symbol, stop_side, quantity, sl_market_trigger
+            client, symbol, stop_side, fill_qty, sl_market_trigger
         )
         ttp_order = orders.place_trailing_stop_order(
-            client, symbol, stop_side, quantity, ttp_callback_rate, ttp_activation
+            client, symbol, stop_side, fill_qty, ttp_callback_rate, ttp_activation
         )
         tp_limit_order = orders.place_tp_limit_order(
-            client, symbol, stop_side, quantity, tp_limit_price
+            client, symbol, stop_side, fill_qty, tp_limit_price
         )
 
         trade_manager.register_trade(
             symbol=symbol,
             position=Position.LONG if is_long else Position.SHORT,
-            size=quantity,
+            size=fill_qty,
             entry_price=fill_price,
             tick_size=tick_size,
             stop_ids=[sl_limit_order["order_id"], sl_market_order["order_id"]],
