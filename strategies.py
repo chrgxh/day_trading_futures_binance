@@ -25,24 +25,24 @@ StrategyFn = Callable[[list[dict], str, Position, dict], TradeSignal]
 
 
 def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, params: dict) -> TradeSignal:
-    """Multi-gate EMA strategy: 1h trend filter + 15m crossover + RVOL + RSI momentum.
+    """Multi-gate EMA strategy: 1h trend filter + interval EMA crossover + RVOL + RSI momentum.
 
     Entry does not require a fresh crossover — any tick where all gates pass opens a trade.
     This handles cold-starts (bot starts with no position) and immediate re-entry after close.
 
     Gate summary:
-      Long:  15m fast EMA > slow EMA, price above 1h 200 EMA, RVOL spike, RSI in [50, 70], ADX >= min_adx
-      Short: 15m fast EMA < slow EMA, price below 1h 200 EMA, RVOL spike, RSI in [30, 50], ADX >= min_adx
+      Long:  fast EMA > slow EMA, price above 1h 200 EMA, RVOL spike, RSI in [50, 70], ADX >= min_adx
+      Short: fast EMA < slow EMA, price below 1h 200 EMA, RVOL spike, RSI in [30, 50], ADX >= min_adx
 
     Exit:
       Long:  fast EMA crosses below slow EMA, or RSI >= rsi_exit_overbought (default 80)
       Short: fast EMA crosses above slow EMA, or RSI <= rsi_exit_oversold  (default 20)
 
-    Requires ~840 15m candles in the buffer (config candle_limit) so that resampling
-    produces 200+ complete 1h bars for the trend EMA.
+    The candle buffer must be large enough that resampling produces 200+ complete 1h bars
+    for the trend EMA (see candle_limit in config.yaml).
 
     Args:
-        candles: 15m OHLCV dicts from market.get_futures_ohlcv().
+        candles: OHLCV dicts from market.get_futures_ohlcv() at the configured interval.
         symbol: Trading pair.
         position: Current open position state.
         params:
@@ -76,20 +76,20 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     adx_period: int = params.get("adx_period", 14)
     min_adx = Decimal(str(params.get("min_adx", "25")))
 
-    min_15m = max(slow_period + 1, rsi_period + 1, volume_lookback + 1)
-    if len(candles) < min_15m:
-        logger.warning("{} ema_trend_momentum: need {} 15m candles, have {}.", symbol, min_15m, len(candles))
-        return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="insufficient 15m data")
+    min_candles = max(slow_period + 1, rsi_period + 1, volume_lookback + 1, 2 * adx_period + 1)
+    if len(candles) < min_candles:
+        logger.warning("{} ema_trend_momentum: need {} candles, have {}.", symbol, min_candles, len(candles))
+        return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="insufficient candle data")
 
     closes = [c["close"] for c in candles]
 
-    # --- Trend gate: resample 15m → 1h and compute the trend EMA ---
+    # --- Trend gate: resample to 1h and compute the trend EMA ---
     candles_1h = resample_to_1h(candles)
     closes_1h = [c["close"] for c in candles_1h]
 
     if len(closes_1h) < trend_period:
         logger.warning(
-            "{} ema_trend_momentum: need {} complete 1h bars, have {} (from {} 15m candles). "
+            "{} ema_trend_momentum: need {} complete 1h bars, have {} (from {} candles). "
             "Increase trading.candle_limit in config.yaml.",
             symbol, trend_period, len(closes_1h), len(candles),
         )
@@ -98,12 +98,12 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     trend_ema_vals = ema(closes_1h, trend_period)
     trend_ema = trend_ema_vals[-1]
 
-    # --- 15m fast/slow EMA (need at least 2 values each for crossover detection) ---
+    # --- Fast/slow EMA (need at least 2 values each for crossover detection) ---
     fast_vals = ema(closes, fast_period)
     slow_vals = ema(closes, slow_period)
 
     if len(fast_vals) < 2 or len(slow_vals) < 2:
-        return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="insufficient data for 15m EMA")
+        return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="insufficient data for EMA")
 
     fast_now, fast_prev = fast_vals[-1], fast_vals[-2]
     slow_now, slow_prev = slow_vals[-1], slow_vals[-2]
@@ -125,6 +125,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     # --- Derived state ---
     current_price = closes[-1]
     above_trend = current_price > trend_ema
+    below_trend = current_price < trend_ema
     ema_bullish = fast_now > slow_now
     ema_bearish = fast_now < slow_now
     cross_up = fast_prev <= slow_prev and fast_now > slow_now
@@ -137,7 +138,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
         float(trend_ema), float(current_price), float(current_rsi), rvol, float(current_adx),
         "bull" if ema_bullish else "bear" if ema_bearish else "flat",
         "(cross-up)" if cross_up else "(cross-down)" if cross_down else "",
-        "above" if above_trend else "below",
+        "above" if above_trend else "below" if below_trend else "at",
         "SPIKE" if vol_spike else "low",
         ("long-zone" if rsi_long_low <= current_rsi <= rsi_long_high
          else "short-zone" if rsi_short_low <= current_rsi <= rsi_short_high
@@ -182,7 +183,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             entry_price=current_price,
         )
 
-    if ema_bearish and not above_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high and trending:
+    if ema_bearish and below_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high and trending:
         prefix = "cross-down + " if cross_down else ""
         return TradeSignal(
             signal=Signal.OPEN_SHORT, symbol=symbol,
