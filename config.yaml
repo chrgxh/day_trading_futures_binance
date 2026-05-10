@@ -64,3 +64,4 @@ logging:
   log_file: logs/bot.log
   rotation: "10 MB"
   retention: "7 days"
+  debug_log_file: logs/bot.debug.log   # Optional: write all DEBUG logs to a separate file (remove key to disable)

@@ -23,10 +23,12 @@ from strategies import STRATEGIES
 # Setup helpers
 # ---------------------------------------------------------------------------
 
-def configure_logging(log_file: str, level: str, rotation: str, retention: str) -> None:
+def configure_logging(log_file: str, level: str, rotation: str, retention: str, debug_log_file: str | None = None) -> None:
     logger.remove()
     logger.add(sys.stdout, level=level)
     logger.add(log_file, level=level, rotation=rotation, retention=retention, enqueue=True)
+    if debug_log_file:
+        logger.add(debug_log_file, level="DEBUG", rotation=rotation, retention=retention, enqueue=True)
 
 
 def load_config(path: str = "config.yaml") -> dict:
