@@ -28,7 +28,7 @@ def configure_logging(log_file: str, level: str, rotation: str, retention: str, 
     logger.add(sys.stdout, level=level)
     logger.add(log_file, level=level, rotation=rotation, retention=retention, enqueue=True)
     if debug_log_file:
-        logger.add(debug_log_file, level="DEBUG", rotation=rotation, retention=retention, enqueue=True)
+        logger.add(debug_log_file, filter=lambda r: r["level"].no < logger.level("INFO").no, rotation=rotation, retention=retention, enqueue=True)
 
 
 def load_config(path: str = "config.yaml") -> dict:
