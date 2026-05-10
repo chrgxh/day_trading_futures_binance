@@ -39,6 +39,8 @@ trading:
     rsi_short_high: 50          # RSI ceiling for short entry
     rsi_exit_overbought: 80     # Force-exit long when RSI reaches this
     rsi_exit_oversold: 20       # Force-exit short when RSI reaches this
+    adx_period: 14              # ADX smoothing period (Wilder's, same as RSI — interval-independent)
+    min_adx: 25                 # Skip entry if ADX < this; market is ranging (20=weak trend, 25=confirmed, 30=strong)
 
 entry:
   gtx_timeout_secs: 5               # Seconds to wait per GTX attempt before cancelling and retrying

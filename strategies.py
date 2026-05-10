@@ -19,7 +19,7 @@ from typing import Callable
 
 from loguru import logger
 
-from utils.indicators import Position, Signal, TradeSignal, ema, resample_to_1h, rsi, sma
+from utils.indicators import Position, Signal, TradeSignal, adx, ema, resample_to_1h, rsi, sma
 
 StrategyFn = Callable[[list[dict], str, Position, dict], TradeSignal]
 
@@ -31,8 +31,8 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     This handles cold-starts (bot starts with no position) and immediate re-entry after close.
 
     Gate summary:
-      Long:  15m fast EMA > slow EMA, price above 1h 200 EMA, RVOL spike, RSI in [50, 70]
-      Short: 15m fast EMA < slow EMA, price below 1h 200 EMA, RVOL spike, RSI in [30, 50]
+      Long:  15m fast EMA > slow EMA, price above 1h 200 EMA, RVOL spike, RSI in [50, 70], ADX >= min_adx
+      Short: 15m fast EMA < slow EMA, price below 1h 200 EMA, RVOL spike, RSI in [30, 50], ADX >= min_adx
 
     Exit:
       Long:  fast EMA crosses below slow EMA, or RSI >= rsi_exit_overbought (default 80)
@@ -58,6 +58,8 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             rsi_short_high      — RSI upper bound for short entry (default 50)
             rsi_exit_overbought — RSI level to force-exit longs (default 80)
             rsi_exit_oversold   — RSI level to force-exit shorts (default 20)
+            adx_period          — ADX smoothing period (default 14)
+            min_adx             — minimum ADX for entry; below this the market is ranging (default 25)
     """
     fast_period: int = params.get("fast_period", 9)
     slow_period: int = params.get("slow_period", 21)
@@ -71,6 +73,8 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     rsi_short_high = Decimal(str(params.get("rsi_short_high", "50")))
     rsi_exit_overbought = Decimal(str(params.get("rsi_exit_overbought", "80")))
     rsi_exit_oversold = Decimal(str(params.get("rsi_exit_oversold", "20")))
+    adx_period: int = params.get("adx_period", 14)
+    min_adx = Decimal(str(params.get("min_adx", "25")))
 
     min_15m = max(slow_period + 1, rsi_period + 1, volume_lookback + 1)
     if len(candles) < min_15m:
@@ -113,6 +117,11 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     rvol = float(current_volume / avg_volume) if avg_volume > 0 else 0.0
     vol_spike = avg_volume > 0 and current_volume > avg_volume * volume_multiplier
 
+    # --- ADX: regime filter — only enter in trending markets ---
+    adx_series = adx(candles, adx_period)
+    current_adx = adx_series[-1] if adx_series else Decimal("0")
+    trending = current_adx >= min_adx
+
     # --- Derived state ---
     current_price = closes[-1]
     above_trend = current_price > trend_ema
@@ -122,10 +131,10 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     cross_down = fast_prev >= slow_prev and fast_now < slow_now
 
     logger.info(
-        "{} EMA{}={:.4f} EMA{}={:.4f} trend1h={:.4f} price={:.4f} RSI={:.2f} RVOL={:.2f}x"
-        " | ema={}{} trend={} vol={} rsi={}",
+        "{} EMA{}={:.4f} EMA{}={:.4f} trend1h={:.4f} price={:.4f} RSI={:.2f} RVOL={:.2f}x ADX={:.1f}"
+        " | ema={}{} trend={} vol={} rsi={} adx={}",
         symbol, fast_period, float(fast_now), slow_period, float(slow_now),
-        float(trend_ema), float(current_price), float(current_rsi), rvol,
+        float(trend_ema), float(current_price), float(current_rsi), rvol, float(current_adx),
         "bull" if ema_bullish else "bear" if ema_bearish else "flat",
         "(cross-up)" if cross_up else "(cross-down)" if cross_down else "",
         "above" if above_trend else "below",
@@ -133,6 +142,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
         ("long-zone" if rsi_long_low <= current_rsi <= rsi_long_high
          else "short-zone" if rsi_short_low <= current_rsi <= rsi_short_high
          else "neutral"),
+        "trending" if trending else f"ranging(<{min_adx})",
     )
 
     # --- Exit logic ---
@@ -161,10 +171,10 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     # This covers: cold starts, immediate re-entries, and standard crossover entries.
     gate_info = (
         f"EMA={'bull' if ema_bullish else 'bear' if ema_bearish else 'flat'} "
-        f"above-1h-trend={above_trend} RVOL={rvol:.2f}x RSI={current_rsi:.1f}"
+        f"above-1h-trend={above_trend} RVOL={rvol:.2f}x RSI={current_rsi:.1f} ADX={current_adx:.1f}"
     )
 
-    if ema_bullish and above_trend and vol_spike and rsi_long_low <= current_rsi <= rsi_long_high:
+    if ema_bullish and above_trend and vol_spike and rsi_long_low <= current_rsi <= rsi_long_high and trending:
         prefix = "cross-up + " if cross_up else ""
         return TradeSignal(
             signal=Signal.OPEN_LONG, symbol=symbol,
@@ -172,7 +182,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             entry_price=current_price,
         )
 
-    if ema_bearish and not above_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high:
+    if ema_bearish and not above_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high and trending:
         prefix = "cross-down + " if cross_down else ""
         return TradeSignal(
             signal=Signal.OPEN_SHORT, symbol=symbol,

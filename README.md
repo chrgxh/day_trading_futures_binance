@@ -47,7 +47,7 @@ Strategy selection and parameters live in `config.yaml` under `trading.strategy`
 
 | Key | Description |
 |---|---|
-| `ema_trend_momentum` | **(active)** EMA crossover gated by 1h 200 EMA trend, RVOL spike, and RSI momentum band. No fresh crossover required — any tick where all gates pass opens a trade, so cold-starts and post-close re-entries are immediate. |
+| `ema_trend_momentum` | **(active)** EMA crossover gated by 1h 200 EMA trend, RVOL spike, RSI momentum band, and ADX regime filter (ADX < `min_adx` blocks entry in ranging markets). No fresh crossover required — any tick where all gates pass opens a trade, so cold-starts and post-close re-entries are immediate. |
 | `ma_crossover` | Simple SMA crossover (fast period vs slow period). |
 
 To add a new strategy: write a function `(candles, symbol, position, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
@@ -109,3 +109,7 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 3% profit and triggers on a 0.5% reversal from peak
   - All four are cancelled automatically when the strategy signals a close
 - `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L
+
+## Strategy notes
+
+`theory/gates.md` — explains what each entry gate does, why it exists, and its known limitations (lag, false positives, tuning levers). Useful reference when reviewing filtered trades or adjusting thresholds.

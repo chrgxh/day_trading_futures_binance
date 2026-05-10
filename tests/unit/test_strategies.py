@@ -25,6 +25,8 @@ _PARAMS = {
     "rsi_short_high": "100",
     "rsi_exit_overbought": "80",
     "rsi_exit_oversold": "20",
+    "adx_period": 14,
+    "min_adx": "0",            # disabled — isolate ADX gate in test_hold_when_adx_gate_fails
 }
 
 
@@ -212,3 +214,40 @@ def test_hold_long_on_no_exit_signal():
     sig = ema_trend_momentum(candles, "BTCUSDT", Position.LONG, params)
     assert sig.signal == Signal.HOLD
     assert "holding long" in sig.reason
+
+
+# ---------------------------------------------------------------------------
+# ADX regime gate
+# ---------------------------------------------------------------------------
+
+def test_hold_when_adx_gate_fails():
+    # All other gates pass (trending candles + volume spike), but min_adx is set
+    # impossibly high — verifies the ADX gate is wired into the entry condition.
+    params = dict(_PARAMS, min_adx="200")
+    candles = _with_volume_spike(_candles(60, step=0.1))
+    sig = ema_trend_momentum(candles, "BTCUSDT", Position.NONE, params)
+    assert sig.signal == Signal.HOLD
+
+
+def test_adx_gate_does_not_block_exits():
+    # ADX only gates entry — an impossibly high min_adx must not suppress exit signals.
+    params = dict(_PARAMS, min_adx="200")
+    rising = _candles(50, step=0.5)
+    reversal = [
+        {
+            "open_time": (50 + i) * MS_15M,
+            "open": D(str(125 - i * 2)),
+            "high": D(str(125 - i * 2 + 0.3)),
+            "low": D(str(125 - i * 2 - 2.3)),
+            "close": D(str(125 - (i + 1) * 2)),
+            "volume": D("1000"),
+        }
+        for i in range(15)
+    ]
+    buf = list(rising)
+    for c in reversal:
+        buf.append(c)
+        sig = ema_trend_momentum(buf, "BTCUSDT", Position.LONG, params)
+        if sig.signal == Signal.CLOSE and "cross down" in sig.reason:
+            return
+    pytest.fail("ADX gate incorrectly suppressed a cross-down CLOSE signal")
