@@ -62,7 +62,7 @@ risk:
   sl_profit_market_lock_pct: 0.3    # Move stop-market to this % above (long) or below (short) entry — safety net if limit can't fill
 
 trade_manager:
-  poll_interval_secs: 10   # How often to check position/order state against Binance (recommended: 5–10s)
+  poll_interval_secs: 5   # How often to check position/order state against Binance (recommended: 5–10s)
 
 logging:
   level: INFO
