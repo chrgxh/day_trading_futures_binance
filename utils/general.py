@@ -106,6 +106,7 @@ def _normalize_order(raw: dict) -> dict:
         "side": raw["side"],
         "type": raw["type"],
         "quantity": Decimal(raw["origQty"]),
+        "executed_qty": Decimal(raw.get("executedQty") or "0"),
         "price": Decimal(raw.get("price") or "0"),
         "stop_price": Decimal(raw.get("stopPrice") or "0"),
         "status": raw["status"],

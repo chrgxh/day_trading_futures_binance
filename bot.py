@@ -153,7 +153,21 @@ def attempt_limit_entry(
                 if latest["status"] == "FILLED":
                     filled_order = latest
                 elif latest["status"] not in ("CANCELED", "EXPIRED"):
-                    orders.cancel_order(client, symbol, order["order_id"])
+                    try:
+                        orders.cancel_order(client, symbol, order["order_id"])
+                    except general.BinanceAPIException as cancel_exc:
+                        if getattr(cancel_exc, "code", None) == -2011:
+                            # Order was filled between our status check and the cancel call.
+                            # Re-fetch to confirm and treat as filled rather than proceeding to the next attempt.
+                            try:
+                                refetch = orders.get_order(client, symbol, order["order_id"])
+                                if refetch["status"] == "FILLED":
+                                    filled_order = refetch
+                                    logger.warning("{} GTX order {} filled just before cancel (-2011); treating as filled.", symbol, order["order_id"])
+                            except Exception as refetch_exc:
+                                logger.warning("{} Could not re-fetch GTX order {} after -2011: {}", symbol, order["order_id"], refetch_exc)
+                        else:
+                            raise
             except Exception as exc:
                 logger.warning("{} Could not cancel GTX order {}: {}", symbol, order["order_id"], exc)
 
@@ -164,6 +178,10 @@ def attempt_limit_entry(
     logger.info("{} GTX unfilled after {} attempts — switching to IOC chase", symbol, gtx_attempts)
 
     # --- Stage 2: IOC chase until filled or price exceeds deviation ---
+    # Track cumulative filled quantity so each IOC only requests the remaining amount.
+    # Without this, a partial fill followed by a full-size IOC creates an oversized position.
+    filled_qty = Decimal("0")
+    remaining_qty = quantity
     ioc_attempt = 0
     while True:
         ioc_attempt += 1
@@ -175,15 +193,23 @@ def attempt_limit_entry(
         limit_price = _round_price(aggressive_ref, tick_size)
         logger.info(
             "{} Placing IOC limit {} {} @ {} (ioc attempt {})",
-            symbol, side, quantity, limit_price, ioc_attempt,
+            symbol, side, remaining_qty, limit_price, ioc_attempt,
         )
-        ioc_order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="IOC")
+        ioc_order = orders.place_limit_order(client, symbol, side, remaining_qty, limit_price, time_in_force="IOC")
 
         time.sleep(0.5)
         try:
             status = orders.get_order(client, symbol, ioc_order["order_id"])
-            if status["status"] == "FILLED":
-                logger.info("{} IOC filled @ {} (ioc attempt {})", symbol, limit_price, ioc_attempt)
+            this_fill = status.get("executed_qty", Decimal("0"))
+            if status["status"] in ("FILLED", "PARTIALLY_FILLED") and this_fill > 0:
+                filled_qty += this_fill
+                remaining_qty = quantity - filled_qty
+                logger.info(
+                    "{} IOC {} @ {} (ioc attempt {}): filled={} cumulative={}/{}",
+                    symbol, status["status"], limit_price, ioc_attempt, this_fill, filled_qty, quantity,
+                )
+            if status["status"] == "FILLED" or remaining_qty <= 0:
+                logger.info("{} IOC fully filled after {} attempt(s)", symbol, ioc_attempt)
                 return status
         except Exception as exc:
             logger.warning("{} Could not check IOC order {}: {}", symbol, ioc_order["order_id"], exc)
@@ -403,6 +429,8 @@ def _run() -> None:
                         symbol, open_positions[symbol].value, binance_state.value,
                     )
                     open_positions[symbol] = binance_state
+                if binance_pos:
+                    logger.debug("{} Position quantity on Binance: {}", symbol, binance_pos[0]["amount"])
 
                 position = open_positions[symbol]
                 signal = strategy_fn(buf, symbol, position, strategy_params)
