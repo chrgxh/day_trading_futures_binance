@@ -64,8 +64,9 @@ def test_hold_on_too_few_15m_candles():
 
 
 def test_hold_when_not_enough_1h_bars():
-    # 20 15m candles → ~4 complete 1h bars, need 10 → should warn and HOLD
-    sig = ema_trend_momentum(_candles(20), "BTCUSDT", Position.NONE, _PARAMS)
+    # 36 candles clears the min_candles guard (needs 29 with adx_period=14) but
+    # produces only 8 complete 1h bars after resampling — below trend_period=10.
+    sig = ema_trend_momentum(_candles(36), "BTCUSDT", Position.NONE, _PARAMS)
     assert sig.signal == Signal.HOLD
     assert "1h" in sig.reason
 
