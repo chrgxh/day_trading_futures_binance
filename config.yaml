@@ -31,7 +31,7 @@ trading:
     slow_period: 21             # Slow EMA period — should be ~2–3× fast_period
     trend_period: 200           # EMA period on 1h for trend gate (interval-independent)
     rsi_period: 14              # RSI lookback period
-    volume_lookback: 8         # Number of prior candles used to compute the RVOL baseline
+    volume_lookback: 12         # Number of prior candles used to compute the RVOL baseline
     volume_multiplier: 1.5      # Current candle volume must exceed the baseline by this multiple
     rsi_long_low: 50            # RSI floor for long entry — momentum must be building
     rsi_long_high: 70           # RSI ceiling for long entry — avoid overbought entries
