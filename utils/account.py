@@ -89,7 +89,7 @@ def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[
                 "leverage": int(p["leverage"]) if p.get("leverage") else None,
                 "liquidation_price": Decimal(p["liquidationPrice"]) if p.get("liquidationPrice") else None,
             })
-        logger.info("Open futures positions: {}", len(positions))
+        logger.debug("Open futures positions for {}: {}", symbol or "all", len(positions))
         return positions
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_futures_positions failed: {}", exc)
@@ -135,6 +135,54 @@ def get_symbol_info(client: Client, symbol: str) -> dict:
         return result
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_symbol_info failed for {}: {}", symbol, exc)
+        raise
+
+
+def get_futures_recent_trades(
+    client: Client,
+    symbol: str,
+    start_time_ms: int,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent futures account trades for a symbol since start_time_ms.
+
+    Used by TradeManager to compute realized P&L when a position closes or partially fills.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+        start_time_ms: Epoch milliseconds — only trades at or after this time are returned.
+        limit: Maximum number of trades to return (Binance cap: 1000).
+
+    Returns:
+        List of dicts with keys: trade_id, order_id, side, price (Decimal), qty (Decimal),
+        realized_pnl (Decimal), commission (Decimal), commission_asset, time (ms), is_maker.
+    """
+    try:
+        raw = with_retry(lambda: client.futures_account_trades(
+            symbol=symbol,
+            startTime=start_time_ms,
+            limit=limit,
+        ))
+        trades = [
+            {
+                "trade_id": t["id"],
+                "order_id": t["orderId"],
+                "side": t["side"],
+                "price": Decimal(t["price"]),
+                "qty": Decimal(t["qty"]),
+                "realized_pnl": Decimal(t["realizedPnl"]),
+                "commission": Decimal(t["commission"]),
+                "commission_asset": t["commissionAsset"],
+                "time": t["time"],
+                "is_maker": t.get("maker", False),
+            }
+            for t in raw
+        ]
+        logger.debug("Recent trades for {} since {}: {} trade(s)", symbol, start_time_ms, len(trades))
+        return trades
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_futures_recent_trades failed for {}: {}", symbol, exc)
         raise
 
 

@@ -93,6 +93,26 @@ def test_gtx_order_at_best_bid_queues_as_maker(client, symbol, sym_info, clean_o
 # the best ask. This is confirmed to raise APIError(-5022) on mainnet (see bot logs).
 
 
+def test_place_tp_limit_order(client, symbol, sym_info, open_position):
+    """TP limit at +3% above mark should sit on the book as a maker reduceOnly order."""
+    mark = market.get_futures_mark_price(client, symbol)
+    qty = abs(open_position["amount"]).quantize(sym_info["step_size"])
+    tp_price = (mark * Decimal("1.03")).quantize(sym_info["tick_size"])
+
+    order = orders.place_tp_limit_order(client, symbol, "SELL", qty, tp_price)
+
+    assert order["is_algo"] is False
+    assert order["order_id"] is not None
+    assert order["status"] == "NEW"
+
+    open_orders = orders.get_open_orders(client, symbol)
+    assert any(o["order_id"] == order["order_id"] for o in open_orders)
+
+    orders.cancel_order(client, symbol, order["order_id"])
+    open_orders_after = orders.get_open_orders(client, symbol)
+    assert not any(o["order_id"] == order["order_id"] for o in open_orders_after)
+
+
 def test_place_trailing_stop_order(client, symbol, sym_info, open_position):
     mark = market.get_futures_mark_price(client, symbol)
     qty = abs(open_position["amount"]).quantize(sym_info["step_size"])

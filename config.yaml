@@ -52,8 +52,12 @@ risk:
   leverage: 10
   stop_loss_limit_pct: 1.5                   # Hard SL: 1.5% against entry (preferred exit, less slippage)
   stop_loss_market_pct: 1.8                  # Safety-net SL: slightly wider to survive price gaps
+  take_profit_limit_pct: 3.0                 # Maker TP limit order placed at this % above (long) or below (short) entry
   trailing_take_profit_activation_pct: 3.0   # Activate trailing TP at 3% profit (2:1 reward at 1.5% SL)
   trailing_take_profit_callback_rate: 0.5    # Trail by 0.5% from peak before triggering
+
+trade_manager:
+  poll_interval_secs: 10   # How often to check position/order state against Binance (recommended: 5–10s)
 
 logging:
   level: INFO

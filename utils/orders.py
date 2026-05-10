@@ -174,6 +174,50 @@ def place_trailing_stop_order(
         raise
 
 
+def place_tp_limit_order(
+    client: Client,
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    price: Decimal,
+) -> dict:
+    """Place a GTC limit take-profit order (maker, reduceOnly).
+
+    Sits on the book at the target price and earns the maker rebate when filled.
+    Because it is GTC and reduceOnly, a partial fill leaves the remainder open
+    without creating a new position.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+        side: "SELL" for a long position, "BUY" for a short position.
+        quantity: Order quantity in base asset units.
+        price: Limit price (e.g. entry * 1.03 for a 3% long TP).
+
+    Returns:
+        Normalised order dict (see _normalize_order).
+    """
+    try:
+        raw = with_retry(lambda: client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="LIMIT",
+            timeInForce="GTC",
+            quantity=str(quantity),
+            price=str(price),
+            reduceOnly=True,
+        ))
+        order = _normalize_order(raw)
+        logger.info(
+            "TP limit order placed: {} {} {} @ {} reduceOnly=True | id={} status={}",
+            side, quantity, symbol, price, order["order_id"], order["status"],
+        )
+        return order
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("place_tp_limit_order failed ({} {} {} @ {}): {}", side, quantity, symbol, price, exc)
+        raise
+
+
 def get_order(client: Client, symbol: str, order_id: int) -> dict:
     """Fetch the current status of a specific order.
 

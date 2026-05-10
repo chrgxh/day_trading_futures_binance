@@ -1,0 +1,314 @@
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from utils.indicators import Position
+from utils.trade_manager import TradeManager
+
+
+def _make_manager() -> TradeManager:
+    return TradeManager(MagicMock(), poll_interval_secs=60)
+
+
+def _register_kwargs(**overrides) -> dict:
+    base = dict(
+        symbol="BTCUSDT",
+        position=Position.LONG,
+        size=Decimal("0.01"),
+        entry_price=Decimal("50000"),
+        tick_size=Decimal("0.1"),
+        stop_ids=[101, 102],
+        sl_limit_price=Decimal("49250"),
+        sl_market_price=Decimal("49100"),
+        ttp_id=201,
+        tp_limit_id=301,
+    )
+    base.update(overrides)
+    return base
+
+
+def _patch_pnl(pnl: str = "0"):
+    """Patch the P&L query so tests don't need a real client."""
+    return patch(
+        "utils.trade_manager.TradeManager._query_realized_pnl",
+        return_value=Decimal(pnl),
+    )
+
+
+def _patch_open_ids(ids: set):
+    """Patch _fetch_open_order_ids to return a fixed set."""
+    return patch(
+        "utils.trade_manager.TradeManager._fetch_open_order_ids",
+        return_value=ids,
+    )
+
+
+# ---------------------------------------------------------------------------
+# get_position / get_size
+# ---------------------------------------------------------------------------
+
+class TestGetters:
+    def test_unregistered_symbol_returns_none(self):
+        mgr = _make_manager()
+        assert mgr.get_position("BTCUSDT") == Position.NONE
+        assert mgr.get_size("BTCUSDT") == Decimal("0")
+
+    def test_registered_position_returned(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(position=Position.SHORT))
+        assert mgr.get_position("BTCUSDT") == Position.SHORT
+
+    def test_registered_size_returned(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.05")))
+        assert mgr.get_size("BTCUSDT") == Decimal("0.05")
+
+
+# ---------------------------------------------------------------------------
+# close_trade
+# ---------------------------------------------------------------------------
+
+class TestCloseTrade:
+    def test_position_becomes_none_after_close(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs())
+        with patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.orders.cancel_order"):
+            mgr.close_trade("BTCUSDT")
+        assert mgr.get_position("BTCUSDT") == Position.NONE
+
+    def test_all_order_ids_cancelled(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
+        with patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
+             patch("utils.trade_manager.orders.cancel_order") as mock_order:
+            mgr.close_trade("BTCUSDT")
+
+        cancelled_algo_ids = {c.args[2] for c in mock_algo.call_args_list}
+        assert {101, 102, 201} == cancelled_algo_ids
+        assert mock_order.call_args.args[2] == 301
+
+    def test_noop_when_not_registered(self):
+        mgr = _make_manager()
+        with patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
+             patch("utils.trade_manager.orders.cancel_order") as mock_order:
+            mgr.close_trade("BTCUSDT")
+        mock_algo.assert_not_called()
+        mock_order.assert_not_called()
+
+    def test_double_close_is_safe(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs())
+        with patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.orders.cancel_order"):
+            mgr.close_trade("BTCUSDT")
+            mgr.close_trade("BTCUSDT")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _reconcile — external close
+# ---------------------------------------------------------------------------
+
+class TestReconcileExternalClose:
+    def test_clears_state_when_binance_size_is_zero(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs())
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             _patch_open_ids(set()), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.orders.cancel_order"), \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+        assert mgr.get_position("BTCUSDT") == Position.NONE
+
+    def test_no_cancel_calls_when_all_orders_already_gone(self):
+        # All exit orders fired simultaneously — nothing left to cancel.
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             _patch_open_ids(set()), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
+             patch("utils.trade_manager.orders.cancel_order") as mock_order, \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+        mock_algo.assert_not_called()
+        mock_order.assert_not_called()
+
+    def test_cancels_all_leftover_orders_on_external_close(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
+        # Simulate: TP limit (301) fired — stops (101,102) and trailing TP (201) are leftovers still open
+        open_ids = {101, 102, 201}
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             _patch_open_ids(open_ids), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
+             patch("utils.trade_manager.orders.cancel_order") as mock_order, \
+             _patch_pnl("50"):
+            mgr._reconcile("BTCUSDT")
+
+        cancelled_algo_ids = {c.args[2] for c in mock_algo.call_args_list}
+        assert {101, 102, 201} == cancelled_algo_ids
+        # tp_limit_id=301 already gone (it fired), cancel_order only called for it if it's a leftover
+        # here it's NOT in open_ids so it won't be in the leftover list — cancel_order should NOT fire
+        mock_order.assert_not_called()
+
+    def test_tp_limit_cancelled_when_stop_fires(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
+        # Simulate: stop-limit (101) fired — TP limit (301) and trailing TP (201) are leftovers
+        open_ids = {102, 201, 301}
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             _patch_open_ids(open_ids), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
+             patch("utils.trade_manager.orders.cancel_order") as mock_order, \
+             _patch_pnl("-20"):
+            mgr._reconcile("BTCUSDT")
+
+        cancelled_algo_ids = {c.args[2] for c in mock_algo.call_args_list}
+        assert {102, 201}.issubset(cancelled_algo_ids)
+        assert mock_order.call_args.args[2] == 301
+
+    def test_no_action_for_unregistered_symbol(self):
+        mgr = _make_manager()
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel:
+            mgr._reconcile("BTCUSDT")
+        mock_cancel.assert_not_called()
+
+    def test_pnl_logged_on_close(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs())
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=[]), \
+             _patch_open_ids(set()), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.orders.cancel_order"), \
+             patch("utils.trade_manager.TradeManager._query_realized_pnl",
+                   return_value=Decimal("75.50")) as mock_pnl:
+            mgr._reconcile("BTCUSDT")
+        mock_pnl.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _reconcile — partial TP fill
+# ---------------------------------------------------------------------------
+
+class TestReconcilePartialFill:
+    def _reduced_pos(self, size: Decimal) -> list[dict]:
+        return [{"amount": size}]
+
+    def test_size_updated_after_partial_fill(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01")))
+        reduced = Decimal("0.005")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(reduced)), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order", return_value={"order_id": 901}), \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order", return_value={"order_id": 902}), \
+             _patch_open_ids({901, 902}), \
+             _patch_pnl("25"):
+            mgr._reconcile("BTCUSDT")
+        assert mgr.get_size("BTCUSDT") == reduced
+
+    def test_position_still_open_after_partial_fill(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), position=Position.LONG))
+        reduced = Decimal("0.005")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(reduced)), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order", return_value={"order_id": 901}), \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order", return_value={"order_id": 902}), \
+             _patch_open_ids({901, 902}), \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+        assert mgr.get_position("BTCUSDT") == Position.LONG
+
+    def test_stops_cancelled_and_replaced_at_new_size(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), stop_ids=[101, 102]))
+        reduced = Decimal("0.005")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(reduced)), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel, \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order", return_value={"order_id": 901}) as mock_sl, \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order", return_value={"order_id": 902}) as mock_sm, \
+             _patch_open_ids({901, 902}), \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+
+        cancelled = {c.args[2] for c in mock_cancel.call_args_list}
+        assert {101, 102}.issubset(cancelled)
+        assert mock_sl.call_args.args[3] == reduced
+        assert mock_sm.call_args.args[3] == reduced
+
+    def test_new_stop_ids_stored_in_state(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), stop_ids=[101, 102]))
+        reduced = Decimal("0.005")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(reduced)), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order", return_value={"order_id": 901}), \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order", return_value={"order_id": 902}), \
+             _patch_open_ids({901, 902}), \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+
+        # new stop IDs should be tracked so the next reconcile can cancel them if needed
+        with mgr._lock:
+            assert set(mgr._states["BTCUSDT"].stop_ids) == {901, 902}
+
+    def test_no_action_when_size_unchanged(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01")))
+        with patch("utils.trade_manager.account.get_futures_positions",
+                   return_value=[{"amount": Decimal("0.01")}]), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel:
+            mgr._reconcile("BTCUSDT")
+        mock_cancel.assert_not_called()
+
+    def test_recovered_position_skips_stop_replacement(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), has_order_details=False))
+        reduced = Decimal("0.005")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(reduced)), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel, \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order") as mock_sl, \
+             _patch_pnl("0"):
+            mgr._reconcile("BTCUSDT")
+
+        mock_cancel.assert_not_called()
+        mock_sl.assert_not_called()
+        assert mgr.get_size("BTCUSDT") == reduced
+
+
+# ---------------------------------------------------------------------------
+# _identify_fired_order
+# ---------------------------------------------------------------------------
+
+class TestIdentifyFiredOrder:
+    def test_identifies_tp_limit_as_fired(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(tp_limit_id=301, stop_ids=[101, 102], ttp_id=201))
+        with mgr._lock:
+            state = mgr._states["BTCUSDT"]
+        # TP limit gone, stops still open
+        result = mgr._identify_fired_order(state, open_ids={101, 102, 201})
+        assert "TP limit" in result
+        assert "301" in result
+
+    def test_identifies_stop_limit_as_fired(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
+        with mgr._lock:
+            state = mgr._states["BTCUSDT"]
+        # stop-limit gone, others open
+        result = mgr._identify_fired_order(state, open_ids={102, 201, 301})
+        assert "stop-limit" in result
+
+    def test_unknown_for_recovered_position(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(has_order_details=False))
+        with mgr._lock:
+            state = mgr._states["BTCUSDT"]
+        result = mgr._identify_fired_order(state, open_ids=set())
+        assert "unknown" in result
+        assert "recovered" in result

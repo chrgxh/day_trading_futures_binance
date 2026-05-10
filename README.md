@@ -9,11 +9,12 @@ bot.py                   — main loop, orchestration, risk controls
 strategies.py            — pluggable strategy functions + STRATEGIES registry
 utils/
   general.py             — shared primitives: build_client, with_retry, send_crash_email, order normalizers
-  account.py             — account state: connection, balances, positions, symbol info, leverage
-  orders.py              — regular orders: market, limit, get_open_orders, cancel, cancel_all
+  account.py             — account state: connection, balances, positions, symbol info, leverage, recent trades
+  orders.py              — regular orders: market, limit, tp_limit, get_open_orders, cancel, cancel_all
   algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
   positions.py           — position management: close_position
   market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
+  trade_manager.py       — background trade state manager: monitors positions, reconciles orders on external fills
   indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h)
 config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
 .env                     — mainnet API keys and runtime flags (never commit)
@@ -85,6 +86,7 @@ Run a specific module's tests:
 pytest tests/integration/test_orders.py -m integration -v
 pytest tests/integration/test_algo_orders.py -m integration -v
 pytest tests/integration/test_positions.py -m integration -v
+pytest tests/integration/test_trade_manager.py -m integration -v
 pytest tests/integration/test_notifications.py -m integration -v
 ```
 
@@ -100,11 +102,10 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `entry.gtx_attempts` (default `3`) — number of GTX attempts before switching to IOC chase
   - `entry.max_price_deviation_pct` (default `0.3`) — abort entry if price drifts more than this % from the signal price; applies to both stages
   - IOC chase retries indefinitely at the current best ask/bid until filled or deviation limit is hit
-- Dual stop losses placed automatically on every position open:
-  - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred exit with less slippage
+- Four exit orders placed automatically on every position open:
+  - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred SL exit with less slippage
   - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
-  - Both are cancelled automatically when the strategy signals a close
-- Trailing take profit placed automatically on every position open (Binance `TRAILING_STOP_MARKET`):
-  - `risk.trailing_take_profit_activation_pct` (default `3.0`) — % move in profit before trailing activates
-  - `risk.trailing_take_profit_callback_rate` (default `0.5`) — % reversal from peak that triggers the close
-  - Cancelled automatically when the strategy signals a close
+  - `risk.take_profit_limit_pct` (default `3.0`) — maker GTC limit TP sitting on the book at +3% (long) / -3% (short) from entry; earns the maker rebate and catches wicks
+  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 3% profit and triggers on a 0.5% reversal from peak
+  - All four are cancelled automatically when the strategy signals a close
+- `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L

@@ -15,6 +15,7 @@ from utils.general import PostOnlyRejected
 
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
+from utils.trade_manager import TradeManager
 from strategies import STRATEGIES
 
 
@@ -221,18 +222,17 @@ def execute_signal(
     signal: TradeSignal,
     max_usdt: Decimal,
     sym_info: dict,
-    open_positions: dict[str, Position],
-    stop_order_ids: dict[str, list[int]],
-    trailing_tp_order_ids: dict[str, int | None],
+    trade_manager: TradeManager,
     sl_limit_pct: Decimal,
     sl_market_pct: Decimal,
+    tp_limit_pct: Decimal,
     ttp_activation_pct: Decimal,
     ttp_callback_rate: Decimal,
     entry_gtx_timeout_secs: int,
     entry_gtx_attempts: int,
     max_entry_deviation_pct: Decimal,
 ) -> None:
-    """Place the order for a non-HOLD signal, set stop losses + trailing TP on open, cancel on close."""
+    """Place the order for a non-HOLD signal, set stop losses + TP orders on open, cancel on close."""
     if signal.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
         signal_price = signal.entry_price or market.get_futures_mark_price(client, symbol)
         step_size = sym_info["step_size"]
@@ -251,19 +251,19 @@ def execute_signal(
             logger.info("{} Limit entry aborted — no position opened.", symbol)
             return
 
-        open_positions[symbol] = Position.LONG if is_long else Position.SHORT
-
-        # Base stop losses and trailing TP on the actual fill price
+        # Base all exit orders on the actual fill price
         fill_price = filled_order["price"] if filled_order["price"] > 0 else signal_price
 
         if is_long:
             sl_limit_trigger = _round_price(fill_price * (1 - sl_limit_pct), tick_size)
             sl_market_trigger = _round_price(fill_price * (1 - sl_market_pct), tick_size)
             ttp_activation = _round_price(fill_price * (1 + ttp_activation_pct), tick_size)
+            tp_limit_price = _round_price(fill_price * (1 + tp_limit_pct), tick_size)
         else:
             sl_limit_trigger = _round_price(fill_price * (1 + sl_limit_pct), tick_size)
             sl_market_trigger = _round_price(fill_price * (1 + sl_market_pct), tick_size)
             ttp_activation = _round_price(fill_price * (1 - ttp_activation_pct), tick_size)
+            tp_limit_price = _round_price(fill_price * (1 - tp_limit_pct), tick_size)
 
         sl_limit_order = algo_orders.place_stop_limit_order(
             client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
@@ -271,31 +271,29 @@ def execute_signal(
         sl_market_order = algo_orders.place_stop_market_order(
             client, symbol, stop_side, quantity, sl_market_trigger
         )
-        stop_order_ids[symbol] = [sl_limit_order["order_id"], sl_market_order["order_id"]]
-
         ttp_order = orders.place_trailing_stop_order(
             client, symbol, stop_side, quantity, ttp_callback_rate, ttp_activation
         )
-        trailing_tp_order_ids[symbol] = ttp_order["order_id"]
+        tp_limit_order = orders.place_tp_limit_order(
+            client, symbol, stop_side, quantity, tp_limit_price
+        )
+
+        trade_manager.register_trade(
+            symbol=symbol,
+            position=Position.LONG if is_long else Position.SHORT,
+            size=quantity,
+            entry_price=fill_price,
+            tick_size=tick_size,
+            stop_ids=[sl_limit_order["order_id"], sl_market_order["order_id"]],
+            sl_limit_price=sl_limit_trigger,
+            sl_market_price=sl_market_trigger,
+            ttp_id=ttp_order["order_id"],
+            tp_limit_id=tp_limit_order["order_id"],
+        )
 
     elif signal.signal == Signal.CLOSE:
-        for algo_id in stop_order_ids.get(symbol, []):
-            try:
-                algo_orders.cancel_algo_order(client, symbol, algo_id)
-            except Exception as exc:
-                logger.warning("Could not cancel stop order {} for {}: {}", algo_id, symbol, exc)
-        stop_order_ids[symbol] = []
-
-        ttp_id = trailing_tp_order_ids.get(symbol)
-        if ttp_id is not None:
-            try:
-                algo_orders.cancel_algo_order(client, symbol, ttp_id)
-            except Exception as exc:
-                logger.warning("Could not cancel trailing TP order {} for {}: {}", ttp_id, symbol, exc)
-            trailing_tp_order_ids[symbol] = None
-
+        trade_manager.close_trade(symbol)
         pos_utils.close_position(client, symbol)
-        open_positions[symbol] = Position.NONE
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +360,7 @@ def _run() -> None:
 
     sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
     sl_market_pct = Decimal(str(cfg["risk"].get("stop_loss_market_pct", 2.0))) / 100
+    tp_limit_pct = Decimal(str(cfg["risk"].get("take_profit_limit_pct", 3.0))) / 100
     ttp_activation_pct = Decimal(str(cfg["risk"].get("trailing_take_profit_activation_pct", 1.0))) / 100
     ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
 
@@ -370,11 +369,37 @@ def _run() -> None:
     entry_gtx_attempts: int = int(entry_cfg.get("gtx_attempts", 3))
     max_entry_deviation_pct = Decimal(str(entry_cfg.get("max_price_deviation_pct", 0.3))) / 100
 
-
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
-    open_positions = recover_positions(client, symbols)
-    stop_order_ids: dict[str, list[int]] = {s: [] for s in symbols}
-    trailing_tp_order_ids: dict[str, int | None] = {s: None for s in symbols}
+
+    tm_poll_secs: int = int(cfg.get("trade_manager", {}).get("poll_interval_secs", 10))
+    trade_manager = TradeManager(client, poll_interval_secs=tm_poll_secs)
+    trade_manager.start()
+
+    # Register any positions already open on Binance so TradeManager can detect
+    # external closes between candles. Order IDs are not recoverable on restart.
+    recovered = recover_positions(client, symbols)
+    for symbol, pos in recovered.items():
+        if pos != Position.NONE:
+            pos_list = account.get_futures_positions(client, symbol=symbol)
+            if pos_list:
+                p = pos_list[0]
+                trade_manager.register_trade(
+                    symbol=symbol,
+                    position=pos,
+                    size=abs(p["amount"]),
+                    entry_price=p["entry_price"],
+                    tick_size=sym_info[symbol]["tick_size"],
+                    stop_ids=[],
+                    sl_limit_price=Decimal("0"),
+                    sl_market_price=Decimal("0"),
+                    ttp_id=None,
+                    tp_limit_id=None,
+                    has_order_details=False,
+                )
+                logger.warning(
+                    "{} Recovered {} position registered — stop/TP order IDs unknown.",
+                    symbol, pos.value,
+                )
 
     # Pre-fetch candle history so strategies have enough data on the first tick.
     # Auto-compute enough candles for 200 complete 1h bars at the chosen interval,
@@ -418,20 +443,7 @@ def _run() -> None:
                     buf.pop(0)
 
             try:
-                # Reconcile position state against Binance before every decision
-                # so a stop-loss or trailing TP that fired silently is picked up.
-                binance_pos = account.get_futures_positions(client, symbol=symbol)
-                binance_state = Position[binance_pos[0]["side"]] if binance_pos else Position.NONE
-                if binance_state != open_positions[symbol]:
-                    logger.warning(
-                        "{} Position mismatch: bot={} Binance={} — syncing.",
-                        symbol, open_positions[symbol].value, binance_state.value,
-                    )
-                    open_positions[symbol] = binance_state
-                if binance_pos:
-                    logger.debug("{} Position quantity on Binance: {}", symbol, binance_pos[0]["amount"])
-
-                position = open_positions[symbol]
+                position = trade_manager.get_position(symbol)
                 signal = strategy_fn(buf, symbol, position, strategy_params)
 
                 logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
@@ -440,28 +452,27 @@ def _run() -> None:
                     continue
 
                 execute_signal(client, symbol, signal, risk.max_position_usdt,
-                               sym_info[symbol], open_positions, stop_order_ids,
-                               trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
-                               ttp_activation_pct, ttp_callback_rate,
+                               sym_info[symbol], trade_manager, sl_limit_pct, sl_market_pct,
+                               tp_limit_pct, ttp_activation_pct, ttp_callback_rate,
                                entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
 
                 # Immediately re-evaluate on the same candle after a close.
                 # Handles trend reversals (close short → open long) and RSI flush re-entries
                 # without waiting for the next candle.
-                if signal.signal == Signal.CLOSE and open_positions[symbol] == Position.NONE and risk.check():
+                if signal.signal == Signal.CLOSE and trade_manager.get_position(symbol) == Position.NONE and risk.check():
                     reentry = strategy_fn(buf, symbol, Position.NONE, strategy_params)
                     logger.info("{} [NONE] {} — {} (re-entry check)", symbol, reentry.signal.value, reentry.reason)
                     if reentry.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
                         execute_signal(client, symbol, reentry, risk.max_position_usdt,
-                                       sym_info[symbol], open_positions, stop_order_ids,
-                                       trailing_tp_order_ids, sl_limit_pct, sl_market_pct,
-                                       ttp_activation_pct, ttp_callback_rate,
+                                       sym_info[symbol], trade_manager, sl_limit_pct, sl_market_pct,
+                                       tp_limit_pct, ttp_activation_pct, ttp_callback_rate,
                                        entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
 
     finally:
+        trade_manager.stop()
         twm.stop()
         logger.info("WebSocket streams stopped.")
 
