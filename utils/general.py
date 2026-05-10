@@ -10,6 +10,7 @@ class PostOnlyRejected(RuntimeError):
     """Raised when a GTX (post-only) limit order is rejected because it would execute as a taker."""
 
 import resend
+import requests.exceptions
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
@@ -89,7 +90,7 @@ def with_retry(fn, retries: int = 3, backoff: float = 2.0):
     for attempt in range(1, retries + 1):
         try:
             return fn()
-        except (BinanceAPIException, BinanceRequestException) as exc:
+        except (BinanceAPIException, BinanceRequestException, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
             last_exc = exc
             logger.warning("Attempt {}/{} failed: {}. Retrying in {}s.", attempt, retries, exc, delay)
             time.sleep(delay)
