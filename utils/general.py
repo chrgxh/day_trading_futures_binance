@@ -98,6 +98,19 @@ def with_retry(fn, retries: int = 3, backoff: float = 2.0):
     raise last_exc
 
 
+def round_price(price: Decimal, tick_size: Decimal) -> Decimal:
+    """Round a price to the nearest tick boundary.
+
+    Args:
+        price: Raw price to round.
+        tick_size: Minimum price increment for the symbol.
+
+    Returns:
+        Price rounded to the nearest tick (half-up).
+    """
+    return (price / tick_size).to_integral_value() * tick_size
+
+
 def _normalize_order(raw: dict) -> dict:
     """Normalize a raw Binance order response to a consistent shape."""
     return {

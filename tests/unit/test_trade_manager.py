@@ -259,8 +259,9 @@ class TestReconcilePartialFill:
     def test_no_action_when_size_unchanged(self):
         mgr = _make_manager()
         mgr.register_trade(**_register_kwargs(size=Decimal("0.01")))
+        # 0 unrealized P&L — below the 1% trigger
         with patch("utils.trade_manager.account.get_futures_positions",
-                   return_value=[{"amount": Decimal("0.01")}]), \
+                   return_value=[{"amount": Decimal("0.01"), "unrealized_pnl": Decimal("0")}]), \
              patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel:
             mgr._reconcile("BTCUSDT")
         mock_cancel.assert_not_called()
@@ -312,3 +313,122 @@ class TestIdentifyFiredOrder:
         result = mgr._identify_fired_order(state, open_ids=set())
         assert "unknown" in result
         assert "recovered" in result
+
+
+# ---------------------------------------------------------------------------
+# SL profit-lock milestone
+# ---------------------------------------------------------------------------
+
+class TestSlMilestone:
+    # entry=50000, size=0.01 → notional=500 USDT
+    # 1% profit = 5 USDT unrealized_pnl
+    # 0.5% profit = 2.5 USDT
+
+    def _pos(self, size: Decimal, unrealized_pnl: Decimal) -> list[dict]:
+        return [{"amount": size, "unrealized_pnl": unrealized_pnl}]
+
+    def test_no_sl_move_below_trigger(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), entry_price=Decimal("50000")))
+        # 0.5% profit (2.5 USDT) — below 1% trigger
+        with patch("utils.trade_manager.account.get_futures_positions",
+                   return_value=self._pos(Decimal("0.01"), Decimal("2.5"))), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel, \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order") as mock_sl:
+            mgr._reconcile("BTCUSDT")
+        mock_cancel.assert_not_called()
+        mock_sl.assert_not_called()
+
+    def test_sl_move_triggered_at_threshold(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            size=Decimal("0.01"), entry_price=Decimal("50000"), stop_ids=[101, 102]
+        ))
+        # 1.0% profit (5 USDT) — exactly at trigger
+        with patch("utils.trade_manager.account.get_futures_positions",
+                   return_value=self._pos(Decimal("0.01"), Decimal("5"))), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order",
+                   return_value={"order_id": 901}) as mock_new_sl, \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order",
+                   return_value={"order_id": 902}) as mock_new_sm, \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_cancel, \
+             patch("utils.trade_manager.TradeManager._fetch_open_order_ids", return_value={901, 902}):
+            mgr._reconcile("BTCUSDT")
+        mock_new_sl.assert_called_once()
+        mock_new_sm.assert_called_once()
+        assert mock_cancel.call_count == 2  # old stop-limit + old stop-market
+
+    def test_new_stops_placed_before_old_cancelled(self):
+        """Verify place calls happen before cancel calls to avoid an unprotected window."""
+        call_order = []
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            size=Decimal("0.01"), entry_price=Decimal("50000"), stop_ids=[101, 102]
+        ))
+
+        def record_place_sl(*args, **kwargs):
+            call_order.append("place_sl")
+            return {"order_id": 901}
+
+        def record_place_sm(*args, **kwargs):
+            call_order.append("place_sm")
+            return {"order_id": 902}
+
+        def record_cancel(client, symbol, algo_id):
+            call_order.append(f"cancel_{algo_id}")
+
+        with patch("utils.trade_manager.account.get_futures_positions",
+                   return_value=self._pos(Decimal("0.01"), Decimal("5"))), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order", side_effect=record_place_sl), \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order", side_effect=record_place_sm), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order", side_effect=record_cancel), \
+             patch("utils.trade_manager.TradeManager._fetch_open_order_ids", return_value={901, 902}):
+            mgr._reconcile("BTCUSDT")
+
+        assert call_order[0] == "place_sl"
+        assert call_order[1] == "place_sm"
+        assert all("cancel" in c for c in call_order[2:])
+
+    def test_sl_moved_flag_prevents_second_move(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            size=Decimal("0.01"), entry_price=Decimal("50000"), stop_ids=[101, 102]
+        ))
+        pos = self._pos(Decimal("0.01"), Decimal("5"))
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=pos), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order",
+                   return_value={"order_id": 901}), \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order",
+                   return_value={"order_id": 902}), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.TradeManager._fetch_open_order_ids", return_value={901, 902}):
+            mgr._reconcile("BTCUSDT")  # first poll — triggers move
+
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=pos), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order") as mock_sl2, \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"):
+            mgr._reconcile("BTCUSDT")  # second poll — must not trigger again
+
+        mock_sl2.assert_not_called()
+
+    def test_sl_move_short_position(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            position=Position.SHORT,
+            size=Decimal("0.01"),
+            entry_price=Decimal("50000"),
+            stop_ids=[101, 102],
+        ))
+        # 1% profit for short = positive 5 USDT (Binance sign: profit is positive for short too)
+        with patch("utils.trade_manager.account.get_futures_positions",
+                   return_value=self._pos(Decimal("-0.01"), Decimal("5"))), \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order",
+                   return_value={"order_id": 901}) as mock_sl, \
+             patch("utils.trade_manager.algo_orders.place_stop_market_order",
+                   return_value={"order_id": 902}), \
+             patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
+             patch("utils.trade_manager.TradeManager._fetch_open_order_ids", return_value={901, 902}):
+            mgr._reconcile("BTCUSDT")
+        # For short, new stop-limit should be below entry (lock in profit at -0.5%)
+        placed_trigger = mock_sl.call_args.args[4]
+        assert placed_trigger < Decimal("50000")

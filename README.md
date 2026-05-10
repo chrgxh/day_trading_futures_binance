@@ -8,7 +8,7 @@ Automated futures trading bot for Binance. Subscribes to Binance Futures kline W
 bot.py                   — main loop, orchestration, risk controls
 strategies.py            — pluggable strategy functions + STRATEGIES registry
 utils/
-  general.py             — shared primitives: build_client, with_retry, send_crash_email, order normalizers
+  general.py             — shared primitives: build_client, with_retry, round_price, send_crash_email, order normalizers
   account.py             — account state: connection, balances, positions, symbol info, leverage, recent trades
   orders.py              — regular orders: market, limit, tp_limit, get_open_orders, cancel, cancel_all
   algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
@@ -106,8 +106,12 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred SL exit with less slippage
   - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
   - `risk.take_profit_limit_pct` (default `3.0`) — maker GTC limit TP sitting on the book at +3% (long) / -3% (short) from entry; earns the maker rebate and catches wicks
-  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 3% profit and triggers on a 0.5% reversal from peak
+  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 1.5% profit and triggers on a 1.5% reversal from peak
   - All four are cancelled automatically when the strategy signals a close
+- **SL profit-lock milestone** — once unrealized P&L (read directly from Binance) reaches `risk.sl_profit_trigger_pct` (default `1.0`%), `TradeManager` automatically moves both stops to profit-lock levels between candles:
+  - `risk.sl_profit_lock_pct` (default `0.5`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
+  - `risk.sl_profit_market_lock_pct` (default `0.3`) — stop-market safety net, slightly worse than the limit in case of a fast gap
+  - New orders are placed first, old ones cancelled after — no unprotected window. Fires at most once per trade
 - `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L
 
 ## Strategy notes

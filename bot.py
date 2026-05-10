@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from utils import account, algo_orders, general, market, orders
-from utils.general import PostOnlyRejected
+from utils.general import PostOnlyRejected, round_price
 
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
@@ -77,10 +77,6 @@ def recover_positions(client, symbols: list[str]) -> dict[str, Position]:
     return open_positions
 
 
-def _round_price(price: Decimal, tick_size: Decimal) -> Decimal:
-    return (price / tick_size).to_integral_value() * tick_size
-
-
 def attempt_limit_entry(
     client,
     symbol: str,
@@ -123,7 +119,7 @@ def attempt_limit_entry(
         if not _within_deviation(passive_ref):
             return None
 
-        limit_price = _round_price(passive_ref, tick_size)
+        limit_price = round_price(passive_ref, tick_size)
         logger.info(
             "{} Placing GTX limit {} {} @ {} (attempt {}/{})",
             symbol, side, quantity, limit_price, attempt, gtx_attempts,
@@ -193,7 +189,7 @@ def attempt_limit_entry(
         if not _within_deviation(aggressive_ref):
             return None
 
-        limit_price = _round_price(aggressive_ref, tick_size)
+        limit_price = round_price(aggressive_ref, tick_size)
         logger.info(
             "{} Placing IOC limit {} {} @ {} (ioc attempt {})",
             symbol, side, remaining_qty, limit_price, ioc_attempt,
@@ -257,15 +253,15 @@ def execute_signal(
         fill_price = filled_order["price"] if filled_order["price"] > 0 else signal_price
 
         if is_long:
-            sl_limit_trigger = _round_price(fill_price * (1 - sl_limit_pct), tick_size)
-            sl_market_trigger = _round_price(fill_price * (1 - sl_market_pct), tick_size)
-            ttp_activation = _round_price(fill_price * (1 + ttp_activation_pct), tick_size)
-            tp_limit_price = _round_price(fill_price * (1 + tp_limit_pct), tick_size)
+            sl_limit_trigger = round_price(fill_price * (1 - sl_limit_pct), tick_size)
+            sl_market_trigger = round_price(fill_price * (1 - sl_market_pct), tick_size)
+            ttp_activation = round_price(fill_price * (1 + ttp_activation_pct), tick_size)
+            tp_limit_price = round_price(fill_price * (1 + tp_limit_pct), tick_size)
         else:
-            sl_limit_trigger = _round_price(fill_price * (1 + sl_limit_pct), tick_size)
-            sl_market_trigger = _round_price(fill_price * (1 + sl_market_pct), tick_size)
-            ttp_activation = _round_price(fill_price * (1 - ttp_activation_pct), tick_size)
-            tp_limit_price = _round_price(fill_price * (1 - tp_limit_pct), tick_size)
+            sl_limit_trigger = round_price(fill_price * (1 + sl_limit_pct), tick_size)
+            sl_market_trigger = round_price(fill_price * (1 + sl_market_pct), tick_size)
+            ttp_activation = round_price(fill_price * (1 - ttp_activation_pct), tick_size)
+            tp_limit_price = round_price(fill_price * (1 - tp_limit_pct), tick_size)
 
         sl_limit_order = algo_orders.place_stop_limit_order(
             client, symbol, stop_side, quantity, sl_limit_trigger, sl_limit_trigger
@@ -365,6 +361,9 @@ def _run() -> None:
     tp_limit_pct = Decimal(str(cfg["risk"].get("take_profit_limit_pct", 3.0))) / 100
     ttp_activation_pct = Decimal(str(cfg["risk"].get("trailing_take_profit_activation_pct", 1.0))) / 100
     ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
+    sl_profit_trigger_pct = Decimal(str(cfg["risk"].get("sl_profit_trigger_pct", 1.0))) / 100
+    sl_profit_lock_pct = Decimal(str(cfg["risk"].get("sl_profit_lock_pct", 0.5))) / 100
+    sl_profit_market_lock_pct = Decimal(str(cfg["risk"].get("sl_profit_market_lock_pct", 0.3))) / 100
 
     entry_cfg = cfg.get("entry", {})
     entry_gtx_timeout_secs: int = int(entry_cfg.get("gtx_timeout_secs", 5))
@@ -374,7 +373,13 @@ def _run() -> None:
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
 
     tm_poll_secs: int = int(cfg.get("trade_manager", {}).get("poll_interval_secs", 10))
-    trade_manager = TradeManager(client, poll_interval_secs=tm_poll_secs)
+    trade_manager = TradeManager(
+        client,
+        poll_interval_secs=tm_poll_secs,
+        sl_profit_trigger_pct=sl_profit_trigger_pct,
+        sl_profit_lock_pct=sl_profit_lock_pct,
+        sl_profit_market_lock_pct=sl_profit_market_lock_pct,
+    )
     trade_manager.start()
 
     # Register any positions already open on Binance so TradeManager can detect

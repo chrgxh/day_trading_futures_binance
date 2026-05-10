@@ -9,6 +9,7 @@ from binance.client import Client
 from loguru import logger
 
 from utils import account, algo_orders, orders
+from utils.general import round_price
 from utils.indicators import Position
 
 
@@ -27,6 +28,7 @@ class _TradeState:
     tp_limit_id: int | None
     registered_at_ms: int        # epoch ms — used to bound the P&L query to this trade
     has_order_details: bool = True
+    sl_moved: bool = False       # True once the SL milestone has fired — prevents repeated moves
 
 
 class TradeManager:
@@ -38,9 +40,19 @@ class TradeManager:
     reduced size and verifies the new orders are live.
     """
 
-    def __init__(self, client: Client, poll_interval_secs: int = 10):
+    def __init__(
+        self,
+        client: Client,
+        poll_interval_secs: int = 10,
+        sl_profit_trigger_pct: Decimal = Decimal("0.01"),
+        sl_profit_lock_pct: Decimal = Decimal("0.005"),
+        sl_profit_market_lock_pct: Decimal = Decimal("0.003"),
+    ):
         self._client = client
         self._poll_interval = poll_interval_secs
+        self._sl_profit_trigger_pct = sl_profit_trigger_pct
+        self._sl_profit_lock_pct = sl_profit_lock_pct
+        self._sl_profit_market_lock_pct = sl_profit_market_lock_pct
         self._states: dict[str, _TradeState] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -49,7 +61,13 @@ class TradeManager:
     def start(self) -> None:
         """Start the background polling thread."""
         self._thread.start()
-        logger.info("TradeManager started (poll_interval={}s)", self._poll_interval)
+        logger.info(
+            "TradeManager started (poll_interval={}s, sl_trigger={:.1f}%, sl_lock={:.1f}%, sl_market_lock={:.1f}%)",
+            self._poll_interval,
+            float(self._sl_profit_trigger_pct * 100),
+            float(self._sl_profit_lock_pct * 100),
+            float(self._sl_profit_market_lock_pct * 100),
+        )
 
     def stop(self) -> None:
         """Signal the background thread to stop and wait for it to exit."""
@@ -186,6 +204,8 @@ class TradeManager:
             self._handle_partial_fill(state, binance_size)
 
         else:
+            if not state.sl_moved and state.has_order_details and pos_list:
+                self._check_sl_milestone(state, pos_list[0]["unrealized_pnl"])
             logger.debug("TradeManager: {} position unchanged (size={}).", symbol, binance_size)
 
     # ------------------------------------------------------------------
@@ -311,6 +331,114 @@ class TradeManager:
                 "TradeManager: {} new stop orders NOT found in open orders — check manually: {}",
                 symbol, missing,
             )
+
+    # ------------------------------------------------------------------
+    # SL profit-lock milestone
+    # ------------------------------------------------------------------
+
+    def _check_sl_milestone(self, state: _TradeState, unrealized_pnl: Decimal) -> None:
+        """Move stops to profit-lock levels once Binance's unrealized P&L crosses the trigger threshold.
+
+        Uses the unrealized_pnl value from the position endpoint directly — authoritative and already
+        accounts for funding fees. pnl_pct = unrealized_pnl / notional works for both LONG and SHORT
+        since Binance's sign handles direction (positive = in profit, negative = in loss).
+        """
+        notional = state.size * state.entry_price
+        if notional == 0:
+            return
+        pnl_pct = unrealized_pnl / notional
+
+        if pnl_pct < self._sl_profit_trigger_pct:
+            return
+
+        if state.position == Position.LONG:
+            new_sl_limit_price = round_price(
+                state.entry_price * (1 + self._sl_profit_lock_pct), state.tick_size
+            )
+            new_sl_market_price = round_price(
+                state.entry_price * (1 + self._sl_profit_market_lock_pct), state.tick_size
+            )
+        else:
+            new_sl_limit_price = round_price(
+                state.entry_price * (1 - self._sl_profit_lock_pct), state.tick_size
+            )
+            new_sl_market_price = round_price(
+                state.entry_price * (1 - self._sl_profit_market_lock_pct), state.tick_size
+            )
+
+        logger.info(
+            "TradeManager: {} unrealized P&L {:.3f}% >= trigger {:.3f}% — "
+            "moving SL to profit-lock (limit={}, market={}).",
+            state.symbol, float(pnl_pct * 100), float(self._sl_profit_trigger_pct * 100),
+            new_sl_limit_price, new_sl_market_price,
+        )
+        self._move_stop_to_profit(state, new_sl_limit_price, new_sl_market_price)
+
+    def _move_stop_to_profit(
+        self,
+        state: _TradeState,
+        new_sl_limit_price: Decimal,
+        new_sl_market_price: Decimal,
+    ) -> None:
+        """Place new profit-lock stops first, then cancel the old ones to avoid an unprotected window."""
+        new_ids: list[int] = []
+
+        try:
+            sl_limit = algo_orders.place_stop_limit_order(
+                self._client, state.symbol, state.stop_side, state.size,
+                new_sl_limit_price, new_sl_limit_price,
+            )
+            new_ids.append(sl_limit["order_id"])
+            logger.info(
+                "TradeManager: {} new profit-lock stop-limit placed at {} id={}.",
+                state.symbol, new_sl_limit_price, sl_limit["order_id"],
+            )
+        except Exception as exc:
+            logger.error(
+                "TradeManager: could not place profit-lock stop-limit for {}: {}", state.symbol, exc
+            )
+
+        try:
+            sl_market = algo_orders.place_stop_market_order(
+                self._client, state.symbol, state.stop_side, state.size, new_sl_market_price,
+            )
+            new_ids.append(sl_market["order_id"])
+            logger.info(
+                "TradeManager: {} new profit-lock stop-market placed at {} id={}.",
+                state.symbol, new_sl_market_price, sl_market["order_id"],
+            )
+        except Exception as exc:
+            logger.error(
+                "TradeManager: could not place profit-lock stop-market for {}: {}", state.symbol, exc
+            )
+
+        # Cancel old stops only after new ones are live — no unprotected window.
+        for algo_id in list(state.stop_ids):
+            try:
+                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
+                logger.info(
+                    "TradeManager: {} cancelled old stop id={} after profit-lock move.", state.symbol, algo_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TradeManager: could not cancel old stop {} for {}: {}", algo_id, state.symbol, exc
+                )
+
+        if new_ids:
+            self._verify_orders_placed(state.symbol, new_ids)
+
+        with self._lock:
+            if state.symbol in self._states:
+                s = self._states[state.symbol]
+                s.sl_moved = True
+                s.stop_ids = new_ids
+                s.sl_limit_price = new_sl_limit_price
+                s.sl_market_price = new_sl_market_price
+
+        logger.info(
+            "TradeManager: {} SL profit-lock complete — limit={} market={} new_ids={}.",
+            state.symbol, new_sl_limit_price, new_sl_market_price, new_ids,
+        )
 
     # ------------------------------------------------------------------
     # Order helpers
