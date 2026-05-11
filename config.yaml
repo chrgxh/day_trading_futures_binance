@@ -58,11 +58,11 @@ risk:
   stop_loss_limit_pct: 1.5          # Hard SL: stop-limit trigger this % against entry (preferred exit, less slippage)
   stop_loss_market_pct: 1.8         # Safety-net SL: slightly wider than limit — fires if limit SL can't fill (e.g. fast gap)
   take_profit_limit_pct: 3.0        # Maker GTC limit TP placed this % in-profit from entry price
-  trailing_take_profit_activation_pct: 1.5  # Activate trailing TP once unrealized profit reaches this % from entry
+  trailing_take_profit_activation_pct: 1.0  # Activate trailing TP once unrealized profit reaches this % from entry
   trailing_take_profit_callback_rate: 0.5   # Trail by this % from peak — fires when price retraces this amount
-  sl_profit_trigger_pct: 1.0        # When unrealized profit reaches this %, move both stop orders to lock in profit
-  sl_profit_lock_pct: 0.5           # Move stop-limit to this % above (long) or below (short) entry on milestone
-  sl_profit_market_lock_pct: 0.3    # Move stop-market to this % above (long) or below (short) entry — safety net if limit can't fill
+  sl_profit_trigger_pct: 0.6        # When unrealized profit reaches this %, move both stop orders to lock in profit
+  sl_profit_lock_pct: 0.2           # Move stop-limit to this % above (long) or below (short) entry on milestone
+  sl_profit_market_lock_pct: 0.1    # Move stop-market to this % above (long) or below (short) entry — safety net if limit can't fill
 
 trade_manager:
   poll_interval_secs: 5   # How often to check position/order state against Binance (recommended: 5–10s)
