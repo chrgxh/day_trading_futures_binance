@@ -44,6 +44,8 @@ trading:
     rsi_exit_oversold: 20       # Force-exit short when RSI reaches this (momentum exhaustion)
     adx_period: 14              # ADX smoothing period — Wilder's method, same as RSI
     min_adx: 25                 # Skip entry if ADX < this — market is ranging (20=weak, 25=confirmed, 30=strong)
+    stagnation_candles: 4       # Re-check momentum health every N candles while in a position
+    stagnation_min_pct: 0.2     # Price must move at least this % in your favour per window; if not AND ADX/RSI have decayed, close
 
 entry:
   max_price_deviation_pct: 0.3      # Abort IOC entry if price drifts more than this % from signal price

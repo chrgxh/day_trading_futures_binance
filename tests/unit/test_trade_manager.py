@@ -432,3 +432,144 @@ class TestSlMilestone:
         # For short, new stop-limit should be below entry (lock in profit at -0.5%)
         placed_trigger = mock_sl.call_args.args[4]
         assert placed_trigger < Decimal("50000")
+
+
+# ---------------------------------------------------------------------------
+# tick_stagnation
+# ---------------------------------------------------------------------------
+
+class TestTickStagnation:
+    """Tests for the rolling momentum-decay exit check.
+
+    Entry price is always 50000. Default stagnation window is 4 candles with a
+    2% minimum price move. Weak ADX = 20 (below min 25). Weak RSI for LONG = 45
+    (below rsi_long_low 50). Weak RSI for SHORT = 55 (above rsi_short_high 50).
+    """
+
+    def _tick(
+        self,
+        mgr: TradeManager,
+        symbol: str = "BTCUSDT",
+        price: str = "50000",
+        adx: str = "20",
+        rsi_val: str = "45",
+        min_adx: str = "25",
+        rsi_long_low: str = "50",
+        rsi_short_high: str = "50",
+        candles: int = 4,
+        min_pct: str = "2.0",
+    ) -> bool:
+        return mgr.tick_stagnation(
+            symbol=symbol,
+            current_price=Decimal(price),
+            current_adx=Decimal(adx),
+            current_rsi=Decimal(rsi_val),
+            min_adx=Decimal(min_adx),
+            rsi_long_low=Decimal(rsi_long_low),
+            rsi_short_high=Decimal(rsi_short_high),
+            stagnation_candles=candles,
+            stagnation_min_pct=Decimal(min_pct),
+        )
+
+    def test_returns_false_for_unregistered_symbol(self):
+        mgr = _make_manager()
+        assert self._tick(mgr) is False
+
+    def test_does_not_fire_before_n_candles(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        # 3 ticks with all conditions bad — window not reached yet
+        for _ in range(3):
+            result = self._tick(mgr)
+        assert result is False
+
+    def test_fires_when_all_three_conditions_fail(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr)
+        # Candle 4: price moved 1% (< 2%), ADX=20 (< 25), RSI=45 (< 50) → stagnation
+        result = self._tick(mgr, price="50500")
+        assert result is True
+
+    def test_does_not_fire_when_price_moved_enough(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr)
+        # 2.5% move exceeds stagnation_min_pct=2.0 — price condition not met
+        result = self._tick(mgr, price="51250")
+        assert result is False
+
+    def test_does_not_fire_when_adx_still_trending(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, adx="30")
+        # ADX=30 > min_adx=25 — trend still strong, must not exit
+        result = self._tick(mgr, price="50500", adx="30")
+        assert result is False
+
+    def test_does_not_fire_when_rsi_in_momentum_zone(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, rsi_val="60")
+        # RSI=60 >= rsi_long_low=50 — momentum still valid for long, must not exit
+        result = self._tick(mgr, price="50500", rsi_val="60")
+        assert result is False
+
+    def test_checkpoint_resets_on_passing_window(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        # First window: 3% move (> 2%) → passes, checkpoint should update to 51500
+        for _ in range(3):
+            self._tick(mgr)
+        self._tick(mgr, price="51500")  # price good — no stagnation, checkpoint resets
+        with mgr._lock:
+            assert mgr._states["BTCUSDT"].checkpoint_price == Decimal("51500")
+
+    def test_second_window_measured_from_checkpoint_not_entry(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        # First window passes: price moves from 50000 → 51500 (3%)
+        for _ in range(3):
+            self._tick(mgr)
+        self._tick(mgr, price="51500")
+        # Second window: price barely moves from new checkpoint 51500 (0.19%) → stagnation
+        for _ in range(3):
+            self._tick(mgr, price="51500")
+        result = self._tick(mgr, price="51600")  # (51600-51500)/51500 ≈ 0.19%
+        assert result is True
+
+    def test_short_position_stagnation(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            position=Position.SHORT, entry_price=Decimal("50000")
+        ))
+        for _ in range(3):
+            self._tick(mgr, rsi_val="55")  # RSI > rsi_short_high=50 → rsi_weak for short
+        # Price moved only 0.5% down (< 2%), ADX weak, RSI out of zone → stagnation
+        result = self._tick(mgr, price="49750", rsi_val="55")
+        assert result is True
+
+    def test_short_no_stagnation_when_price_moved(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            position=Position.SHORT, entry_price=Decimal("50000")
+        ))
+        for _ in range(3):
+            self._tick(mgr, rsi_val="55")
+        # Price moved 3% down (> 2%) — price condition not met, no exit
+        result = self._tick(mgr, price="48500", rsi_val="55")
+        assert result is False
+
+    def test_short_rsi_in_zone_prevents_exit(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            position=Position.SHORT, entry_price=Decimal("50000")
+        ))
+        for _ in range(3):
+            self._tick(mgr, rsi_val="40")  # RSI=40 <= rsi_short_high=50 → rsi_weak=False
+        result = self._tick(mgr, price="49750", rsi_val="40")
+        assert result is False

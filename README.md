@@ -109,6 +109,12 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `risk.sl_profit_lock_pct` (default `0.5`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
   - `risk.sl_profit_market_lock_pct` (default `0.3`) — stop-market safety net, slightly worse than the limit in case of a fast gap
   - New orders are placed first, old ones cancelled after — no unprotected window. Fires at most once per trade
+- **Stagnation exit** — on every HOLD candle, `bot.py` calls `TradeManager.tick_stagnation()`. Every `strategy_params.stagnation_candles` (default `4`) candles it checks whether all three conditions are true simultaneously:
+  1. Price has moved less than `strategy_params.stagnation_min_pct` (default `2.0`%) in your favour from the last checkpoint
+  2. ADX is below `strategy_params.min_adx` (trend regime gone)
+  3. RSI has left the entry momentum zone (< 50 for longs, > 50 for shorts)
+  
+  If all three are true → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry. All three conditions must fail together — a trade that is slow but still trending (good ADX/RSI) is not cut early.
 - `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L
 
 ## Strategy notes

@@ -29,6 +29,8 @@ class _TradeState:
     registered_at_ms: int        # epoch ms — used to bound the P&L query to this trade
     has_order_details: bool = True
     sl_moved: bool = False       # True once the SL milestone has fired — prevents repeated moves
+    candle_count: int = 0        # incremented on every closed candle while in the trade
+    checkpoint_price: Decimal = Decimal("0")  # price at last stagnation window boundary
 
 
 class TradeManager:
@@ -122,6 +124,7 @@ class TradeManager:
                 tp_limit_id=tp_limit_id,
                 registered_at_ms=int(time.time() * 1000),
                 has_order_details=has_order_details,
+                checkpoint_price=entry_price,
             )
         logger.info(
             "TradeManager: registered {} {} size={} entry={} order_details={}",
@@ -170,6 +173,80 @@ class TradeManager:
         with self._lock:
             state = self._states.get(symbol)
             return state.size if state else Decimal("0")
+
+    def tick_stagnation(
+        self,
+        symbol: str,
+        current_price: Decimal,
+        current_adx: Decimal,
+        current_rsi: Decimal,
+        min_adx: Decimal,
+        rsi_long_low: Decimal,
+        rsi_short_high: Decimal,
+        stagnation_candles: int,
+        stagnation_min_pct: Decimal,
+    ) -> bool:
+        """Increment the candle counter and check for momentum stagnation.
+
+        Called on every closed candle for symbols with an active position. Every
+        stagnation_candles ticks, checks whether price has moved at least
+        stagnation_min_pct in the trade's favour from the last checkpoint AND
+        whether entry-quality indicator conditions still hold. Both conditions
+        must fail simultaneously to trigger a close.
+
+        On a passing window the checkpoint price is reset to current_price so
+        the next window measures progress from here, not from entry.
+
+        Args:
+            symbol: Trading pair.
+            current_price: Latest candle close price.
+            current_adx: ADX value on the current candle.
+            current_rsi: RSI value on the current candle.
+            min_adx: Minimum ADX threshold (same value used at entry).
+            rsi_long_low: RSI lower bound for long momentum zone (same as entry gate).
+            rsi_short_high: RSI upper bound for short momentum zone (same as entry gate).
+            stagnation_candles: Evaluate every N candles.
+            stagnation_min_pct: Required price progress per window, in percent (e.g. 2.0 = 2%).
+
+        Returns:
+            True if stagnation is confirmed and the position should be closed.
+        """
+        with self._lock:
+            state = self._states.get(symbol)
+            if state is None:
+                return False
+
+            state.candle_count += 1
+            if state.candle_count % stagnation_candles != 0:
+                return False
+
+            if state.position == Position.LONG:
+                price_pct = (current_price - state.checkpoint_price) / state.checkpoint_price * 100
+                rsi_weak = current_rsi < rsi_long_low
+            else:
+                price_pct = (state.checkpoint_price - current_price) / state.checkpoint_price * 100
+                rsi_weak = current_rsi > rsi_short_high
+
+            adx_weak = current_adx < min_adx
+
+            if price_pct < stagnation_min_pct and adx_weak and rsi_weak:
+                logger.info(
+                    "TradeManager: {} stagnation detected at candle {} — "
+                    "price moved {:.3f}% from checkpoint (need {:.1f}%), "
+                    "ADX={:.1f} (below min {}), RSI={:.2f} (out of momentum zone) — closing.",
+                    symbol, state.candle_count, float(price_pct), float(stagnation_min_pct),
+                    float(current_adx), float(min_adx), float(current_rsi),
+                )
+                return True
+
+            state.checkpoint_price = current_price
+            logger.debug(
+                "TradeManager: {} stagnation window {} passed — "
+                "price_pct={:.3f}% adx_weak={} rsi_weak={} — checkpoint reset to {}.",
+                symbol, state.candle_count // stagnation_candles,
+                float(price_pct), adx_weak, rsi_weak, current_price,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Background thread

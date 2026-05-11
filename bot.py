@@ -14,7 +14,7 @@ from utils import account, algo_orders, general, market, orders
 from utils.general import round_price
 
 from utils import positions as pos_utils
-from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
+from utils.indicators import Position, Signal, TradeSignal, adx as compute_adx, rsi as compute_rsi, interval_to_minutes
 from utils.trade_manager import TradeManager
 from strategies import STRATEGIES
 
@@ -396,6 +396,25 @@ def _run() -> None:
                 signal = strategy_fn(buf, symbol, position, strategy_params)
 
                 logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
+
+                if signal.signal == Signal.HOLD and position != Position.NONE:
+                    closes = [c["close"] for c in buf]
+                    adx_series = compute_adx(buf, strategy_params.get("adx_period", 14))
+                    current_adx = adx_series[-1] if adx_series else Decimal("0")
+                    current_rsi = compute_rsi(closes, strategy_params.get("rsi_period", 14))
+                    if trade_manager.tick_stagnation(
+                        symbol=symbol,
+                        current_price=closes[-1],
+                        current_adx=current_adx,
+                        current_rsi=current_rsi,
+                        min_adx=Decimal(str(strategy_params.get("min_adx", "25"))),
+                        rsi_long_low=Decimal(str(strategy_params.get("rsi_long_low", "50"))),
+                        rsi_short_high=Decimal(str(strategy_params.get("rsi_short_high", "50"))),
+                        stagnation_candles=int(strategy_params.get("stagnation_candles", 4)),
+                        stagnation_min_pct=Decimal(str(strategy_params.get("stagnation_min_pct", "2.0"))),
+                    ):
+                        signal = TradeSignal(signal=Signal.CLOSE, symbol=symbol, reason="stagnation exit — momentum decayed")
+                        logger.info("{} Stagnation exit triggered — overriding HOLD to CLOSE.", symbol)
 
                 if signal.signal == Signal.HOLD or not risk.check():
                     continue
