@@ -51,7 +51,7 @@ entry:
   max_price_deviation_pct: 0.3      # Abort entry (GTX and IOC) if price drifts more than this % from signal price
 
 risk:
-  max_position_size_usdt: 1000.0    # Maximum USDT notional value per open position
+  max_position_size_usdt: 2000.0    # Maximum USDT notional value per open position
   max_daily_loss_usdt: 50.0         # Bot stops opening new trades once cumulative daily loss hits this
   kill_switch: false                 # Set true to immediately block all new order attempts
   leverage: 20                       # Leverage multiplier set on position open (applied to all symbols)
