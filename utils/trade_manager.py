@@ -293,7 +293,6 @@ class TradeManager:
         else:
             if not state.sl_moved and state.has_order_details and pos_list:
                 self._check_sl_milestone(state, pos_list[0]["unrealized_pnl"])
-            logger.debug("TradeManager: {} position unchanged (size={}).", symbol, binance_size)
 
     # ------------------------------------------------------------------
     # External close handler

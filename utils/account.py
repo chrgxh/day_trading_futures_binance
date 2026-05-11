@@ -89,7 +89,6 @@ def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[
                 "leverage": int(p["leverage"]) if p.get("leverage") else None,
                 "liquidation_price": Decimal(p["liquidationPrice"]) if p.get("liquidationPrice") else None,
             })
-        logger.debug("Open futures positions for {}: {}", symbol or "all", len(positions))
         return positions
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_futures_positions failed: {}", exc)

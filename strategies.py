@@ -224,7 +224,7 @@ def ma_crossover(candles: list[dict], symbol: str, position: Position, params: d
     cross_up = fast_prev <= slow_prev and fast_now > slow_now
     cross_down = fast_prev >= slow_prev and fast_now < slow_now
 
-    logger.debug("{} SMA({})={:.4f} SMA({})={:.4f}", symbol, fast_period, fast_now, slow_period, slow_now)
+
 
     if position == Position.LONG:
         if cross_down:
