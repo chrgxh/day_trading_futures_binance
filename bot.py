@@ -16,7 +16,7 @@ from utils.general import round_price
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, adx as compute_adx, rsi as compute_rsi, interval_to_minutes
 from utils.trade_manager import TradeManager
-from utils.pnl_logger import DailyPnLLogger
+from utils.pnl_reporter import DailyPnLReporter
 from strategies import STRATEGIES
 
 
@@ -325,9 +325,9 @@ def _run() -> None:
     )
     trade_manager.start()
 
-    pnl_log_file = cfg["logging"].get("pnl_log_file", "logs/pnl.log")
-    pnl_logger = DailyPnLLogger(client, symbols, pnl_log_file)
-    pnl_logger.start()
+    pnl_csv_file = cfg["reporting"]["pnl_csv_file"]
+    pnl_reporter = DailyPnLReporter(client, symbols, pnl_csv_file)
+    pnl_reporter.start()
 
     # Register any positions already open on Binance so TradeManager can detect
     # external closes between candles. Order IDs are not recoverable on restart.

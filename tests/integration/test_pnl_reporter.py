@@ -1,5 +1,6 @@
-"""Integration tests for utils/account.get_futures_trades_for_range and utils/pnl_logger."""
+"""Integration tests for utils/account.get_futures_trades_for_range and utils/pnl_reporter."""
 
+import csv
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from utils import account, orders as orders_mod, positions as positions_mod
-from utils.pnl_logger import DailyPnLLogger, write_daily_pnl
+from utils.pnl_reporter import DailyPnLReporter, write_daily_pnl
 
 pytestmark = pytest.mark.integration
 
@@ -66,7 +67,6 @@ def test_trades_for_range_excludes_earlier_trades(client, symbol, sym_info):
 
 def test_trades_for_range_returns_correct_keys(client, symbol):
     """Smoke test: a 1-second window far in the past returns a well-formed list (likely empty)."""
-    # Use a fixed past timestamp that is guaranteed to precede any testnet activity.
     ancient_start_ms = 1_700_000_000_000  # 2023-11-14 UTC
     ancient_end_ms = ancient_start_ms + 1_000
     result = account.get_futures_trades_for_range(client, symbol, ancient_start_ms, ancient_end_ms)
@@ -77,44 +77,44 @@ def test_trades_for_range_returns_correct_keys(client, symbol):
 # write_daily_pnl
 # ---------------------------------------------------------------------------
 
-def test_write_daily_pnl_creates_report_file(client, symbol, sym_info):
-    """write_daily_pnl should produce a file with date header and symbol lines."""
+def test_write_daily_pnl_creates_csv_with_expected_rows(client, symbol, sym_info):
+    """write_daily_pnl should produce a CSV with a header, a symbol row, and a TOTAL row."""
     qty = max(Decimal("0.001"), sym_info["min_qty"]).quantize(sym_info["step_size"])
     orders_mod.cancel_all_orders(client, symbol)
     positions_mod.close_position(client, symbol)
     orders_mod.place_market_order(client, symbol, "BUY", qty)
     positions_mod.close_position(client, symbol)
 
-    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tmp:
-        log_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        csv_path = tmp.name
 
     today = datetime.now(timezone.utc)
-    write_daily_pnl(client, [symbol], log_path, report_date=today)
+    write_daily_pnl(client, [symbol], csv_path, report_date=today)
 
-    content = Path(log_path).read_text()
+    rows = list(csv.DictReader(Path(csv_path).open()))
     date_str = today.strftime("%Y-%m-%d")
 
-    assert date_str in content
-    assert symbol in content
-    assert "TOTAL" in content
-    assert "net" in content
+    symbols_in_rows = [r["symbol"] for r in rows]
+    assert symbol in symbols_in_rows
+    assert "TOTAL" in symbols_in_rows
+    assert all(r["date"] == date_str for r in rows)
 
 
 def test_write_daily_pnl_appends_on_multiple_calls(client, symbol):
-    """Calling write_daily_pnl twice should append two report blocks, not overwrite."""
-    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tmp:
-        log_path = tmp.name
+    """Calling write_daily_pnl twice should append rows, not overwrite."""
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        csv_path = tmp.name
 
     today = datetime.now(timezone.utc)
-    write_daily_pnl(client, [symbol], log_path, report_date=today)
-    write_daily_pnl(client, [symbol], log_path, report_date=today)
+    write_daily_pnl(client, [symbol], csv_path, report_date=today)
+    write_daily_pnl(client, [symbol], csv_path, report_date=today)
 
-    content = Path(log_path).read_text()
-    assert content.count("Daily P&L Report") == 2
+    rows = list(csv.DictReader(Path(csv_path).open()))
+    assert len([r for r in rows if r["symbol"] == "TOTAL"]) == 2
 
 
 def test_write_daily_pnl_net_equals_realized_minus_commission(client, symbol, sym_info):
-    """Net P&L in the report must equal realized − commission for the symbol line."""
+    """Net P&L in the CSV must equal realized − commission for the symbol row."""
     qty = max(Decimal("0.001"), sym_info["min_qty"]).quantize(sym_info["step_size"])
     orders_mod.cancel_all_orders(client, symbol)
     positions_mod.close_position(client, symbol)
@@ -127,31 +127,27 @@ def test_write_daily_pnl_net_equals_realized_minus_commission(client, symbol, sy
     end_epoch = int(today.timestamp() * 1000)
 
     trades = account.get_futures_trades_for_range(client, symbol, start_epoch, end_epoch)
-    expected_realized = sum((t["realized_pnl"] for t in trades), Decimal("0"))
-    expected_commission = sum((t["commission"] for t in trades), Decimal("0"))
-    expected_net = expected_realized - expected_commission
+    expected_net = sum((t["realized_pnl"] - t["commission"] for t in trades), Decimal("0"))
 
-    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tmp:
-        log_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        csv_path = tmp.name
 
-    write_daily_pnl(client, [symbol], log_path, report_date=today)
-    content = Path(log_path).read_text()
+    write_daily_pnl(client, [symbol], csv_path, report_date=today)
 
-    # Find the symbol line and confirm the net value matches what we computed directly.
-    symbol_line = next(line for line in content.splitlines() if symbol in line and "net" in line)
-    sign = "+" if expected_net >= 0 else ""
-    assert f"net {sign}{expected_net:.4f}" in symbol_line
+    rows = list(csv.DictReader(Path(csv_path).open()))
+    symbol_row = next(r for r in rows if r["symbol"] == symbol)
+    assert Decimal(symbol_row["net_pnl"]) == expected_net.quantize(Decimal("0.0001"))
 
 
 # ---------------------------------------------------------------------------
-# DailyPnLLogger
+# DailyPnLReporter
 # ---------------------------------------------------------------------------
 
-def test_daily_pnl_logger_starts_without_error(client, symbol):
-    """DailyPnLLogger.start() should launch the daemon thread without raising."""
-    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tmp:
-        log_path = tmp.name
+def test_daily_pnl_reporter_starts_without_error(client, symbol):
+    """DailyPnLReporter.start() should launch the daemon thread without raising."""
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        csv_path = tmp.name
 
-    pnl_logger = DailyPnLLogger(client, [symbol], log_path)
-    pnl_logger.start()
-    assert pnl_logger._thread.is_alive()
+    reporter = DailyPnLReporter(client, [symbol], csv_path)
+    reporter.start()
+    assert reporter._thread.is_alive()
