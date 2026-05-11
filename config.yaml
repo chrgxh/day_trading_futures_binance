@@ -46,9 +46,7 @@ trading:
     min_adx: 25                 # Skip entry if ADX < this — market is ranging (20=weak, 25=confirmed, 30=strong)
 
 entry:
-  gtx_timeout_secs: 5               # Seconds to wait per GTX attempt before cancelling and retrying
-  gtx_attempts: 3                   # Number of post-only GTX attempts before falling back to IOC chase
-  max_price_deviation_pct: 0.3      # Abort entry (GTX and IOC) if price drifts more than this % from signal price
+  max_price_deviation_pct: 0.3      # Abort IOC entry if price drifts more than this % from signal price
 
 risk:
   max_position_size_usdt: 2000.0    # Maximum USDT notional value per open position

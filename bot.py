@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from utils import account, algo_orders, general, market, orders
-from utils.general import PostOnlyRejected, round_price
+from utils.general import round_price
 
 from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
@@ -77,28 +77,20 @@ def recover_positions(client, symbols: list[str]) -> dict[str, Position]:
     return open_positions
 
 
-def attempt_limit_entry(
+def ioc_entry(
     client,
     symbol: str,
     side: str,
     quantity: Decimal,
     tick_size: Decimal,
     signal_price: Decimal,
-    gtx_timeout_secs: int,
-    gtx_attempts: int,
     max_deviation_pct: Decimal,
 ) -> dict | None:
-    """Two-stage limit entry: GTX (post-only) at bid/ask first, then IOC chase until filled or price drifts too far.
+    """IOC limit entry: chases best ask (BUY) / best bid (SELL) until filled or price drifts too far.
 
-    Stage 1 — GTX at best bid (BUY) / best ask (SELL): passive maker attempt, repeated up to
-    gtx_attempts times with a gtx_timeout_secs wait each. An instant GTX rejection (price already
-    crossing the spread) counts as one attempt and moves straight to the next without waiting.
-    Exits early to IOC if price drifts beyond max_deviation_pct from signal_price.
-
-    Stage 2 — IOC chase at best ask (BUY) / best bid (SELL): keeps retrying with a fresh
-    ask/bid on every iteration. The only exit conditions are a fill or price drifting beyond
-    max_deviation_pct. Criteria cannot change before the next candle closes, so deviation
-    is the only meaningful abort.
+    Retries with a fresh price on each attempt. The only exit conditions are a full fill or price
+    drifting beyond max_deviation_pct from signal_price. On partial fill with price drift, returns
+    a partial fill dict so stop/TP orders are placed on the live position.
 
     Returns the filled order dict on success, or None if entry was aborted.
     """
@@ -112,78 +104,13 @@ def attempt_limit_entry(
             return False
         return True
 
-    # --- Stage 1: GTX (post-only) at best bid (BUY) or best ask (SELL) ---
-    for attempt in range(1, gtx_attempts + 1):
-        best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
-        passive_ref = best_bid if side == "BUY" else best_ask
-        if not _within_deviation(passive_ref):
-            return None
-
-        limit_price = round_price(passive_ref, tick_size)
-        logger.info(
-            "{} Placing GTX limit {} {} @ {} (attempt {}/{})",
-            symbol, side, quantity, limit_price, attempt, gtx_attempts,
-        )
-
-        try:
-            order = orders.place_limit_order(client, symbol, side, quantity, limit_price, time_in_force="GTX")
-        except PostOnlyRejected:
-            logger.info("{} GTX rejected (would be taker) on attempt {}/{}", symbol, attempt, gtx_attempts)
-            continue
-
-        deadline = time.monotonic() + gtx_timeout_secs
-        filled_order: dict | None = None
-        while time.monotonic() < deadline:
-            time.sleep(2)
-            try:
-                status = orders.get_order(client, symbol, order["order_id"])
-            except Exception as exc:
-                logger.warning("{} Could not poll GTX order {}: {}", symbol, order["order_id"], exc)
-                break
-            if status["status"] == "FILLED":
-                filled_order = status
-                break
-            if status["status"] in ("CANCELED", "EXPIRED"):
-                break
-
-        if filled_order is None:
-            try:
-                latest = orders.get_order(client, symbol, order["order_id"])
-                if latest["status"] == "FILLED":
-                    filled_order = latest
-                elif latest["status"] not in ("CANCELED", "EXPIRED"):
-                    try:
-                        orders.cancel_order(client, symbol, order["order_id"])
-                    except general.BinanceAPIException as cancel_exc:
-                        if getattr(cancel_exc, "code", None) == -2011:
-                            # Order was filled between our status check and the cancel call.
-                            # Re-fetch to confirm and treat as filled rather than proceeding to the next attempt.
-                            try:
-                                refetch = orders.get_order(client, symbol, order["order_id"])
-                                if refetch["status"] == "FILLED":
-                                    filled_order = refetch
-                                    logger.warning("{} GTX order {} filled just before cancel (-2011); treating as filled.", symbol, order["order_id"])
-                            except Exception as refetch_exc:
-                                logger.warning("{} Could not re-fetch GTX order {} after -2011: {}", symbol, order["order_id"], refetch_exc)
-                        else:
-                            raise
-            except Exception as exc:
-                logger.warning("{} Could not cancel GTX order {}: {}", symbol, order["order_id"], exc)
-
-        if filled_order is not None:
-            logger.info("{} GTX limit filled @ {} (attempt {})", symbol, limit_price, attempt)
-            return filled_order
-
-    logger.info("{} GTX unfilled after {} attempts — switching to IOC chase", symbol, gtx_attempts)
-
-    # --- Stage 2: IOC chase until filled or price exceeds deviation ---
     # Track cumulative filled quantity so each IOC only requests the remaining amount.
     # Without this, a partial fill followed by a full-size IOC creates an oversized position.
     filled_qty = Decimal("0")
     remaining_qty = quantity
-    ioc_attempt = 0
+    attempt = 0
     while True:
-        ioc_attempt += 1
+        attempt += 1
         best_bid, best_ask = market.get_futures_best_bid_ask(client, symbol)
         aggressive_ref = best_ask if side == "BUY" else best_bid
         if not _within_deviation(aggressive_ref):
@@ -201,8 +128,8 @@ def attempt_limit_entry(
 
         limit_price = round_price(aggressive_ref, tick_size)
         logger.info(
-            "{} Placing IOC limit {} {} @ {} (ioc attempt {})",
-            symbol, side, remaining_qty, limit_price, ioc_attempt,
+            "{} Placing IOC limit {} {} @ {} (attempt {})",
+            symbol, side, remaining_qty, limit_price, attempt,
         )
         ioc_order = orders.place_limit_order(client, symbol, side, remaining_qty, limit_price, time_in_force="IOC")
 
@@ -214,11 +141,11 @@ def attempt_limit_entry(
                 filled_qty += this_fill
                 remaining_qty = quantity - filled_qty
                 logger.info(
-                    "{} IOC {} @ {} (ioc attempt {}): filled={} cumulative={}/{}",
-                    symbol, status["status"], limit_price, ioc_attempt, this_fill, filled_qty, quantity,
+                    "{} IOC {} @ {} (attempt {}): filled={} cumulative={}/{}",
+                    symbol, status["status"], limit_price, attempt, this_fill, filled_qty, quantity,
                 )
             if status["status"] == "FILLED" or remaining_qty <= 0:
-                logger.info("{} IOC fully filled after {} attempt(s)", symbol, ioc_attempt)
+                logger.info("{} IOC fully filled after {} attempt(s)", symbol, attempt)
                 # Patch executed_qty to reflect cumulative fill across all IOC attempts.
                 status["executed_qty"] = filled_qty
                 return status
@@ -238,8 +165,6 @@ def execute_signal(
     tp_limit_pct: Decimal,
     ttp_activation_pct: Decimal,
     ttp_callback_rate: Decimal,
-    entry_gtx_timeout_secs: int,
-    entry_gtx_attempts: int,
     max_entry_deviation_pct: Decimal,
 ) -> None:
     """Place the order for a non-HOLD signal, set stop losses + TP orders on open, cancel on close."""
@@ -252,9 +177,9 @@ def execute_signal(
         side = "BUY" if is_long else "SELL"
         stop_side = "SELL" if is_long else "BUY"
 
-        filled_order = attempt_limit_entry(
+        filled_order = ioc_entry(
             client, symbol, side, quantity, tick_size,
-            signal_price, entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct,
+            signal_price, max_entry_deviation_pct,
         )
 
         if filled_order is None:
@@ -385,8 +310,6 @@ def _run() -> None:
     sl_profit_market_lock_pct = Decimal(str(cfg["risk"].get("sl_profit_market_lock_pct", 0.3))) / 100
 
     entry_cfg = cfg.get("entry", {})
-    entry_gtx_timeout_secs: int = int(entry_cfg.get("gtx_timeout_secs", 5))
-    entry_gtx_attempts: int = int(entry_cfg.get("gtx_attempts", 3))
     max_entry_deviation_pct = Decimal(str(entry_cfg.get("max_price_deviation_pct", 0.3))) / 100
 
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
@@ -480,7 +403,7 @@ def _run() -> None:
                 execute_signal(client, symbol, signal, risk.max_position_usdt,
                                sym_info[symbol], trade_manager, sl_limit_pct, sl_market_pct,
                                tp_limit_pct, ttp_activation_pct, ttp_callback_rate,
-                               entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
+                               max_entry_deviation_pct)
 
                 # Immediately re-evaluate on the same candle after a close.
                 # Handles trend reversals (close short → open long) and RSI flush re-entries
@@ -492,7 +415,7 @@ def _run() -> None:
                         execute_signal(client, symbol, reentry, risk.max_position_usdt,
                                        sym_info[symbol], trade_manager, sl_limit_pct, sl_market_pct,
                                        tp_limit_pct, ttp_activation_pct, ttp_callback_rate,
-                                       entry_gtx_timeout_secs, entry_gtx_attempts, max_entry_deviation_pct)
+                                       max_entry_deviation_pct)
 
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
