@@ -93,9 +93,15 @@ def _register_recovered_position(
     try:
         open_orders = orders.get_open_orders(client, symbol)
         exit_side = "SELL" if pos == Position.LONG else "BUY"
-        sl_limit_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "STOP" and o["side"] == exit_side), None)
-        sl_market_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "STOP_MARKET" and o["side"] == exit_side), None)
-        ttp_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "TRAILING_STOP_MARKET" and o["side"] == exit_side), None)
+        # Binance does not populate `type` on algo order query responses, so match
+        # by price structure instead: stop-limit has both price and stop_price set;
+        # stop-market has only stop_price; trailing stop has neither. This is safe
+        # because the bot only ever places these three algo order types per position,
+        # all reduceOnly on the exit side — no other algo order can collide.
+        algo_exits = [o for o in open_orders if o["is_algo"] and o["side"] == exit_side]
+        sl_limit_o = next((o for o in algo_exits if o["price"] > 0 and o["stop_price"] > 0), None)
+        sl_market_o = next((o for o in algo_exits if o["price"] == 0 and o["stop_price"] > 0), None)
+        ttp_o = next((o for o in algo_exits if o["price"] == 0 and o["stop_price"] == 0), None)
         tp_limit_o = next((o for o in open_orders if not o["is_algo"] and o["type"] == "LIMIT" and o["side"] == exit_side), None)
     except Exception as exc:
         logger.warning("{} Could not fetch open orders during recovery: {}", symbol, exc)
