@@ -186,13 +186,15 @@ class TradeManager:
         stagnation_candles: int,
         stagnation_min_pct: Decimal,
     ) -> bool:
-        """Increment the candle counter and check for momentum stagnation.
+        """Increment the candle counter and check for momentum stagnation or reversal.
 
         Called on every closed candle for symbols with an active position. Every
-        stagnation_candles ticks, checks whether price has moved at least
-        stagnation_min_pct in the trade's favour from the last checkpoint AND
-        whether entry-quality indicator conditions still hold. Both conditions
-        must fail simultaneously to trigger a close.
+        stagnation_candles ticks, two exit conditions are evaluated:
+
+        1. Stagnation: price moved less than stagnation_min_pct in favour AND
+           ADX is below min_adx AND RSI has left the entry momentum zone.
+        2. Reversal: price moved more than stagnation_min_pct *against* the trade
+           from the last checkpoint — exits regardless of ADX or RSI.
 
         On a passing window the checkpoint price is reset to current_price so
         the next window measures progress from here, not from entry.
@@ -236,6 +238,14 @@ class TradeManager:
                     "ADX={:.1f} (below min {}), RSI={:.2f} (out of momentum zone) — closing.",
                     symbol, state.candle_count, float(price_pct), float(stagnation_min_pct),
                     float(current_adx), float(min_adx), float(current_rsi),
+                )
+                return True
+
+            if price_pct < Decimal("0"):
+                logger.info(
+                    "TradeManager: {} reversal exit at candle {} — "
+                    "price moved {:.3f}% against trade from checkpoint — closing.",
+                    symbol, state.candle_count, float(price_pct),
                 )
                 return True
 

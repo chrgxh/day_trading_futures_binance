@@ -103,18 +103,17 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred SL exit with less slippage
   - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
   - `risk.take_profit_limit_pct` (default `3.0`) — maker GTC limit TP sitting on the book at +3% (long) / -3% (short) from entry; earns the maker rebate and catches wicks
-  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 1.5% profit and triggers on a 1.5% reversal from peak
+  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 1.0% profit and trails by 0.5% from peak
   - All four are cancelled automatically when the strategy signals a close
-- **SL profit-lock milestone** — once unrealized P&L (read directly from Binance) reaches `risk.sl_profit_trigger_pct` (default `1.0`%), `TradeManager` automatically moves both stops to profit-lock levels between candles:
-  - `risk.sl_profit_lock_pct` (default `0.5`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
-  - `risk.sl_profit_market_lock_pct` (default `0.3`) — stop-market safety net, slightly worse than the limit in case of a fast gap
+- **SL profit-lock milestone** — once unrealized P&L (read directly from Binance) reaches `risk.sl_profit_trigger_pct` (default `0.6`%), `TradeManager` automatically moves both stops to profit-lock levels between candles:
+  - `risk.sl_profit_lock_pct` (default `0.2`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
+  - `risk.sl_profit_market_lock_pct` (default `0.1`) — stop-market safety net, slightly worse than the limit in case of a fast gap
   - New orders are placed first, old ones cancelled after — no unprotected window. Fires at most once per trade
-- **Stagnation exit** — on every HOLD candle, `bot.py` calls `TradeManager.tick_stagnation()`. Every `strategy_params.stagnation_candles` (default `4`) candles it checks whether all three conditions are true simultaneously:
-  1. Price has moved less than `strategy_params.stagnation_min_pct` (default `2.0`%) in your favour from the last checkpoint
-  2. ADX is below `strategy_params.min_adx` (trend regime gone)
-  3. RSI has left the entry momentum zone (< 50 for longs, > 50 for shorts)
-  
-  If all three are true → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry. All three conditions must fail together — a trade that is slow but still trending (good ADX/RSI) is not cut early.
+- **Stagnation / reversal exit** — on every HOLD candle, `bot.py` calls `TradeManager.tick_stagnation()`. Every `strategy_params.stagnation_candles` (default `4`) candles it evaluates two conditions:
+  1. **Stagnation**: price moved less than `strategy_params.stagnation_min_pct` (default `0.2`%) in your favour from the last checkpoint AND ADX is below `strategy_params.min_adx` AND RSI has left the entry momentum zone — all three required
+  2. **Reversal**: price moved *any amount against* the trade from the last checkpoint (`price_pct < 0`) — fires regardless of ADX or RSI
+
+  Either condition → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry.
 - `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L
 
 ## Strategy notes

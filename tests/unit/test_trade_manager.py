@@ -573,3 +573,32 @@ class TestTickStagnation:
             self._tick(mgr, rsi_val="40")  # RSI=40 <= rsi_short_high=50 → rsi_weak=False
         result = self._tick(mgr, price="49750", rsi_val="40")
         assert result is False
+
+    def test_reversal_exit_long_fires_regardless_of_adx(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, adx="30", rsi_val="60")
+        # Price dropped below checkpoint (50000) — reversal fires even with strong ADX/RSI
+        result = self._tick(mgr, price="49900", adx="30", rsi_val="60")
+        assert result is True
+
+    def test_reversal_exit_short_fires_regardless_of_adx(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(
+            position=Position.SHORT, entry_price=Decimal("50000")
+        ))
+        for _ in range(3):
+            self._tick(mgr, adx="30", rsi_val="40")
+        # Price rose above checkpoint (50000) — reversal fires even with strong ADX/RSI
+        result = self._tick(mgr, price="50100", adx="30", rsi_val="40")
+        assert result is True
+
+    def test_no_reversal_exit_when_price_exactly_at_checkpoint(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, adx="30", rsi_val="60")
+        # price_pct = 0 exactly — reversal requires strictly < 0; stagnation blocked by strong ADX
+        result = self._tick(mgr, price="50000", adx="30", rsi_val="60")
+        assert result is False
