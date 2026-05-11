@@ -10,10 +10,8 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from utils import account, algo_orders, general, market, orders
+from utils import account, algo_orders, general, market, orders, positions as pos_utils
 from utils.general import round_price
-
-from utils import positions as pos_utils
 from utils.indicators import Position, Signal, TradeSignal, adx as compute_adx, rsi as compute_rsi, interval_to_minutes
 from utils.trade_manager import TradeManager
 from utils.pnl_reporter import DailyPnLReporter
@@ -330,30 +328,54 @@ def _run() -> None:
     pnl_reporter.start()
 
     # Register any positions already open on Binance so TradeManager can detect
-    # external closes between candles. Order IDs are not recoverable on restart.
+    # external closes between candles. Query open orders to recover exit order IDs.
     recovered = recover_positions(client, symbols)
     for symbol, pos in recovered.items():
         if pos != Position.NONE:
             pos_list = account.get_futures_positions(client, symbol=symbol)
             if pos_list:
                 p = pos_list[0]
+                sl_limit_o = sl_market_o = ttp_o = tp_limit_o = None
+                try:
+                    open_orders = orders.get_open_orders(client, symbol)
+                    exit_side = "SELL" if pos == Position.LONG else "BUY"
+                    sl_limit_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "STOP" and o["side"] == exit_side), None)
+                    sl_market_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "STOP_MARKET" and o["side"] == exit_side), None)
+                    ttp_o = next((o for o in open_orders if o["is_algo"] and o["type"] == "TRAILING_STOP_MARKET" and o["side"] == exit_side), None)
+                    tp_limit_o = next((o for o in open_orders if not o["is_algo"] and o["type"] == "LIMIT" and o["side"] == exit_side), None)
+                except Exception as exc:
+                    logger.warning("{} Could not fetch open orders during recovery: {}", symbol, exc)
+                stop_ids = [o["order_id"] for o in [sl_limit_o, sl_market_o] if o is not None]
+                sl_limit_price = sl_limit_o["stop_price"] if sl_limit_o else Decimal("0")
+                sl_market_price = sl_market_o["stop_price"] if sl_market_o else Decimal("0")
+                has_details = bool(stop_ids or ttp_o or tp_limit_o)
                 trade_manager.register_trade(
                     symbol=symbol,
                     position=pos,
                     size=abs(p["amount"]),
                     entry_price=p["entry_price"],
                     tick_size=sym_info[symbol]["tick_size"],
-                    stop_ids=[],
-                    sl_limit_price=Decimal("0"),
-                    sl_market_price=Decimal("0"),
-                    ttp_id=None,
-                    tp_limit_id=None,
-                    has_order_details=False,
+                    stop_ids=stop_ids,
+                    sl_limit_price=sl_limit_price,
+                    sl_market_price=sl_market_price,
+                    ttp_id=ttp_o["order_id"] if ttp_o else None,
+                    tp_limit_id=tp_limit_o["order_id"] if tp_limit_o else None,
+                    has_order_details=has_details,
                 )
-                logger.warning(
-                    "{} Recovered {} position registered — stop/TP order IDs unknown.",
-                    symbol, pos.value,
-                )
+                if has_details:
+                    logger.info(
+                        "{} Recovered {} position registered — found orders: sl_limit={} sl_market={} ttp={} tp_limit={}.",
+                        symbol, pos.value,
+                        sl_limit_o["order_id"] if sl_limit_o else None,
+                        sl_market_o["order_id"] if sl_market_o else None,
+                        ttp_o["order_id"] if ttp_o else None,
+                        tp_limit_o["order_id"] if tp_limit_o else None,
+                    )
+                else:
+                    logger.warning(
+                        "{} Recovered {} position registered — exit order IDs unknown.",
+                        symbol, pos.value,
+                    )
 
     # Pre-fetch candle history so strategies have enough data on the first tick.
     # Auto-compute enough candles for 200 complete 1h bars at the chosen interval,
