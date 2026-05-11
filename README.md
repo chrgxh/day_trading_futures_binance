@@ -15,6 +15,7 @@ utils/
   positions.py           — position management: close_position
   market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
   trade_manager.py       — background trade state manager: monitors positions, reconciles orders on external fills
+  pnl_logger.py          — daily P&L reporter: writes net P&L per symbol to logs/pnl.log at UTC midnight
   indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h)
 config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
 .env                     — mainnet API keys and runtime flags (never commit)
@@ -22,7 +23,7 @@ config.yaml              — symbols, interval, risk limits, strategy selection 
 tests/
   unit/                  — fast unit tests (no network), run with plain pytest
   integration/           — testnet integration tests, one file per module
-logs/                    — runtime log output, mounted volume
+logs/                    — runtime log output, mounted volume (bot.log, pnl.log, optionally bot.debug.log)
 sandbox.ipynb            — manual testnet notebook for ad-hoc scenario testing
 ```
 
@@ -66,6 +67,26 @@ python bot.py
 docker compose up --build
 ```
 
+## Daily P&L log
+
+At 00:00:05 UTC each day the bot appends a report to `logs/pnl.log` covering the just-completed UTC calendar day (matching Binance's own day boundary). The file is plain-appended — one block per day — and is separate from the main bot log so it reads as a clean ledger:
+
+```
+==============================================================
+  Daily P&L Report  —  2026-05-10  (UTC)
+==============================================================
+  BTCUSDT      net +4.2310 USDT  (realized +4.5100, commission -0.2790, 6 trade(s))
+  ETHUSDT      net -1.1240 USDT  (realized -1.0800, commission -0.0440, 3 trade(s))
+  SOLUSDT      net +0.0000 USDT  (realized +0.0000, commission -0.0000, 0 trade(s))
+──────────────────────────────────────────────────────────────
+  TOTAL        net +3.1070 USDT  (realized +3.4300, commission -0.3230)
+==============================================================
+```
+
+Net P&L = realized P&L − trading commission. The log file path is configurable via `logging.pnl_log_file` in `config.yaml`.
+
+> **Note:** the report only fires if the bot is alive at midnight. If the bot is stopped before midnight and restarted after, that day's report is skipped.
+
 ## Testing
 
 Unit tests run without any network connection:
@@ -87,6 +108,7 @@ pytest tests/integration/test_orders.py -m integration -v
 pytest tests/integration/test_algo_orders.py -m integration -v
 pytest tests/integration/test_positions.py -m integration -v
 pytest tests/integration/test_trade_manager.py -m integration -v
+pytest tests/integration/test_pnl_logger.py -m integration -v
 pytest tests/integration/test_notifications.py -m integration -v
 ```
 

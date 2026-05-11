@@ -73,3 +73,4 @@ logging:
   rotation: "10 MB"
   retention: "7 days"
   debug_log_file: logs/bot.debug.log   # Optional: write all DEBUG logs to a separate file (remove key to disable)
+  pnl_log_file: logs/pnl.log           # Daily P&L report — one entry per UTC day, appended at 00:00:05 UTC

@@ -186,6 +186,59 @@ def get_futures_recent_trades(
         raise
 
 
+def get_futures_trades_for_range(
+    client: Client,
+    symbol: str,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> list[dict]:
+    """Return all futures account trades for a symbol within a UTC time range.
+
+    Fetches up to 1000 trades per request (Binance cap). Sufficient for daily
+    reporting on a day-trading bot; add pagination here if trade volume grows.
+
+    Args:
+        client: Authenticated Binance client.
+        symbol: Trading pair, e.g. "BTCUSDT".
+        start_time_ms: Range start, epoch milliseconds (inclusive).
+        end_time_ms: Range end, epoch milliseconds (inclusive).
+
+    Returns:
+        List of dicts with keys: trade_id, order_id, side, price (Decimal), qty (Decimal),
+        realized_pnl (Decimal), commission (Decimal), commission_asset, time (ms), is_maker.
+    """
+    try:
+        raw = with_retry(lambda: client.futures_account_trades(
+            symbol=symbol,
+            startTime=start_time_ms,
+            endTime=end_time_ms,
+            limit=1000,
+        ))
+        trades = [
+            {
+                "trade_id": t["id"],
+                "order_id": t["orderId"],
+                "side": t["side"],
+                "price": Decimal(t["price"]),
+                "qty": Decimal(t["qty"]),
+                "realized_pnl": Decimal(t["realizedPnl"]),
+                "commission": Decimal(t["commission"]),
+                "commission_asset": t["commissionAsset"],
+                "time": t["time"],
+                "is_maker": t.get("maker", False),
+            }
+            for t in raw
+        ]
+        logger.debug(
+            "Trades for {} [{} – {}]: {} trade(s)",
+            symbol, start_time_ms, end_time_ms, len(trades),
+        )
+        return trades
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_futures_trades_for_range failed for {}: {}", symbol, exc)
+        raise
+
+
 def set_leverage(client: Client, symbol: str, leverage: int) -> None:
     """Set the leverage for a futures symbol.
 
