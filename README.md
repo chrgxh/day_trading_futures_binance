@@ -8,14 +8,14 @@ Automated futures trading bot for Binance. Subscribes to Binance Futures kline W
 bot.py                   — main loop, orchestration, risk controls
 strategies.py            — pluggable strategy functions + STRATEGIES registry
 utils/
-  general.py             — shared primitives: build_client, with_retry, round_price, send_crash_email, order normalizers
+  general.py             — shared primitives: build_client, with_retry, round_price, send_crash_email, send_daily_report_email, order normalizers
   account.py             — account state: connection, balances, positions, symbol info, leverage, recent trades
   orders.py              — regular orders: market, limit, tp_limit, get_open_orders, cancel, cancel_all
   algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
   positions.py           — position management: close_position
   market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
   trade_manager.py       — background trade state manager: monitors positions, reconciles orders on external fills
-  pnl_reporter.py        — daily P&L reporter: appends net P&L per symbol to logs/pnl.csv at UTC midnight
+  pnl_reporter.py        — daily P&L reporter: appends net P&L per symbol to logs/pnl.csv at UTC midnight and emails a summary
   indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h)
 config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
 .env                     — mainnet API keys and runtime flags (never commit)
@@ -36,7 +36,7 @@ BINANCE_API_KEY=
 BINANCE_API_SECRET=
 BINANCE_TESTNET=true        # set to false for mainnet
 
-# optional — crash email notifications via Resend
+# optional — crash and daily report email notifications via Resend
 RESEND_API_KEY=
 CRASH_NOTIFY_EMAIL=
 CRASH_NOTIFY_FROM_EMAIL=    # must be a verified sender domain in Resend
@@ -69,7 +69,9 @@ docker compose up --build
 
 ## Daily P&L report
 
-At 00:00:05 UTC each day the bot appends rows to `logs/pnl.csv` covering the just-completed UTC calendar day. One row per symbol plus a TOTAL row — the header is written only on first file creation:
+At 00:00:05 UTC each day the bot:
+
+1. Appends rows to `logs/pnl.csv` covering the just-completed UTC calendar day — one row per symbol plus a TOTAL row (header written only on first file creation):
 
 ```
 date,symbol,realized_pnl,commission,net_pnl,trade_count
@@ -78,6 +80,8 @@ date,symbol,realized_pnl,commission,net_pnl,trade_count
 2026-05-10,SOLUSDT,0.0000,0.0000,0.0000,0
 2026-05-10,TOTAL,3.4300,-0.3230,3.1070,9
 ```
+
+2. Sends an email to `CRASH_NOTIFY_EMAIL` with subject `[Bot Report] YYYY-MM-DD — Net P&L: X.XXXX USDT`. The email contains the same P&L table and a section listing every WARNING, ERROR, and CRITICAL log line from that day. If the day was clean the log section says "No warnings or errors logged for this day." The email is silently skipped if the Resend env vars are absent.
 
 Net P&L = realized P&L − trading commission. The CSV path is configurable via `reporting.pnl_csv_file` in `config.yaml`.
 

@@ -11,6 +11,7 @@ from binance.client import Client
 from loguru import logger
 
 from utils.account import get_futures_trades_for_range
+from utils import general
 
 _FIELDNAMES = ["date", "symbol", "realized_pnl", "commission", "net_pnl", "trade_count"]
 
@@ -22,7 +23,7 @@ def _day_bounds_ms(date: datetime) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
-def write_daily_pnl(client: Client, symbols: list[str], csv_file: str, report_date: datetime | None = None) -> None:
+def write_daily_pnl(client: Client, symbols: list[str], csv_file: str, report_date: datetime | None = None) -> list[dict]:
     """Fetch realized P&L for all symbols for one UTC day and append rows to *csv_file*.
 
     Net P&L = realized_pnl − commission. Symbols that error are skipped in the
@@ -34,6 +35,9 @@ def write_daily_pnl(client: Client, symbols: list[str], csv_file: str, report_da
         csv_file: Path to the P&L CSV file. Appended to, not overwritten.
         report_date: UTC date to cover. Defaults to yesterday (since this is
             called just after midnight to close out the completed day).
+
+    Returns:
+        List of row dicts written to the CSV (symbol rows + TOTAL row).
     """
     if report_date is None:
         report_date = datetime.now(timezone.utc) - timedelta(days=1)
@@ -89,14 +93,17 @@ def write_daily_pnl(client: Client, symbols: list[str], csv_file: str, report_da
     except Exception as exc:
         logger.error("P&L reporter: failed to write to {}: {}", csv_file, exc)
 
+    return rows
+
 
 class DailyPnLReporter:
-    """Background daemon that appends a P&L CSV report just after UTC midnight each day."""
+    """Background daemon that appends a P&L CSV report just after UTC midnight each day and emails it."""
 
-    def __init__(self, client: Client, symbols: list[str], csv_file: str) -> None:
+    def __init__(self, client: Client, symbols: list[str], csv_file: str, log_file: str) -> None:
         self._client = client
         self._symbols = symbols
         self._csv_file = csv_file
+        self._log_file = log_file
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="pnl-reporter"
         )
@@ -119,6 +126,8 @@ class DailyPnLReporter:
             logger.debug("P&L reporter: sleeping {:.0f}s until next report", wait)
             time.sleep(wait)
             try:
-                write_daily_pnl(self._client, self._symbols, self._csv_file)
+                report_date = datetime.now(timezone.utc) - timedelta(days=1)
+                rows = write_daily_pnl(self._client, self._symbols, self._csv_file, report_date)
+                general.send_daily_report_email(rows, self._log_file, report_date)
             except Exception as exc:
                 logger.error("P&L reporter: unhandled error during report: {}", exc)

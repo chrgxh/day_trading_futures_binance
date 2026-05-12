@@ -3,6 +3,7 @@
 import os
 import time
 import traceback
+from datetime import datetime
 from decimal import Decimal
 
 
@@ -52,6 +53,110 @@ def send_crash_email(exc: BaseException) -> str | None:
         return email_id
     except Exception as mail_exc:
         logger.error("Failed to send crash email: {}", mail_exc)
+        return None
+
+
+def _read_log_warnings_errors(log_file: str, report_date: datetime) -> list[str]:
+    """Return WARNING/ERROR/CRITICAL lines from *log_file* that belong to *report_date* (UTC)."""
+    date_prefix = report_date.strftime("%Y-%m-%d")
+    lines: list[str] = []
+    try:
+        with open(log_file, "r", errors="replace") as fh:
+            for line in fh:
+                if date_prefix in line and any(lvl in line for lvl in ("| WARNING", "| ERROR", "| CRITICAL")):
+                    lines.append(line.rstrip())
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.error("Daily report: could not read log file {}: {}", log_file, exc)
+    return lines
+
+
+def send_daily_report_email(rows: list[dict], log_file: str, report_date: datetime) -> str | None:
+    """Send a daily P&L + warnings/errors email via Resend.
+
+    Reads RESEND_API_KEY, CRASH_NOTIFY_EMAIL, and CRASH_NOTIFY_FROM_EMAIL from
+    the environment. Logs a warning and returns None if any are missing.
+
+    Args:
+        rows: P&L rows as returned by write_daily_pnl (symbol rows + TOTAL row).
+        log_file: Path to the loguru log file to scan for warnings and errors.
+        report_date: The UTC date the report covers.
+
+    Returns:
+        The Resend email ID on success, or None if skipped or failed.
+    """
+    api_key = os.getenv("RESEND_API_KEY")
+    to_email = os.getenv("CRASH_NOTIFY_EMAIL")
+    from_email = os.getenv("CRASH_NOTIFY_FROM_EMAIL")
+    if not api_key or not to_email or not from_email:
+        logger.warning("Daily report email not sent — RESEND_API_KEY, CRASH_NOTIFY_EMAIL, or CRASH_NOTIFY_FROM_EMAIL not set.")
+        return None
+
+    date_str = report_date.strftime("%Y-%m-%d")
+
+    table_rows_html = ""
+    for row in rows:
+        is_total = row["symbol"] == "TOTAL"
+        row_style = " style=\"font-weight:bold;background:#f0f0f0\"" if is_total else ""
+        net_color = "green" if float(row["net_pnl"]) >= 0 else "red"
+        table_rows_html += (
+            f"<tr{row_style}>"
+            f"<td>{row['symbol']}</td>"
+            f"<td>{row['realized_pnl']}</td>"
+            f"<td>{row['commission']}</td>"
+            f"<td style=\"color:{net_color}\">{row['net_pnl']}</td>"
+            f"<td>{row['trade_count']}</td>"
+            f"</tr>"
+        )
+
+    table_html = (
+        "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse;font-family:monospace\">"
+        "<thead style=\"background:#333;color:#fff\">"
+        "<tr><th>Symbol</th><th>Realized PNL</th><th>Commission</th><th>Net PNL</th><th>Trades</th></tr>"
+        "</thead>"
+        f"<tbody>{table_rows_html}</tbody>"
+        "</table>"
+    )
+
+    log_lines = _read_log_warnings_errors(log_file, report_date)
+    if log_lines:
+        escaped = "\n".join(log_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        log_section = (
+            f"<h2>Warnings &amp; Errors ({len(log_lines)} entries)</h2>"
+            f"<pre style=\"background:#fff8e1;padding:10px;font-size:12px\">{escaped}</pre>"
+        )
+    else:
+        log_section = (
+            "<h2>Warnings &amp; Errors</h2>"
+            "<p style=\"color:green\">No warnings or errors logged for this day.</p>"
+        )
+
+    total_row = next((r for r in rows if r["symbol"] == "TOTAL"), None)
+    total_net = total_row["net_pnl"] if total_row else "N/A"
+
+    body = (
+        "<html><body style=\"font-family:sans-serif;padding:20px\">"
+        f"<h1>Daily Trading Report — {date_str}</h1>"
+        "<h2>P&amp;L Summary</h2>"
+        f"{table_html}"
+        f"{log_section}"
+        "</body></html>"
+    )
+
+    resend.api_key = api_key
+    try:
+        response = resend.Emails.send({
+            "from": from_email,
+            "to": [to_email],
+            "subject": f"[Bot Report] {date_str} — Net P&L: {total_net} USDT",
+            "html": body,
+        })
+        email_id = response["id"]
+        logger.info("Daily report email sent to {}. id={}", to_email, email_id)
+        return email_id
+    except Exception as mail_exc:
+        logger.error("Failed to send daily report email: {}", mail_exc)
         return None
 
 

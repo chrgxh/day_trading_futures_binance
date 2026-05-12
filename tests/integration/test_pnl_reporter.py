@@ -145,9 +145,11 @@ def test_write_daily_pnl_net_equals_realized_minus_commission(client, symbol, sy
 
 def test_daily_pnl_reporter_starts_without_error(client, symbol):
     """DailyPnLReporter.start() should launch the daemon thread without raising."""
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
-        csv_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as csv_tmp, \
+         tempfile.NamedTemporaryFile(suffix=".log", delete=False) as log_tmp:
+        csv_path = csv_tmp.name
+        log_path = log_tmp.name
 
-    reporter = DailyPnLReporter(client, [symbol], csv_path)
+    reporter = DailyPnLReporter(client, [symbol], csv_path, log_path)
     reporter.start()
     assert reporter._thread.is_alive()

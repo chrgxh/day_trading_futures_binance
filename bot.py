@@ -500,7 +500,7 @@ def _run() -> None:
     trade_manager = _build_trade_manager(client, cfg)
     trade_manager.start()
 
-    pnl_reporter = DailyPnLReporter(client, symbols, cfg["reporting"]["pnl_csv_file"])
+    pnl_reporter = DailyPnLReporter(client, symbols, cfg["reporting"]["pnl_csv_file"], cfg["logging"]["log_file"])
     pnl_reporter.start()
 
     # Register any positions already open on Binance so TradeManager can detect
