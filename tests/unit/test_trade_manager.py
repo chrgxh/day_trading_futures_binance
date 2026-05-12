@@ -257,6 +257,20 @@ class TestReconcilePartialFill:
             mgr._reconcile("BTCUSDT")
         mock_cancel.assert_not_called()
 
+    def test_residual_below_min_notional_closes_directly(self):
+        # entry=50000, residual=0.0001 BNB → notional=5 USDT < default 10 USDT threshold
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), entry_price=Decimal("50000")))
+        residual = Decimal("0.0001")
+        with patch("utils.trade_manager.account.get_futures_positions", return_value=self._reduced_pos(residual)), \
+             patch("utils.trade_manager.positions.close_position") as mock_close, \
+             patch("utils.trade_manager.algo_orders.place_stop_limit_order") as mock_sl, \
+             _patch_pnl("10"):
+            mgr._reconcile("BTCUSDT")
+        mock_close.assert_called_once()
+        mock_sl.assert_not_called()
+        assert mgr.get_position("BTCUSDT") == Position.NONE
+
     def test_recovered_position_skips_stop_replacement(self):
         mgr = _make_manager()
         mgr.register_trade(**_register_kwargs(size=Decimal("0.01"), has_order_details=False))
@@ -449,6 +463,7 @@ class TestTickStagnation:
         rsi_short_high: str = "50",
         candles: int = 4,
         min_pct: str = "2.0",
+        reversal_pct: str = "0.15",
     ) -> bool:
         return mgr.tick_stagnation(
             symbol=symbol,
@@ -460,6 +475,7 @@ class TestTickStagnation:
             rsi_short_high=Decimal(rsi_short_high),
             stagnation_candles=candles,
             stagnation_min_pct=Decimal(min_pct),
+            stagnation_reversal_pct=Decimal(reversal_pct),
         )
 
     def test_returns_false_for_unregistered_symbol(self):
@@ -570,7 +586,7 @@ class TestTickStagnation:
         mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
         for _ in range(3):
             self._tick(mgr, adx="30", rsi_val="60")
-        # Price dropped below checkpoint (50000) — reversal fires even with strong ADX/RSI
+        # Price dropped 0.2% below checkpoint — exceeds default 0.15% threshold
         result = self._tick(mgr, price="49900", adx="30", rsi_val="60")
         assert result is True
 
@@ -581,7 +597,7 @@ class TestTickStagnation:
         ))
         for _ in range(3):
             self._tick(mgr, adx="30", rsi_val="40")
-        # Price rose above checkpoint (50000) — reversal fires even with strong ADX/RSI
+        # Price rose 0.2% above checkpoint — exceeds default 0.15% threshold
         result = self._tick(mgr, price="50100", adx="30", rsi_val="40")
         assert result is True
 
@@ -590,6 +606,24 @@ class TestTickStagnation:
         mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
         for _ in range(3):
             self._tick(mgr, adx="30", rsi_val="60")
-        # price_pct = 0 exactly — reversal requires strictly < 0; stagnation blocked by strong ADX
+        # price_pct = 0 — stagnation blocked by strong ADX, reversal requires > threshold
         result = self._tick(mgr, price="50000", adx="30", rsi_val="60")
+        assert result is False
+
+    def test_reversal_does_not_fire_below_threshold(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, adx="30", rsi_val="60")
+        # 0.1% drop — below default 0.15% threshold, must not fire
+        result = self._tick(mgr, price="49950", adx="30", rsi_val="60")
+        assert result is False
+
+    def test_reversal_threshold_is_configurable(self):
+        mgr = _make_manager()
+        mgr.register_trade(**_register_kwargs(entry_price=Decimal("50000")))
+        for _ in range(3):
+            self._tick(mgr, adx="30", rsi_val="60", reversal_pct="0.30")
+        # 0.25% drop — below custom 0.30% threshold, must not fire
+        result = self._tick(mgr, price="49875", adx="30", rsi_val="60", reversal_pct="0.30")
         assert result is False

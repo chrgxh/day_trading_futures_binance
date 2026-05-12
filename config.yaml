@@ -46,6 +46,7 @@ trading:
     min_adx: 27                 # Skip entry if ADX < this — market is ranging (20=weak, 25=confirmed, 30=strong)
     stagnation_candles: 4       # Re-check momentum health every N candles while in a position
     stagnation_min_pct: 0.2     # Price must move at least this % in your favour per window; if not AND ADX/RSI have decayed, close
+    stagnation_reversal_pct: 0.15  # Close if price moves more than this % against the trade from checkpoint (filters out sub-0.15% noise bounces)
 
 entry:
   max_price_deviation_pct: 0.3      # Abort IOC entry if price drifts more than this % from signal price
@@ -65,7 +66,8 @@ risk:
   sl_profit_market_lock_pct: 0.1    # Move stop-market to this % above (long) or below (short) entry — safety net if limit can't fill
 
 trade_manager:
-  poll_interval_secs: 5   # How often to check position/order state against Binance (recommended: 5–10s)
+  poll_interval_secs: 5             # How often to check position/order state against Binance (recommended: 5–10s)
+  min_residual_notional_usdt: 10.0  # When a partial TP fill leaves a residual below this value (USDT), close it directly instead of re-placing stops
 
 logging:
   level: INFO

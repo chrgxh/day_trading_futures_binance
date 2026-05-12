@@ -372,13 +372,16 @@ def _run() -> None:
 
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
 
-    tm_poll_secs: int = int(cfg.get("trade_manager", {}).get("poll_interval_secs", 10))
+    tm_cfg = cfg.get("trade_manager", {})
+    tm_poll_secs: int = int(tm_cfg.get("poll_interval_secs", 10))
+    tm_min_residual = Decimal(str(tm_cfg.get("min_residual_notional_usdt", "10")))
     trade_manager = TradeManager(
         client,
         poll_interval_secs=tm_poll_secs,
         sl_profit_trigger_pct=sl_profit_trigger_pct,
         sl_profit_lock_pct=sl_profit_lock_pct,
         sl_profit_market_lock_pct=sl_profit_market_lock_pct,
+        min_residual_notional=tm_min_residual,
     )
     trade_manager.start()
 
@@ -464,6 +467,7 @@ def _run() -> None:
                         rsi_short_high=Decimal(str(strategy_params.get("rsi_short_high", "50"))),
                         stagnation_candles=int(strategy_params.get("stagnation_candles", 4)),
                         stagnation_min_pct=Decimal(str(strategy_params.get("stagnation_min_pct", "2.0"))),
+                        stagnation_reversal_pct=Decimal(str(strategy_params.get("stagnation_reversal_pct", "0.15"))),
                     ):
                         signal = TradeSignal(signal=Signal.CLOSE, symbol=symbol, reason="stagnation exit — momentum decayed")
                         logger.info("{} Stagnation exit triggered — overriding HOLD to CLOSE.", symbol)
@@ -475,8 +479,9 @@ def _run() -> None:
 
                 # Immediately re-evaluate on the same candle after a close.
                 # Handles trend reversals (close short → open long) and RSI flush re-entries
-                # without waiting for the next candle.
-                if signal.signal == Signal.CLOSE and trade_manager.get_position(symbol) == Position.NONE and risk.check():
+                # without waiting for the next candle. Skipped after a stagnation close — the
+                # same price data that triggered the exit would immediately re-enter.
+                if signal.signal == Signal.CLOSE and "stagnation" not in signal.reason and trade_manager.get_position(symbol) == Position.NONE and risk.check():
                     reentry = strategy_fn(buf, symbol, Position.NONE, strategy_params)
                     logger.info("{} [NONE] {} — {} (re-entry check)", symbol, reentry.signal.value, reentry.reason)
                     if reentry.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):

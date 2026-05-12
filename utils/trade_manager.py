@@ -8,7 +8,7 @@ from decimal import Decimal
 from binance.client import Client
 from loguru import logger
 
-from utils import account, algo_orders, orders
+from utils import account, algo_orders, orders, positions
 from utils.general import round_price
 from utils.indicators import Position
 
@@ -49,12 +49,14 @@ class TradeManager:
         sl_profit_trigger_pct: Decimal = Decimal("0.01"),
         sl_profit_lock_pct: Decimal = Decimal("0.005"),
         sl_profit_market_lock_pct: Decimal = Decimal("0.003"),
+        min_residual_notional: Decimal = Decimal("10"),
     ):
         self._client = client
         self._poll_interval = poll_interval_secs
         self._sl_profit_trigger_pct = sl_profit_trigger_pct
         self._sl_profit_lock_pct = sl_profit_lock_pct
         self._sl_profit_market_lock_pct = sl_profit_market_lock_pct
+        self._min_residual_notional = min_residual_notional
         self._states: dict[str, _TradeState] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -184,6 +186,7 @@ class TradeManager:
         rsi_short_high: Decimal,
         stagnation_candles: int,
         stagnation_min_pct: Decimal,
+        stagnation_reversal_pct: Decimal = Decimal("0.15"),
     ) -> bool:
         """Increment the candle counter and check for momentum stagnation or reversal.
 
@@ -240,11 +243,11 @@ class TradeManager:
                 )
                 return True
 
-            if price_pct < Decimal("0"):
+            if price_pct < -stagnation_reversal_pct:
                 logger.info(
                     "TradeManager: {} reversal exit at candle {} — "
-                    "price moved {:.3f}% against trade from checkpoint — closing.",
-                    symbol, state.candle_count, float(price_pct),
+                    "price moved {:.3f}% against trade from checkpoint (threshold -{:.2f}%) — closing.",
+                    symbol, state.candle_count, float(price_pct), float(stagnation_reversal_pct),
                 )
                 return True
 
@@ -379,13 +382,35 @@ class TradeManager:
         """TP limit partially filled. Re-place stops at reduced size, verify, update state, log P&L."""
         filled_qty = state.size - new_size
         fill_pct = float(filled_qty / state.size * 100)
+        residual_notional = new_size * state.entry_price
 
         logger.info(
-            "TradeManager: {} partial TP limit fill — size {} → {} ({:.1f}% of position filled). "
-            "Re-placing stops at new size.",
+            "TradeManager: {} partial TP limit fill — size {} → {} ({:.1f}% of position filled).",
             state.symbol, state.size, new_size, fill_pct,
         )
 
+        if residual_notional < self._min_residual_notional:
+            logger.info(
+                "TradeManager: {} residual {:.4f} (≈{:.2f} USDT) below minimum notional — closing directly.",
+                state.symbol, new_size, float(residual_notional),
+            )
+            try:
+                positions.close_position(self._client, state.symbol)
+            except Exception as exc:
+                logger.error("TradeManager: {} could not close residual position: {}", state.symbol, exc)
+            with self._lock:
+                if state.symbol in self._states:
+                    del self._states[state.symbol]
+            logger.info("TradeManager: trade closed for {} (residual below minimum notional).", state.symbol)
+            pnl = self._query_realized_pnl(state)
+            if pnl != 0:
+                logger.info(
+                    "TradeManager: {} final P&L (cumulative since open): {:+.4f} USDT",
+                    state.symbol, pnl,
+                )
+            return
+
+        logger.info("TradeManager: {} re-placing stops at new size.", state.symbol)
         new_stop_ids = self._replace_stops(state, new_size)
 
         if new_stop_ids:

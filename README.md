@@ -129,10 +129,10 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - New orders are placed first, old ones cancelled after — no unprotected window. Fires at most once per trade
 - **Stagnation / reversal exit** — on every HOLD candle, `bot.py` calls `TradeManager.tick_stagnation()`. Every `strategy_params.stagnation_candles` (default `4`) candles it evaluates two conditions:
   1. **Stagnation**: price moved less than `strategy_params.stagnation_min_pct` (default `0.2`%) in your favour from the last checkpoint AND ADX is below `strategy_params.min_adx` AND RSI has left the entry momentum zone — all three required
-  2. **Reversal**: price moved *any amount against* the trade from the last checkpoint (`price_pct < 0`) — fires regardless of ADX or RSI
+  2. **Reversal**: price moved more than `strategy_params.stagnation_reversal_pct` (default `0.15`%) against the trade from the last checkpoint — fires regardless of ADX or RSI
 
-  Either condition → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry.
-- `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `10`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: re-places stop orders at the reduced size, verifies the new orders are live, and logs cumulative P&L
+  Either condition → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry. Same-candle re-entry is suppressed after a stagnation close.
+- `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `5`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: if the residual is below `trade_manager.min_residual_notional_usdt` (default `10` USDT), closes it directly with a market order; otherwise re-places stop orders at the reduced size, verifies they're live, and logs cumulative P&L
 
 ## Strategy notes
 
