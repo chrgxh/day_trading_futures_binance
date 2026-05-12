@@ -151,26 +151,28 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
         "trending" if trending else f"ranging(<{min_adx})",
     )
 
+    _indicators = dict(current_adx=current_adx, current_rsi=current_rsi)
+
     # --- Exit logic ---
     if position == Position.LONG:
         if cross_down:
             return TradeSignal(signal=Signal.CLOSE, symbol=symbol,
-                               reason=f"EMA cross down (RSI={current_rsi:.1f})")
+                               reason=f"EMA cross down (RSI={current_rsi:.1f})", **_indicators)
         if current_rsi >= rsi_exit_overbought:
             return TradeSignal(signal=Signal.CLOSE, symbol=symbol,
-                               reason=f"RSI overbought exit ({current_rsi:.1f} >= {rsi_exit_overbought})")
+                               reason=f"RSI overbought exit ({current_rsi:.1f} >= {rsi_exit_overbought})", **_indicators)
         return TradeSignal(signal=Signal.HOLD, symbol=symbol,
-                           reason=f"holding long (RSI={current_rsi:.1f})")
+                           reason=f"holding long (RSI={current_rsi:.1f})", **_indicators)
 
     if position == Position.SHORT:
         if cross_up:
             return TradeSignal(signal=Signal.CLOSE, symbol=symbol,
-                               reason=f"EMA cross up (RSI={current_rsi:.1f})")
+                               reason=f"EMA cross up (RSI={current_rsi:.1f})", **_indicators)
         if current_rsi <= rsi_exit_oversold:
             return TradeSignal(signal=Signal.CLOSE, symbol=symbol,
-                               reason=f"RSI oversold exit ({current_rsi:.1f} <= {rsi_exit_oversold})")
+                               reason=f"RSI oversold exit ({current_rsi:.1f} <= {rsi_exit_oversold})", **_indicators)
         return TradeSignal(signal=Signal.HOLD, symbol=symbol,
-                           reason=f"holding short (RSI={current_rsi:.1f})")
+                           reason=f"holding short (RSI={current_rsi:.1f})", **_indicators)
 
     # --- Entry logic (position is NONE) ---
     # No fresh crossover required — EMAs already aligned is sufficient.
@@ -186,6 +188,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             signal=Signal.OPEN_LONG, symbol=symbol,
             reason=f"{prefix}long gates passed: {gate_info}",
             entry_price=closes[-1],
+            **_indicators,
         )
 
     if ema_bearish and below_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high and trending:
@@ -194,9 +197,10 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
             signal=Signal.OPEN_SHORT, symbol=symbol,
             reason=f"{prefix}short gates passed: {gate_info}",
             entry_price=closes[-1],
+            **_indicators,
         )
 
-    return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason=f"no entry: {gate_info}")
+    return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason=f"no entry: {gate_info}", **_indicators)
 
 
 def ma_crossover(candles: list[dict], symbol: str, position: Position, params: dict) -> TradeSignal:

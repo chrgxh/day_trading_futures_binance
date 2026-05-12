@@ -230,6 +230,36 @@ def test_hold_when_adx_gate_fails():
     assert sig.signal == Signal.HOLD
 
 
+# ---------------------------------------------------------------------------
+# TradeSignal indicator fields (bot.py reads current_adx/current_rsi from the signal
+# instead of recomputing them — verify the contract holds for all post-computation paths)
+# ---------------------------------------------------------------------------
+
+def test_hold_signal_carries_indicator_values():
+    # Any HOLD after indicators are computed should populate current_adx and current_rsi.
+    candles = _candles(60, step=0.1)  # no volume spike → HOLD
+    sig = ema_trend_momentum(candles, "BTCUSDT", Position.NONE, _PARAMS)
+    assert sig.signal == Signal.HOLD
+    assert sig.current_adx is not None
+    assert sig.current_rsi is not None
+
+
+def test_open_signal_carries_indicator_values():
+    candles = _with_volume_spike(_candles(60, step=0.1))
+    sig = ema_trend_momentum(candles, "BTCUSDT", Position.NONE, _PARAMS)
+    assert sig.signal == Signal.OPEN_LONG
+    assert sig.current_adx is not None
+    assert sig.current_rsi is not None
+
+
+def test_early_return_signals_have_no_indicator_values():
+    # Early guards (insufficient data) fire before indicators are computed.
+    sig = ema_trend_momentum(_candles(4), "BTCUSDT", Position.NONE, _PARAMS)
+    assert sig.signal == Signal.HOLD
+    assert sig.current_adx is None
+    assert sig.current_rsi is None
+
+
 def test_adx_gate_does_not_block_exits():
     # ADX only gates entry — an impossibly high min_adx must not suppress exit signals.
     params = dict(_PARAMS, min_adx="200")

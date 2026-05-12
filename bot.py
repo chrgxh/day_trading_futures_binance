@@ -12,7 +12,7 @@ from loguru import logger
 
 from utils import account, algo_orders, general, market, orders, positions as pos_utils
 from utils.general import round_price
-from utils.indicators import Position, Signal, TradeSignal, adx as compute_adx, rsi as compute_rsi, interval_to_minutes
+from utils.indicators import Position, Signal, TradeSignal, interval_to_minutes
 from utils.trade_manager import TradeManager
 from utils.pnl_reporter import DailyPnLReporter
 from strategies import STRATEGIES
@@ -133,6 +133,64 @@ def _register_recovered_position(
         logger.warning("{} Recovered {} position registered — exit order IDs unknown.", symbol, pos.value)
 
 
+def _load_risk_params(cfg: dict) -> dict:
+    """Extract order-execution risk percentages from config into a flat dict of Decimal values."""
+    risk = cfg["risk"]
+    entry = cfg.get("entry", {})
+    return {
+        "sl_limit_pct":          Decimal(str(risk.get("stop_loss_limit_pct", 1.0))) / 100,
+        "sl_market_pct":         Decimal(str(risk.get("stop_loss_market_pct", 2.0))) / 100,
+        "tp_limit_pct":          Decimal(str(risk.get("take_profit_limit_pct", 3.0))) / 100,
+        "ttp_activation_pct":    Decimal(str(risk.get("trailing_take_profit_activation_pct", 1.0))) / 100,
+        "ttp_callback_rate":     Decimal(str(risk.get("trailing_take_profit_callback_rate", 2.0))),
+        "max_entry_deviation_pct": Decimal(str(entry.get("max_price_deviation_pct", 0.3))) / 100,
+    }
+
+
+def _build_trade_manager(client, cfg: dict) -> TradeManager:
+    """Construct a TradeManager from config."""
+    risk = cfg["risk"]
+    tm = cfg.get("trade_manager", {})
+    return TradeManager(
+        client,
+        poll_interval_secs=int(tm.get("poll_interval_secs", 10)),
+        sl_profit_trigger_pct=Decimal(str(risk.get("sl_profit_trigger_pct", 1.0))) / 100,
+        sl_profit_lock_pct=Decimal(str(risk.get("sl_profit_lock_pct", 0.5))) / 100,
+        sl_profit_market_lock_pct=Decimal(str(risk.get("sl_profit_market_lock_pct", 0.3))) / 100,
+        min_residual_notional=Decimal(str(tm.get("min_residual_notional_usdt", "10"))),
+    )
+
+
+def _prefetch_candles(client, symbols: list[str], interval: str, cfg: dict) -> tuple[int, dict[str, list[dict]]]:
+    """Pre-fetch REST candle history for indicator warmup. Returns (candle_limit, buffers)."""
+    _cfg_limit = cfg["trading"].get("candle_limit")
+    if _cfg_limit:
+        candle_limit = int(_cfg_limit)
+    else:
+        interval_min = interval_to_minutes(interval)
+        candle_limit = (200 * 60 // interval_min) + 50
+    logger.info("Candle limit: {} (interval={})", candle_limit, interval)
+    buffers: dict[str, list[dict]] = {}
+    for symbol in symbols:
+        buffers[symbol] = market.get_futures_ohlcv(client, symbol, interval, limit=candle_limit)
+        logger.info("Prefetched {} candles for {}", len(buffers[symbol]), symbol)
+    return candle_limit, buffers
+
+
+def _update_buffer(buf: list[dict], candle: dict, candle_limit: int) -> None:
+    """Append a closed candle to the buffer, replacing an open candle for the same period if present."""
+    if buf and candle["open_time"] == buf[-1]["open_time"]:
+        buf[-1] = candle
+    else:
+        buf.append(candle)
+        if len(buf) > candle_limit:
+            buf.pop(0)
+
+
+# ---------------------------------------------------------------------------
+# IOC entry
+# ---------------------------------------------------------------------------
+
 def ioc_entry(
     client,
     symbol: str,
@@ -208,6 +266,10 @@ def ioc_entry(
         except Exception as exc:
             logger.warning("{} Could not check IOC order {}: {}", symbol, ioc_order["order_id"], exc)
 
+
+# ---------------------------------------------------------------------------
+# Signal execution
+# ---------------------------------------------------------------------------
 
 def execute_signal(
     client,
@@ -324,6 +386,82 @@ class RiskGuard:
 
 
 # ---------------------------------------------------------------------------
+# Per-tick processing
+# ---------------------------------------------------------------------------
+
+def _check_stagnation(
+    symbol: str,
+    buf: list[dict],
+    signal: TradeSignal,
+    strategy_params: dict,
+    trade_manager: TradeManager,
+) -> TradeSignal | None:
+    """Run the stagnation/reversal check on a HOLD candle.
+
+    Uses indicator values carried on the signal to avoid recomputing them.
+    Returns a CLOSE TradeSignal (suppress_reentry=True) if stagnation is confirmed,
+    or None to keep holding.
+    """
+    triggered = trade_manager.tick_stagnation(
+        symbol=symbol,
+        current_price=buf[-1]["close"],
+        current_adx=signal.current_adx if signal.current_adx is not None else 0.0,
+        current_rsi=signal.current_rsi if signal.current_rsi is not None else 50.0,
+        min_adx=float(strategy_params.get("min_adx", 25.0)),
+        rsi_long_low=float(strategy_params.get("rsi_long_low", 50.0)),
+        rsi_short_high=float(strategy_params.get("rsi_short_high", 50.0)),
+        stagnation_candles=int(strategy_params.get("stagnation_candles", 4)),
+        stagnation_min_pct=float(strategy_params.get("stagnation_min_pct", 2.0)),
+        stagnation_reversal_pct=float(strategy_params.get("stagnation_reversal_pct", 0.15)),
+    )
+    if triggered:
+        logger.info("{} Stagnation exit triggered — overriding HOLD to CLOSE.", symbol)
+        return TradeSignal(signal=Signal.CLOSE, symbol=symbol,
+                           reason="stagnation exit — momentum decayed", suppress_reentry=True)
+    return None
+
+
+def _process_symbol_tick(
+    symbol: str,
+    buf: list[dict],
+    strategy_fn,
+    strategy_params: dict,
+    trade_manager: TradeManager,
+    risk: "RiskGuard",
+    execute_fn,
+) -> None:
+    """Evaluate one closed candle for a symbol: run strategy, check stagnation, execute signal."""
+    position = trade_manager.get_position(symbol)
+    signal = strategy_fn(buf, symbol, position, strategy_params)
+    logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
+
+    if signal.signal == Signal.HOLD and position != Position.NONE:
+        stagnation = _check_stagnation(symbol, buf, signal, strategy_params, trade_manager)
+        if stagnation:
+            signal = stagnation
+
+    if signal.signal == Signal.HOLD or not risk.check():
+        return
+
+    execute_fn(symbol, signal)
+
+    # Immediately re-evaluate on the same candle after a close.
+    # Handles trend reversals (close short → open long) and RSI flush re-entries
+    # without waiting for the next candle. Skipped after a stagnation close — the
+    # same price data that triggered the exit would immediately re-enter.
+    if (
+        signal.signal == Signal.CLOSE
+        and not signal.suppress_reentry
+        and trade_manager.get_position(symbol) == Position.NONE
+        and risk.check()
+    ):
+        reentry = strategy_fn(buf, symbol, Position.NONE, strategy_params)
+        logger.info("{} [NONE] {} — {} (re-entry check)", symbol, reentry.signal.value, reentry.reason)
+        if reentry.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
+            execute_fn(symbol, reentry)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -356,35 +494,13 @@ def _run() -> None:
     strategy_params: dict = cfg["trading"].get("strategy_params", {})
     logger.info("Strategy: {}", cfg["trading"]["strategy"])
 
-    sl_limit_pct = Decimal(str(cfg["risk"].get("stop_loss_limit_pct", 1.0))) / 100
-    sl_market_pct = Decimal(str(cfg["risk"].get("stop_loss_market_pct", 2.0))) / 100
-    tp_limit_pct = Decimal(str(cfg["risk"].get("take_profit_limit_pct", 3.0))) / 100
-    ttp_activation_pct = Decimal(str(cfg["risk"].get("trailing_take_profit_activation_pct", 1.0))) / 100
-    ttp_callback_rate = Decimal(str(cfg["risk"].get("trailing_take_profit_callback_rate", 2.0)))
-    sl_profit_trigger_pct = Decimal(str(cfg["risk"].get("sl_profit_trigger_pct", 1.0))) / 100
-    sl_profit_lock_pct = Decimal(str(cfg["risk"].get("sl_profit_lock_pct", 0.5))) / 100
-    sl_profit_market_lock_pct = Decimal(str(cfg["risk"].get("sl_profit_market_lock_pct", 0.3))) / 100
-
-    entry_cfg = cfg.get("entry", {})
-    max_entry_deviation_pct = Decimal(str(entry_cfg.get("max_price_deviation_pct", 0.3))) / 100
-
+    risk_params = _load_risk_params(cfg)
     sym_info = setup_symbols(client, symbols, cfg["risk"]["leverage"])
 
-    tm_cfg = cfg.get("trade_manager", {})
-    tm_poll_secs: int = int(tm_cfg.get("poll_interval_secs", 10))
-    tm_min_residual = Decimal(str(tm_cfg.get("min_residual_notional_usdt", "10")))
-    trade_manager = TradeManager(
-        client,
-        poll_interval_secs=tm_poll_secs,
-        sl_profit_trigger_pct=sl_profit_trigger_pct,
-        sl_profit_lock_pct=sl_profit_lock_pct,
-        sl_profit_market_lock_pct=sl_profit_market_lock_pct,
-        min_residual_notional=tm_min_residual,
-    )
+    trade_manager = _build_trade_manager(client, cfg)
     trade_manager.start()
 
-    pnl_csv_file = cfg["reporting"]["pnl_csv_file"]
-    pnl_reporter = DailyPnLReporter(client, symbols, pnl_csv_file)
+    pnl_reporter = DailyPnLReporter(client, symbols, cfg["reporting"]["pnl_csv_file"])
     pnl_reporter.start()
 
     # Register any positions already open on Binance so TradeManager can detect
@@ -396,27 +512,12 @@ def _run() -> None:
                 client, symbol, Position[pos_data["side"]], pos_data, sym_info[symbol], trade_manager
             )
 
-    # Pre-fetch candle history so strategies have enough data on the first tick.
-    # Auto-compute enough candles for 200 complete 1h bars at the chosen interval,
-    # unless the config explicitly overrides it.
-    _cfg_limit = cfg["trading"].get("candle_limit")
-    if _cfg_limit:
-        candle_limit = int(_cfg_limit)
-    else:
-        interval_min = interval_to_minutes(interval)
-        candle_limit = (200 * 60 // interval_min) + 50
-    logger.info("Candle limit: {} (interval={})", candle_limit, interval)
-    candle_buffers: dict[str, list[dict]] = {}
-    for symbol in symbols:
-        candle_buffers[symbol] = market.get_futures_ohlcv(client, symbol, interval, limit=candle_limit)
-        logger.info("Prefetched {} candles for {}", len(candle_buffers[symbol]), symbol)
+    candle_limit, candle_buffers = _prefetch_candles(client, symbols, interval, cfg)
 
-    # WebSocket callbacks run in background threads — route events through a queue
-    # so all state mutations happen on the main thread.
     event_queue: queue.SimpleQueue = queue.SimpleQueue()
 
-    def on_closed_candle(symbol: str, candle: dict) -> None:
-        event_queue.put((symbol, candle))
+    def on_closed_candle(sym: str, candle: dict) -> None:
+        event_queue.put((sym, candle))
 
     twm = market.start_kline_streams(
         env["api_key"], env["api_secret"], env["testnet"],
@@ -426,72 +527,21 @@ def _run() -> None:
     def _execute(sym: str, sig: TradeSignal) -> None:
         execute_signal(
             client, sym, sig, risk.max_position_usdt, sym_info[sym], trade_manager,
-            sl_limit_pct, sl_market_pct, tp_limit_pct, ttp_activation_pct,
-            ttp_callback_rate, max_entry_deviation_pct,
+            **risk_params,
         )
 
     try:
         while True:
             symbol, candle = event_queue.get()
-
-            buf = candle_buffers[symbol]
-            # The last REST candle may have been open at prefetch time; replace it if
-            # the closed WS candle covers the same period, otherwise append.
-            if buf and candle["open_time"] == buf[-1]["open_time"]:
-                buf[-1] = candle
-            else:
-                buf.append(candle)
-                if len(buf) > candle_limit:
-                    buf.pop(0)
-
+            _update_buffer(candle_buffers[symbol], candle, candle_limit)
             try:
-                position = trade_manager.get_position(symbol)
-                signal = strategy_fn(buf, symbol, position, strategy_params)
-
-                logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
-
-                if signal.signal == Signal.HOLD and position != Position.NONE:
-                    _rsi_period = strategy_params.get("rsi_period", 14)
-                    _adx_period = strategy_params.get("adx_period", 14)
-                    _rsi_slice = _rsi_period * 10 + 1
-                    _adx_slice = _adx_period * 20 + 1
-                    _closes_slice = [c["close"] for c in buf[-_rsi_slice:]]
-                    _adx_series = compute_adx(buf[-_adx_slice:], _adx_period)
-                    _current_adx = _adx_series[-1] if _adx_series else 0.0
-                    _current_rsi = compute_rsi(_closes_slice, _rsi_period)
-                    if trade_manager.tick_stagnation(
-                        symbol=symbol,
-                        current_price=buf[-1]["close"],
-                        current_adx=_current_adx,
-                        current_rsi=_current_rsi,
-                        min_adx=float(strategy_params.get("min_adx", 25.0)),
-                        rsi_long_low=float(strategy_params.get("rsi_long_low", 50.0)),
-                        rsi_short_high=float(strategy_params.get("rsi_short_high", 50.0)),
-                        stagnation_candles=int(strategy_params.get("stagnation_candles", 4)),
-                        stagnation_min_pct=float(strategy_params.get("stagnation_min_pct", 2.0)),
-                        stagnation_reversal_pct=float(strategy_params.get("stagnation_reversal_pct", 0.15)),
-                    ):
-                        signal = TradeSignal(signal=Signal.CLOSE, symbol=symbol, reason="stagnation exit — momentum decayed")
-                        logger.info("{} Stagnation exit triggered — overriding HOLD to CLOSE.", symbol)
-
-                if signal.signal == Signal.HOLD or not risk.check():
-                    continue
-
-                _execute(symbol, signal)
-
-                # Immediately re-evaluate on the same candle after a close.
-                # Handles trend reversals (close short → open long) and RSI flush re-entries
-                # without waiting for the next candle. Skipped after a stagnation close — the
-                # same price data that triggered the exit would immediately re-enter.
-                if signal.signal == Signal.CLOSE and "stagnation" not in signal.reason and trade_manager.get_position(symbol) == Position.NONE and risk.check():
-                    reentry = strategy_fn(buf, symbol, Position.NONE, strategy_params)
-                    logger.info("{} [NONE] {} — {} (re-entry check)", symbol, reentry.signal.value, reentry.reason)
-                    if reentry.signal in (Signal.OPEN_LONG, Signal.OPEN_SHORT):
-                        _execute(symbol, reentry)
-
+                _process_symbol_tick(
+                    symbol, candle_buffers[symbol],
+                    strategy_fn, strategy_params,
+                    trade_manager, risk, _execute,
+                )
             except Exception as exc:
                 logger.exception("Error processing {}: {}", symbol, exc)
-
     finally:
         trade_manager.stop()
         twm.stop()

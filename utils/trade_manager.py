@@ -491,48 +491,10 @@ class TradeManager:
         new_sl_market_price: Decimal,
     ) -> None:
         """Place new profit-lock stops first, then cancel the old ones to avoid an unprotected window."""
-        new_ids: list[int] = []
-
-        try:
-            sl_limit = algo_orders.place_stop_limit_order(
-                self._client, state.symbol, state.stop_side, state.size,
-                new_sl_limit_price, new_sl_limit_price,
-            )
-            new_ids.append(sl_limit["order_id"])
-            logger.info(
-                "TradeManager: {} new profit-lock stop-limit placed at {} id={}.",
-                state.symbol, new_sl_limit_price, sl_limit["order_id"],
-            )
-        except Exception as exc:
-            logger.error(
-                "TradeManager: could not place profit-lock stop-limit for {}: {}", state.symbol, exc
-            )
-
-        try:
-            sl_market = algo_orders.place_stop_market_order(
-                self._client, state.symbol, state.stop_side, state.size, new_sl_market_price,
-            )
-            new_ids.append(sl_market["order_id"])
-            logger.info(
-                "TradeManager: {} new profit-lock stop-market placed at {} id={}.",
-                state.symbol, new_sl_market_price, sl_market["order_id"],
-            )
-        except Exception as exc:
-            logger.error(
-                "TradeManager: could not place profit-lock stop-market for {}: {}", state.symbol, exc
-            )
+        new_ids = self._place_stop_pair(state.symbol, state.stop_side, state.size, new_sl_limit_price, new_sl_market_price)
 
         # Cancel old stops only after new ones are live — no unprotected window.
-        for algo_id in list(state.stop_ids):
-            try:
-                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
-                logger.info(
-                    "TradeManager: {} cancelled old stop id={} after profit-lock move.", state.symbol, algo_id
-                )
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel old stop {} for {}: {}", algo_id, state.symbol, exc
-                )
+        self._cancel_stop_ids(state.symbol, list(state.stop_ids))
 
         if new_ids:
             self._verify_orders_placed(state.symbol, new_ids)
@@ -589,31 +551,6 @@ class TradeManager:
                         "TradeManager: could not cancel order {} for {}: {}", oid, state.symbol, exc
                     )
 
-    def _cancel_all_orders(self, state: _TradeState) -> None:
-        for algo_id in state.stop_ids:
-            try:
-                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel stop {} for {}: {}", algo_id, state.symbol, exc
-                )
-
-        if state.ttp_id is not None:
-            try:
-                algo_orders.cancel_algo_order(self._client, state.symbol, state.ttp_id)
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel trailing TP {} for {}: {}", state.ttp_id, state.symbol, exc
-                )
-
-        if state.tp_limit_id is not None:
-            try:
-                orders.cancel_order(self._client, state.symbol, state.tp_limit_id)
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel TP limit {} for {}: {}", state.tp_limit_id, state.symbol, exc
-                )
-
     def _replace_stops(self, state: _TradeState, new_size: Decimal) -> list[int]:
         """Cancel existing stop orders and re-place at the reduced size.
 
@@ -628,38 +565,50 @@ class TradeManager:
             )
             return []
 
-        new_ids: list[int] = []
-        try:
-            sl_limit = algo_orders.place_stop_limit_order(
-                self._client, state.symbol, state.stop_side, new_size,
-                state.sl_limit_price, state.sl_limit_price,
-            )
-            new_ids.append(sl_limit["order_id"])
-        except Exception as exc:
-            logger.error("TradeManager: could not re-place stop-limit for {}: {}", state.symbol, exc)
-
-        try:
-            sl_market = algo_orders.place_stop_market_order(
-                self._client, state.symbol, state.stop_side, new_size, state.sl_market_price,
-            )
-            new_ids.append(sl_market["order_id"])
-        except Exception as exc:
-            logger.error("TradeManager: could not re-place stop-market for {}: {}", state.symbol, exc)
-
+        new_ids = self._place_stop_pair(
+            state.symbol, state.stop_side, new_size, state.sl_limit_price, state.sl_market_price,
+        )
         if not new_ids:
             logger.error("TradeManager: {} no new stops placed — keeping old stops to preserve protection.", state.symbol)
             return new_ids
 
-        for algo_id in state.stop_ids:
-            try:
-                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
-                logger.info("TradeManager: {} cancelled old stop id={} for resize.", state.symbol, algo_id)
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel stop {} for resize: {}", algo_id, exc
-                )
-
+        self._cancel_stop_ids(state.symbol, list(state.stop_ids))
         return new_ids
+
+    def _place_stop_pair(
+        self,
+        symbol: str,
+        stop_side: str,
+        size: Decimal,
+        sl_limit_price: Decimal,
+        sl_market_price: Decimal,
+    ) -> list[int]:
+        """Place a stop-limit + stop-market pair. Returns algo IDs of successfully placed orders."""
+        new_ids: list[int] = []
+        try:
+            sl_limit = algo_orders.place_stop_limit_order(
+                self._client, symbol, stop_side, size, sl_limit_price, sl_limit_price,
+            )
+            new_ids.append(sl_limit["order_id"])
+        except Exception as exc:
+            logger.error("TradeManager: could not place stop-limit for {}: {}", symbol, exc)
+        try:
+            sl_market = algo_orders.place_stop_market_order(
+                self._client, symbol, stop_side, size, sl_market_price,
+            )
+            new_ids.append(sl_market["order_id"])
+        except Exception as exc:
+            logger.error("TradeManager: could not place stop-market for {}: {}", symbol, exc)
+        return new_ids
+
+    def _cancel_stop_ids(self, symbol: str, stop_ids: list[int]) -> None:
+        """Cancel a list of stop algo order IDs, logging each outcome."""
+        for algo_id in stop_ids:
+            try:
+                algo_orders.cancel_algo_order(self._client, symbol, algo_id)
+                logger.info("TradeManager: {} cancelled stop id={}.", symbol, algo_id)
+            except Exception as exc:
+                logger.warning("TradeManager: could not cancel stop {} for {}: {}", algo_id, symbol, exc)
 
     # ------------------------------------------------------------------
     # P&L

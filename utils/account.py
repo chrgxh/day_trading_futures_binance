@@ -176,6 +176,22 @@ def get_symbol_infos(client: Client, symbols: list[str]) -> dict[str, dict]:
         raise
 
 
+def _normalize_trade(t: dict) -> dict:
+    """Normalize a raw Binance account trade record to a consistent shape."""
+    return {
+        "trade_id": t["id"],
+        "order_id": t["orderId"],
+        "side": t["side"],
+        "price": Decimal(t["price"]),
+        "qty": Decimal(t["qty"]),
+        "realized_pnl": Decimal(t["realizedPnl"]),
+        "commission": Decimal(t["commission"]),
+        "commission_asset": t["commissionAsset"],
+        "time": t["time"],
+        "is_maker": t.get("maker", False),
+    }
+
+
 def get_futures_recent_trades(
     client: Client,
     symbol: str,
@@ -202,21 +218,7 @@ def get_futures_recent_trades(
             startTime=start_time_ms,
             limit=limit,
         ))
-        trades = [
-            {
-                "trade_id": t["id"],
-                "order_id": t["orderId"],
-                "side": t["side"],
-                "price": Decimal(t["price"]),
-                "qty": Decimal(t["qty"]),
-                "realized_pnl": Decimal(t["realizedPnl"]),
-                "commission": Decimal(t["commission"]),
-                "commission_asset": t["commissionAsset"],
-                "time": t["time"],
-                "is_maker": t.get("maker", False),
-            }
-            for t in raw
-        ]
+        trades = [_normalize_trade(t) for t in raw]
         logger.debug("Recent trades for {} since {}: {} trade(s)", symbol, start_time_ms, len(trades))
         return trades
     except (BinanceAPIException, BinanceRequestException) as exc:
@@ -252,21 +254,7 @@ def get_futures_trades_for_range(
             endTime=end_time_ms,
             limit=1000,
         ))
-        trades = [
-            {
-                "trade_id": t["id"],
-                "order_id": t["orderId"],
-                "side": t["side"],
-                "price": Decimal(t["price"]),
-                "qty": Decimal(t["qty"]),
-                "realized_pnl": Decimal(t["realizedPnl"]),
-                "commission": Decimal(t["commission"]),
-                "commission_asset": t["commissionAsset"],
-                "time": t["time"],
-                "is_maker": t.get("maker", False),
-            }
-            for t in raw
-        ]
+        trades = [_normalize_trade(t) for t in raw]
         logger.debug(
             "Trades for {} [{} – {}]: {} trade(s)",
             symbol, start_time_ms, end_time_ms, len(trades),

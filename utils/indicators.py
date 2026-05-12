@@ -29,6 +29,9 @@ class TradeSignal:
     reason: str
     suggested_quantity: Optional[Decimal] = None
     entry_price: Optional[Decimal] = None
+    current_adx: Optional[float] = None   # strategy-computed; used by stagnation check in bot.py
+    current_rsi: Optional[float] = None   # strategy-computed; used by stagnation check in bot.py
+    suppress_reentry: bool = False         # set True on stagnation exits to block same-candle re-entry
 
 
 def interval_to_minutes(interval: str) -> int:
