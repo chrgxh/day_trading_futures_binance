@@ -292,8 +292,8 @@ def execute_signal(
         )
 
     elif signal.signal == Signal.CLOSE:
-        trade_manager.close_trade(symbol)
         pos_utils.close_position(client, symbol)
+        trade_manager.close_trade(symbol)
 
 
 # ---------------------------------------------------------------------------

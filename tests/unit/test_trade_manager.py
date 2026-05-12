@@ -73,37 +73,28 @@ class TestCloseTrade:
     def test_position_becomes_none_after_close(self):
         mgr = _make_manager()
         mgr.register_trade(**_register_kwargs())
-        with patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
-             patch("utils.trade_manager.orders.cancel_order"):
-            mgr.close_trade("BTCUSDT")
+        mgr.close_trade("BTCUSDT")
         assert mgr.get_position("BTCUSDT") == Position.NONE
 
-    def test_all_order_ids_cancelled(self):
+    def test_no_cancel_calls_made(self):
+        # close_trade only removes state; Binance auto-cancels reduceOnly orders
         mgr = _make_manager()
         mgr.register_trade(**_register_kwargs(stop_ids=[101, 102], ttp_id=201, tp_limit_id=301))
-        with patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
-             patch("utils.trade_manager.orders.cancel_order") as mock_order:
-            mgr.close_trade("BTCUSDT")
-
-        cancelled_algo_ids = {c.args[2] for c in mock_algo.call_args_list}
-        assert {101, 102, 201} == cancelled_algo_ids
-        assert mock_order.call_args.args[2] == 301
-
-    def test_noop_when_not_registered(self):
-        mgr = _make_manager()
         with patch("utils.trade_manager.algo_orders.cancel_algo_order") as mock_algo, \
              patch("utils.trade_manager.orders.cancel_order") as mock_order:
             mgr.close_trade("BTCUSDT")
         mock_algo.assert_not_called()
         mock_order.assert_not_called()
 
+    def test_noop_when_not_registered(self):
+        mgr = _make_manager()
+        mgr.close_trade("BTCUSDT")  # must not raise
+
     def test_double_close_is_safe(self):
         mgr = _make_manager()
         mgr.register_trade(**_register_kwargs())
-        with patch("utils.trade_manager.algo_orders.cancel_algo_order"), \
-             patch("utils.trade_manager.orders.cancel_order"):
-            mgr.close_trade("BTCUSDT")
-            mgr.close_trade("BTCUSDT")  # must not raise
+        mgr.close_trade("BTCUSDT")
+        mgr.close_trade("BTCUSDT")  # must not raise
 
 
 # ---------------------------------------------------------------------------

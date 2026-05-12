@@ -132,10 +132,10 @@ class TradeManager:
         )
 
     def close_trade(self, symbol: str) -> None:
-        """Cancel all orders for the symbol and remove it from tracking.
+        """Remove symbol from tracking after position has been closed.
 
-        Called when the strategy issues a CLOSE signal so the background thread
-        does not interfere with the orderly close sequence in execute_signal.
+        Called after close_position() in execute_signal. Binance auto-cancels all
+        reduceOnly orders when the position hits zero, so no manual cancellation needed.
 
         Args:
             symbol: Trading pair to stop tracking.
@@ -145,7 +145,6 @@ class TradeManager:
         if state is None:
             logger.debug("TradeManager: close_trade({}) called but no active state.", symbol)
             return
-        self._cancel_all_orders(state)
         logger.info("TradeManager: trade closed for {} (strategy signal).", symbol)
 
     def get_position(self, symbol: str) -> Position:
@@ -604,15 +603,6 @@ class TradeManager:
             )
             return []
 
-        for algo_id in state.stop_ids:
-            try:
-                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
-                logger.info("TradeManager: {} cancelled old stop id={} for resize.", state.symbol, algo_id)
-            except Exception as exc:
-                logger.warning(
-                    "TradeManager: could not cancel stop {} for resize: {}", algo_id, exc
-                )
-
         new_ids: list[int] = []
         try:
             sl_limit = algo_orders.place_stop_limit_order(
@@ -630,6 +620,19 @@ class TradeManager:
             new_ids.append(sl_market["order_id"])
         except Exception as exc:
             logger.error("TradeManager: could not re-place stop-market for {}: {}", state.symbol, exc)
+
+        if not new_ids:
+            logger.error("TradeManager: {} no new stops placed — keeping old stops to preserve protection.", state.symbol)
+            return new_ids
+
+        for algo_id in state.stop_ids:
+            try:
+                algo_orders.cancel_algo_order(self._client, state.symbol, algo_id)
+                logger.info("TradeManager: {} cancelled old stop id={} for resize.", state.symbol, algo_id)
+            except Exception as exc:
+                logger.warning(
+                    "TradeManager: could not cancel stop {} for resize: {}", algo_id, exc
+                )
 
         return new_ids
 

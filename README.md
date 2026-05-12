@@ -122,7 +122,7 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips all integrat
   - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
   - `risk.take_profit_limit_pct` (default `3.0`) — maker GTC limit TP sitting on the book at +3% (long) / -3% (short) from entry; earns the maker rebate and catches wicks
   - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 1.0% profit and trails by 0.5% from peak
-  - All four are cancelled automatically when the strategy signals a close
+  - All four are auto-cancelled by Binance when the position closes (`reduceOnly` orders are dropped when position hits zero)
 - **SL profit-lock milestone** — once unrealized P&L (read directly from Binance) reaches `risk.sl_profit_trigger_pct` (default `0.6`%), `TradeManager` automatically moves both stops to profit-lock levels between candles:
   - `risk.sl_profit_lock_pct` (default `0.2`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
   - `risk.sl_profit_market_lock_pct` (default `0.1`) — stop-market safety net, slightly worse than the limit in case of a fast gap
