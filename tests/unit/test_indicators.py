@@ -12,21 +12,21 @@ MS_1H = 3_600_000
 
 
 # ---------------------------------------------------------------------------
-# rsi
+# rsi — returns float
 # ---------------------------------------------------------------------------
 
 def test_rsi_returns_neutral_when_insufficient_data():
-    assert rsi([D("100")] * 14, 14) == D("50")
+    assert rsi([D("100")] * 14, 14) == 50.0
 
 
 def test_rsi_all_gains_returns_100():
     prices = [D(str(i)) for i in range(1, 25)]
-    assert rsi(prices, 14) == D("100")
+    assert rsi(prices, 14) == 100.0
 
 
 def test_rsi_all_losses_returns_0():
     prices = [D(str(25 - i)) for i in range(25)]
-    assert rsi(prices, 14) == D("0")
+    assert rsi(prices, 14) == 0.0
 
 
 def test_rsi_result_is_between_0_and_100():
@@ -37,7 +37,7 @@ def test_rsi_result_is_between_0_and_100():
         p += D("2") if i % 2 == 0 else D("-1")
         prices.append(p)
     result = rsi(prices, 14)
-    assert D("0") < result < D("100")
+    assert 0 < result < 100
 
 
 def test_rsi_exact_known_value():
@@ -46,7 +46,7 @@ def test_rsi_exact_known_value():
     prices = [D(str(i)) for i in range(16)]  # 0..14 (gains), then drop 1
     prices[-1] = D("13")  # last change is -1
     result = rsi(prices, 14)
-    assert D("80") < result < D("95")  # RS ≈ 13 → RSI ≈ 92.9
+    assert 80 < result < 95  # RS ≈ 13 → RSI ≈ 92.9
 
 
 # ---------------------------------------------------------------------------

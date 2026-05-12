@@ -179,14 +179,14 @@ class TradeManager:
         self,
         symbol: str,
         current_price: Decimal,
-        current_adx: Decimal,
-        current_rsi: Decimal,
-        min_adx: Decimal,
-        rsi_long_low: Decimal,
-        rsi_short_high: Decimal,
+        current_adx: float,
+        current_rsi: float,
+        min_adx: float,
+        rsi_long_low: float,
+        rsi_short_high: float,
         stagnation_candles: int,
-        stagnation_min_pct: Decimal,
-        stagnation_reversal_pct: Decimal = Decimal("0.15"),
+        stagnation_min_pct: float,
+        stagnation_reversal_pct: float = 0.15,
     ) -> bool:
         """Increment the candle counter and check for momentum stagnation or reversal.
 
@@ -225,10 +225,10 @@ class TradeManager:
                 return False
 
             if state.position == Position.LONG:
-                price_pct = (current_price - state.checkpoint_price) / state.checkpoint_price * 100
+                price_pct = float((current_price - state.checkpoint_price) / state.checkpoint_price * 100)
                 rsi_weak = current_rsi < rsi_long_low
             else:
-                price_pct = (state.checkpoint_price - current_price) / state.checkpoint_price * 100
+                price_pct = float((state.checkpoint_price - current_price) / state.checkpoint_price * 100)
                 rsi_weak = current_rsi > rsi_short_high
 
             adx_weak = current_adx < min_adx
@@ -238,8 +238,8 @@ class TradeManager:
                     "TradeManager: {} stagnation detected at candle {} — "
                     "price moved {:.3f}% from checkpoint (need {:.1f}%), "
                     "ADX={:.1f} (below min {}), RSI={:.2f} (out of momentum zone) — closing.",
-                    symbol, state.candle_count, float(price_pct), float(stagnation_min_pct),
-                    float(current_adx), float(min_adx), float(current_rsi),
+                    symbol, state.candle_count, price_pct, stagnation_min_pct,
+                    current_adx, min_adx, current_rsi,
                 )
                 return True
 
@@ -247,7 +247,7 @@ class TradeManager:
                 logger.info(
                     "TradeManager: {} reversal exit at candle {} — "
                     "price moved {:.3f}% against trade from checkpoint (threshold -{:.2f}%) — closing.",
-                    symbol, state.candle_count, float(price_pct), float(stagnation_reversal_pct),
+                    symbol, state.candle_count, price_pct, stagnation_reversal_pct,
                 )
                 return True
 
@@ -256,7 +256,7 @@ class TradeManager:
                 "TradeManager: {} stagnation window {} passed — "
                 "price_pct={:.3f}% adx_weak={} rsi_weak={} — checkpoint reset to {}.",
                 symbol, state.candle_count // stagnation_candles,
-                float(price_pct), adx_weak, rsi_weak, current_price,
+                price_pct, adx_weak, rsi_weak, current_price,
             )
             return False
 

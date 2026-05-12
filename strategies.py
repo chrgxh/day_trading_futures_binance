@@ -67,14 +67,14 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     rsi_period: int = params.get("rsi_period", 14)
     volume_lookback: int = params.get("volume_lookback", 20)
     volume_multiplier = Decimal(str(params.get("volume_multiplier", "1.2")))
-    rsi_long_low = Decimal(str(params.get("rsi_long_low", "50")))
-    rsi_long_high = Decimal(str(params.get("rsi_long_high", "70")))
-    rsi_short_low = Decimal(str(params.get("rsi_short_low", "30")))
-    rsi_short_high = Decimal(str(params.get("rsi_short_high", "50")))
-    rsi_exit_overbought = Decimal(str(params.get("rsi_exit_overbought", "80")))
-    rsi_exit_oversold = Decimal(str(params.get("rsi_exit_oversold", "20")))
+    rsi_long_low: float = float(params.get("rsi_long_low", 50))
+    rsi_long_high: float = float(params.get("rsi_long_high", 70))
+    rsi_short_low: float = float(params.get("rsi_short_low", 30))
+    rsi_short_high: float = float(params.get("rsi_short_high", 50))
+    rsi_exit_overbought: float = float(params.get("rsi_exit_overbought", 80))
+    rsi_exit_oversold: float = float(params.get("rsi_exit_oversold", 20))
     adx_period: int = params.get("adx_period", 14)
-    min_adx = Decimal(str(params.get("min_adx", "25")))
+    min_adx: float = float(params.get("min_adx", 25))
 
     min_candles = max(slow_period + 1, rsi_period + 1, volume_lookback + 1, 2 * adx_period + 1)
     if len(candles) < min_candles:
@@ -98,9 +98,11 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     trend_ema_vals = ema(closes_1h, trend_period)
     trend_ema = trend_ema_vals[-1]
 
-    # --- Fast/slow EMA (need at least 2 values each for crossover detection) ---
-    fast_vals = ema(closes, fast_period)
-    slow_vals = ema(closes, slow_period)
+    # --- Fast/slow EMA — truncated to a warmup window so we iterate a small slice
+    #     instead of the full buffer. 6× the slow period gives < 0.01% seed error.
+    ema_slice = slow_period * 6 + 2
+    fast_vals = ema(closes[-ema_slice:], fast_period)
+    slow_vals = ema(closes[-ema_slice:], slow_period)
 
     if len(fast_vals) < 2 or len(slow_vals) < 2:
         return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason="insufficient data for EMA")
@@ -108,8 +110,9 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     fast_now, fast_prev = fast_vals[-1], fast_vals[-2]
     slow_now, slow_prev = slow_vals[-1], slow_vals[-2]
 
-    # --- RSI ---
-    current_rsi = rsi(closes, rsi_period)
+    # --- RSI — truncated: 10× period gives < 0.001% Wilder-smoothing seed error ---
+    rsi_slice = rsi_period * 10 + 1
+    current_rsi = rsi(closes[-rsi_slice:], rsi_period)
 
     # --- RVOL: compare this candle's volume to the rolling average of the previous N candles ---
     current_volume = candles[-1]["volume"]
@@ -117,13 +120,15 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     rvol = float(current_volume / avg_volume) if avg_volume > 0 else 0.0
     vol_spike = avg_volume > 0 and current_volume > avg_volume * volume_multiplier
 
-    # --- ADX: regime filter — only enter in trending markets ---
-    adx_series = adx(candles, adx_period)
-    current_adx = adx_series[-1] if adx_series else Decimal("0")
+    # --- ADX — truncated: 20× period gives < 0.001% Wilder-smoothing seed error ---
+    adx_slice = adx_period * 20 + 1
+    adx_series = adx(candles[-adx_slice:], adx_period)
+    current_adx: float = adx_series[-1] if adx_series else 0.0
     trending = current_adx >= min_adx
 
     # --- Derived state ---
-    current_price = closes[-1]
+    # float for comparisons against float indicator outputs; closes[-1] (Decimal) used for entry_price
+    current_price = float(closes[-1])
     above_trend = current_price > trend_ema
     below_trend = current_price < trend_ema
     ema_bullish = fast_now > slow_now
@@ -134,8 +139,8 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
     logger.info(
         "{} EMA{}={:.4f} EMA{}={:.4f} trend1h={:.4f} price={:.4f} RSI={:.2f} RVOL={:.2f}x ADX={:.1f}"
         " | ema={}{} trend={} vol={} rsi={} adx={}",
-        symbol, fast_period, float(fast_now), slow_period, float(slow_now),
-        float(trend_ema), float(current_price), float(current_rsi), rvol, float(current_adx),
+        symbol, fast_period, fast_now, slow_period, slow_now,
+        trend_ema, current_price, current_rsi, rvol, current_adx,
         "bull" if ema_bullish else "bear" if ema_bearish else "flat",
         "(cross-up)" if cross_up else "(cross-down)" if cross_down else "",
         "above" if above_trend else "below" if below_trend else "at",
@@ -180,7 +185,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
         return TradeSignal(
             signal=Signal.OPEN_LONG, symbol=symbol,
             reason=f"{prefix}long gates passed: {gate_info}",
-            entry_price=current_price,
+            entry_price=closes[-1],
         )
 
     if ema_bearish and below_trend and vol_spike and rsi_short_low <= current_rsi <= rsi_short_high and trending:
@@ -188,7 +193,7 @@ def ema_trend_momentum(candles: list[dict], symbol: str, position: Position, par
         return TradeSignal(
             signal=Signal.OPEN_SHORT, symbol=symbol,
             reason=f"{prefix}short gates passed: {gate_info}",
-            entry_price=current_price,
+            entry_price=closes[-1],
         )
 
     return TradeSignal(signal=Signal.HOLD, symbol=symbol, reason=f"no entry: {gate_info}")

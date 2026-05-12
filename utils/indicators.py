@@ -37,48 +37,50 @@ def interval_to_minutes(interval: str) -> int:
     return {"m": n, "h": n * 60, "d": n * 1440}[unit]
 
 
-def sma(prices: list[Decimal], period: int) -> Decimal:
+def sma(prices: list, period: int) -> float:
     """Simple moving average of the last `period` prices.
 
     Args:
-        prices: Price series.
+        prices: Price series (Decimal or float).
         period: Lookback window.
     """
-    return sum(prices[-period:]) / period
+    return sum(float(p) for p in prices[-period:]) / period
 
 
-def ema(prices: list[Decimal], period: int) -> list[Decimal]:
+def ema(prices: list, period: int) -> list[float]:
     """Exponential moving average seeded with the first SMA.
 
     Returns a list of length max(0, len(prices) - period + 1).
     Returns an empty list if there are fewer than `period` prices.
+    Arithmetic is performed in float for performance.
 
     Args:
-        prices: Price series in chronological order.
+        prices: Price series in chronological order (Decimal or float).
         period: EMA period.
     """
     if len(prices) < period:
         return []
-    k = Decimal("2") / Decimal(str(period + 1))
-    result: list[Decimal] = [sum(prices[:period]) / period]
-    for price in prices[period:]:
-        result.append(price * k + result[-1] * (1 - k))
+    data = [float(p) for p in prices]
+    k = 2.0 / (period + 1)
+    result: list[float] = [sum(data[:period]) / period]
+    for price in data[period:]:
+        result.append(price * k + result[-1] * (1.0 - k))
     return result
 
 
 def macd(
-    prices: list[Decimal],
+    prices: list,
     fast_period: int = 12,
     slow_period: int = 26,
     signal_period: int = 9,
-) -> tuple[list[Decimal], list[Decimal], list[Decimal]]:
+) -> tuple[list[float], list[float], list[float]]:
     """MACD — Moving Average Convergence/Divergence.
 
     Returns (macd_line, signal_line, histogram) aligned to the same length.
     All three lists are empty if there are insufficient prices.
 
     Args:
-        prices: Closing prices in chronological order.
+        prices: Closing prices in chronological order (Decimal or float).
         fast_period: Fast EMA period (default 12).
         slow_period: Slow EMA period (default 26).
         signal_period: Signal line EMA period (default 9).
@@ -104,21 +106,23 @@ def macd(
     return macd_trimmed, sig_line, histogram
 
 
-def rsi(prices: list[Decimal], period: int = 14) -> Decimal:
+def rsi(prices: list, period: int = 14) -> float:
     """Relative Strength Index using Wilder's smoothing.
 
-    Returns 50 (neutral) if there are fewer than period + 1 prices.
+    Returns 50.0 (neutral) if there are fewer than period + 1 prices.
+    Arithmetic is performed in float for performance.
 
     Args:
-        prices: Closing prices in chronological order.
+        prices: Closing prices in chronological order (Decimal or float).
         period: RSI period (default 14).
     """
     if len(prices) < period + 1:
-        return Decimal("50")
+        return 50.0
 
-    changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    gains = [c if c > 0 else Decimal("0") for c in changes]
-    losses = [-c if c < 0 else Decimal("0") for c in changes]
+    data = [float(p) for p in prices]
+    changes = [data[i] - data[i - 1] for i in range(1, len(data))]
+    gains = [c if c > 0 else 0.0 for c in changes]
+    losses = [-c if c < 0 else 0.0 for c in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -127,10 +131,10 @@ def rsi(prices: list[Decimal], period: int = 14) -> Decimal:
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
-    if avg_loss == 0:
-        return Decimal("100")
+    if avg_loss == 0.0:
+        return 100.0
     rs = avg_gain / avg_loss
-    return Decimal("100") - Decimal("100") / (1 + rs)
+    return 100.0 - 100.0 / (1.0 + rs)
 
 
 def resample_to_1h(candles: list[dict]) -> list[dict]:
@@ -169,11 +173,12 @@ def resample_to_1h(candles: list[dict]) -> list[dict]:
     return bars[:-1] if bars else []
 
 
-def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
+def adx(candles: list[dict], period: int = 14) -> list[float]:
     """Average Directional Index using Wilder's smoothing.
 
-    Returns the ADX series as a list of Decimal values.
+    Returns the ADX series as a list of float values.
     Returns an empty list if there are fewer than 2 * period + 1 candles.
+    Arithmetic is performed in float for performance.
 
     Args:
         candles: OHLCV dicts in chronological order; each must have 'high', 'low', 'close'.
@@ -182,13 +187,13 @@ def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
     if len(candles) < 2 * period + 1:
         return []
 
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
 
-    tr_vals: list[Decimal] = []
-    plus_dm_vals: list[Decimal] = []
-    minus_dm_vals: list[Decimal] = []
+    tr_vals: list[float] = []
+    plus_dm_vals: list[float] = []
+    minus_dm_vals: list[float] = []
 
     for i in range(1, len(candles)):
         h, l, prev_c = highs[i], lows[i], closes[i - 1]
@@ -197,8 +202,8 @@ def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
         tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
         up_move = h - prev_h
         down_move = prev_l - l
-        plus_dm = up_move if up_move > down_move and up_move > 0 else Decimal("0")
-        minus_dm = down_move if down_move > up_move and down_move > 0 else Decimal("0")
+        plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
+        minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
 
         tr_vals.append(tr)
         plus_dm_vals.append(plus_dm)
@@ -209,20 +214,20 @@ def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
     smooth_plus = sum(plus_dm_vals[:period])
     smooth_minus = sum(minus_dm_vals[:period])
 
-    dx_vals: list[Decimal] = []
+    dx_vals: list[float] = []
     for i in range(period, len(tr_vals)):
         smooth_tr = smooth_tr - smooth_tr / period + tr_vals[i]
         smooth_plus = smooth_plus - smooth_plus / period + plus_dm_vals[i]
         smooth_minus = smooth_minus - smooth_minus / period + minus_dm_vals[i]
 
-        if smooth_tr == 0:
-            dx_vals.append(Decimal("0"))
+        if smooth_tr == 0.0:
+            dx_vals.append(0.0)
             continue
 
-        plus_di = Decimal("100") * smooth_plus / smooth_tr
-        minus_di = Decimal("100") * smooth_minus / smooth_tr
+        plus_di = 100.0 * smooth_plus / smooth_tr
+        minus_di = 100.0 * smooth_minus / smooth_tr
         di_sum = plus_di + minus_di
-        dx = Decimal("100") * abs(plus_di - minus_di) / di_sum if di_sum != 0 else Decimal("0")
+        dx = 100.0 * abs(plus_di - minus_di) / di_sum if di_sum != 0.0 else 0.0
         dx_vals.append(dx)
 
     if len(dx_vals) < period:
@@ -230,7 +235,7 @@ def adx(candles: list[dict], period: int = 14) -> list[Decimal]:
 
     # Wilder-smooth the DX series to produce ADX
     adx_val = sum(dx_vals[:period]) / period
-    adx_series: list[Decimal] = [adx_val]
+    adx_series: list[float] = [adx_val]
     for dx in dx_vals[period:]:
         adx_val = (adx_val * (period - 1) + dx) / period
         adx_series.append(adx_val)

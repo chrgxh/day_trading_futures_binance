@@ -58,12 +58,10 @@ def load_env() -> dict:
 
 
 def setup_symbols(client, symbols: list[str], leverage: int) -> dict[str, dict]:
-    """Set leverage and fetch symbol info for every symbol."""
-    sym_info = {}
+    """Set leverage for every symbol and fetch all symbol info in a single exchange-info call."""
     for symbol in symbols:
         account.set_leverage(client, symbol, leverage)
-        sym_info[symbol] = account.get_symbol_info(client, symbol)
-    return sym_info
+    return account.get_symbol_infos(client, symbols)
 
 
 def recover_positions(client, symbols: list[str]) -> dict[str, dict | None]:
@@ -191,7 +189,7 @@ def ioc_entry(
         )
         ioc_order = orders.place_limit_order(client, symbol, side, remaining_qty, limit_price, time_in_force="IOC")
 
-        time.sleep(0.5)
+        time.sleep(0.1)
         try:
             status = orders.get_order(client, symbol, ioc_order["order_id"])
             this_fill = status.get("executed_qty", Decimal("0"))
@@ -453,21 +451,25 @@ def _run() -> None:
                 logger.info("{} [{}] {} — {}", symbol, position.value, signal.signal.value, signal.reason)
 
                 if signal.signal == Signal.HOLD and position != Position.NONE:
-                    closes = [c["close"] for c in buf]
-                    adx_series = compute_adx(buf, strategy_params.get("adx_period", 14))
-                    current_adx = adx_series[-1] if adx_series else Decimal("0")
-                    current_rsi = compute_rsi(closes, strategy_params.get("rsi_period", 14))
+                    _rsi_period = strategy_params.get("rsi_period", 14)
+                    _adx_period = strategy_params.get("adx_period", 14)
+                    _rsi_slice = _rsi_period * 10 + 1
+                    _adx_slice = _adx_period * 20 + 1
+                    _closes_slice = [c["close"] for c in buf[-_rsi_slice:]]
+                    _adx_series = compute_adx(buf[-_adx_slice:], _adx_period)
+                    _current_adx = _adx_series[-1] if _adx_series else 0.0
+                    _current_rsi = compute_rsi(_closes_slice, _rsi_period)
                     if trade_manager.tick_stagnation(
                         symbol=symbol,
-                        current_price=closes[-1],
-                        current_adx=current_adx,
-                        current_rsi=current_rsi,
-                        min_adx=Decimal(str(strategy_params.get("min_adx", "25"))),
-                        rsi_long_low=Decimal(str(strategy_params.get("rsi_long_low", "50"))),
-                        rsi_short_high=Decimal(str(strategy_params.get("rsi_short_high", "50"))),
+                        current_price=buf[-1]["close"],
+                        current_adx=_current_adx,
+                        current_rsi=_current_rsi,
+                        min_adx=float(strategy_params.get("min_adx", 25.0)),
+                        rsi_long_low=float(strategy_params.get("rsi_long_low", 50.0)),
+                        rsi_short_high=float(strategy_params.get("rsi_short_high", 50.0)),
                         stagnation_candles=int(strategy_params.get("stagnation_candles", 4)),
-                        stagnation_min_pct=Decimal(str(strategy_params.get("stagnation_min_pct", "2.0"))),
-                        stagnation_reversal_pct=Decimal(str(strategy_params.get("stagnation_reversal_pct", "0.15"))),
+                        stagnation_min_pct=float(strategy_params.get("stagnation_min_pct", 2.0)),
+                        stagnation_reversal_pct=float(strategy_params.get("stagnation_reversal_pct", 0.15)),
                     ):
                         signal = TradeSignal(signal=Signal.CLOSE, symbol=symbol, reason="stagnation exit — momentum decayed")
                         logger.info("{} Stagnation exit triggered — overriding HOLD to CLOSE.", symbol)

@@ -95,6 +95,26 @@ def get_futures_positions(client: Client, symbol: Optional[str] = None) -> list[
         raise
 
 
+def _parse_symbol_filters(sym_info: dict) -> dict:
+    """Extract tick_size, step_size, and other trading filters from a raw exchange-info symbol entry."""
+    filters = {f["filterType"]: f for f in sym_info["filters"]}
+    price_filter = filters.get("PRICE_FILTER", {})
+    lot_size = filters.get("LOT_SIZE", {})
+    min_notional_f = filters.get("MIN_NOTIONAL", {})
+    tick_size = Decimal(price_filter.get("tickSize", "0")).normalize()
+    step_size = Decimal(lot_size.get("stepSize", "0")).normalize()
+    return {
+        "symbol": sym_info["symbol"],
+        "tick_size": tick_size,
+        "step_size": step_size,
+        "min_qty": Decimal(lot_size.get("minQty", "0")),
+        "max_qty": Decimal(lot_size.get("maxQty", "0")),
+        "min_notional": Decimal(min_notional_f.get("notional", "0")),
+        "price_precision": sym_info.get("pricePrecision", 0),
+        "qty_precision": sym_info.get("quantityPrecision", 0),
+    }
+
+
 def get_symbol_info(client: Client, symbol: str) -> dict:
     """Fetch exchange filters for a futures symbol.
 
@@ -108,32 +128,51 @@ def get_symbol_info(client: Client, symbol: str) -> dict:
     """
     try:
         info = with_retry(lambda: client.futures_exchange_info())
-        sym_info = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
-        if sym_info is None:
+        sym_entry = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
+        if sym_entry is None:
             raise ValueError(f"Symbol {symbol} not found on Binance Futures")
-
-        filters = {f["filterType"]: f for f in sym_info["filters"]}
-        price_filter = filters.get("PRICE_FILTER", {})
-        lot_size = filters.get("LOT_SIZE", {})
-        min_notional = filters.get("MIN_NOTIONAL", {})
-
-        tick_size = Decimal(price_filter.get("tickSize", "0")).normalize()
-        step_size = Decimal(lot_size.get("stepSize", "0")).normalize()
-
-        result = {
-            "symbol": symbol,
-            "tick_size": tick_size,
-            "step_size": step_size,
-            "min_qty": Decimal(lot_size.get("minQty", "0")),
-            "max_qty": Decimal(lot_size.get("maxQty", "0")),
-            "min_notional": Decimal(min_notional.get("notional", "0")),
-            "price_precision": sym_info.get("pricePrecision", 0),
-            "qty_precision": sym_info.get("quantityPrecision", 0),
-        }
-        logger.info("Symbol info for {}: tick_size={}, step_size={}", symbol, tick_size, step_size)
+        result = _parse_symbol_filters(sym_entry)
+        logger.info("Symbol info for {}: tick_size={}, step_size={}", symbol, result["tick_size"], result["step_size"])
         return result
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_symbol_info failed for {}: {}", symbol, exc)
+        raise
+
+
+def get_symbol_infos(client: Client, symbols: list[str]) -> dict[str, dict]:
+    """Fetch exchange filters for multiple futures symbols in a single API call.
+
+    Prefer this over calling get_symbol_info() in a loop — it avoids downloading
+    the full exchange-info response once per symbol.
+
+    Args:
+        client: Authenticated Binance client.
+        symbols: List of trading pairs, e.g. ["BTCUSDT", "ETHUSDT"].
+
+    Returns:
+        Dict keyed by symbol, each value matching the shape of get_symbol_info().
+
+    Raises:
+        ValueError: If any requested symbol is not found on Binance Futures.
+    """
+    try:
+        info = with_retry(lambda: client.futures_exchange_info())
+        symbol_set = set(symbols)
+        result = {}
+        for s in info["symbols"]:
+            if s["symbol"] in symbol_set:
+                parsed = _parse_symbol_filters(s)
+                result[s["symbol"]] = parsed
+                logger.info(
+                    "Symbol info for {}: tick_size={}, step_size={}",
+                    s["symbol"], parsed["tick_size"], parsed["step_size"],
+                )
+        missing = symbol_set - set(result.keys())
+        if missing:
+            raise ValueError(f"Symbols not found on Binance Futures: {missing}")
+        return result
+    except (BinanceAPIException, BinanceRequestException) as exc:
+        logger.error("get_symbol_infos failed for {}: {}", symbols, exc)
         raise
 
 

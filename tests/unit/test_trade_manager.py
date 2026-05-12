@@ -467,15 +467,15 @@ class TestTickStagnation:
     ) -> bool:
         return mgr.tick_stagnation(
             symbol=symbol,
-            current_price=Decimal(price),
-            current_adx=Decimal(adx),
-            current_rsi=Decimal(rsi_val),
-            min_adx=Decimal(min_adx),
-            rsi_long_low=Decimal(rsi_long_low),
-            rsi_short_high=Decimal(rsi_short_high),
+            current_price=Decimal(price),   # Decimal — used in Decimal arithmetic with checkpoint_price
+            current_adx=float(adx),
+            current_rsi=float(rsi_val),
+            min_adx=float(min_adx),
+            rsi_long_low=float(rsi_long_low),
+            rsi_short_high=float(rsi_short_high),
             stagnation_candles=candles,
-            stagnation_min_pct=Decimal(min_pct),
-            stagnation_reversal_pct=Decimal(reversal_pct),
+            stagnation_min_pct=float(min_pct),
+            stagnation_reversal_pct=float(reversal_pct),
         )
 
     def test_returns_false_for_unregistered_symbol(self):
