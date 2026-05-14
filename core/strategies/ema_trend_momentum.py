@@ -54,7 +54,10 @@ class EmaTrendMomentum(Strategy):
         adx_period = int(p.get("adx_period", 14))
         min_adx = float(p.get("min_adx", 25))
 
-        min_candles = max(slow_period + 1, rsi_period + 1, volume_lookback + 1, 2 * adx_period + 1)
+        ema_slice = slow_period * 6 + 2
+        rsi_slice = rsi_period * 10 + 1
+        adx_slice = adx_period * 20 + 1
+        min_candles = max(ema_slice, rsi_slice, adx_slice, volume_lookback + 1)
         if len(candles) < min_candles:
             return None
 
@@ -67,7 +70,6 @@ class EmaTrendMomentum(Strategy):
 
         trend_ema = ema(closes_1h, trend_period)[-1]
 
-        ema_slice = slow_period * 6 + 2
         fast_vals = ema(closes[-ema_slice:], fast_period)
         slow_vals = ema(closes[-ema_slice:], slow_period)
         if len(fast_vals) < 1 or len(slow_vals) < 1:
@@ -75,7 +77,6 @@ class EmaTrendMomentum(Strategy):
 
         fast_now = fast_vals[-1]
         slow_now = slow_vals[-1]
-        rsi_slice = rsi_period * 10 + 1
         current_rsi = rsi(closes[-rsi_slice:], rsi_period)
 
         current_volume = candles[-1]["volume"]
@@ -83,7 +84,6 @@ class EmaTrendMomentum(Strategy):
         rvol = float(current_volume / avg_volume) if avg_volume > 0 else 0.0
         vol_spike = avg_volume > 0 and current_volume > avg_volume * volume_multiplier
 
-        adx_slice = adx_period * 20 + 1
         adx_series = adx(candles[-adx_slice:], adx_period)
         current_adx: float = adx_series[-1] if adx_series else 0.0
         trending = current_adx >= min_adx
