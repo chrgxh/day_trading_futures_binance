@@ -157,6 +157,8 @@ class AdaptiveTrendPullback(Strategy):
             return
 
         if self.state_manager.has_position(symbol):
+            logger.info("{} {} {} NO-ENTRY foreign-position — symbol already held by another strategy",
+                        self.tag, symbol, self._entry_interval)
             return
 
         result = self._compute_entry(symbol)
@@ -187,51 +189,82 @@ class AdaptiveTrendPullback(Strategy):
     # ==================================================================
 
     def _compute_entry(self, symbol: str) -> Optional[tuple[Signal, float]]:
-        regime_long, regime_short = self._regime_bias(symbol)
-        if not regime_long and not regime_short:
+        long_ok, short_ok, regime_str = self._regime_summary(symbol)
+        if not long_ok and not short_ok:
+            logger.info("{} {} {} NO-ENTRY regime — {}",
+                        self.tag, symbol, self._entry_interval, regime_str)
             return None
 
         ind = self._entry_indicators(symbol)
         if ind is None:
+            logger.info("{} {} {} NO-ENTRY warmup — entry indicators not ready",
+                        self.tag, symbol, self._entry_interval)
             return None
 
-        if regime_long:
-            result = self._eval_long_entry(symbol, ind)
-            if result is not None:
-                return result
-        if regime_short:
-            result = self._eval_short_entry(symbol, ind)
-            if result is not None:
-                return result
+        long_fail: Optional[tuple[str, str]] = None
+        short_fail: Optional[tuple[str, str]] = None
 
-        logger.debug("{} {} no entry — {}", self.tag, symbol, self._gate_log(ind, "neither"))
+        if long_ok:
+            long_fail = self._first_failed_long_gate(ind)
+            if long_fail is None:
+                return self._build_signal(symbol, ind, Action.OPEN_LONG)
+        if short_ok:
+            short_fail = self._first_failed_short_gate(ind)
+            if short_fail is None:
+                return self._build_signal(symbol, ind, Action.OPEN_SHORT)
+
+        if long_ok and short_ok:
+            logger.info("{} {} {} NO-ENTRY long-reject={}({}) short-reject={}({})",
+                        self.tag, symbol, self._entry_interval,
+                        long_fail[0], long_fail[1], short_fail[0], short_fail[1])
+        elif long_ok:
+            logger.info("{} {} {} NO-ENTRY long-reject — {} ({})",
+                        self.tag, symbol, self._entry_interval,
+                        long_fail[0], long_fail[1])
+        else:
+            logger.info("{} {} {} NO-ENTRY short-reject — {} ({})",
+                        self.tag, symbol, self._entry_interval,
+                        short_fail[0], short_fail[1])
         return None
 
     def _regime_bias(self, symbol: str) -> tuple[bool, bool]:
-        """Return (regime_long_ok, regime_short_ok) from the regime-interval buffer."""
+        """Return (regime_long_ok, regime_short_ok). Thin wrapper over _regime_summary."""
+        long_ok, short_ok, _ = self._regime_summary(symbol)
+        return long_ok, short_ok
+
+    def _regime_summary(self, symbol: str) -> tuple[bool, bool, str]:
+        """Return (long_ok, short_ok, diagnostic_str) from the regime-interval buffer.
+
+        diagnostic_str is short and human-readable for use in HOLD logs — it shows
+        whichever values were inspected (warmup state, close vs EMAs, slope).
+        """
         p = self.params
         candles = self._buffers[symbol].get(self._regime_interval) or []
         ema_fast = int(p.get("regime_ema_fast", 50))
         ema_slow = int(p.get("regime_ema_slow", 200))
         slope_lookback = int(p.get("regime_slope_lookback", 5))
 
-        if len(candles) < ema_slow + slope_lookback + 1:
-            return False, False
+        needed = ema_slow + slope_lookback + 1
+        if len(candles) < needed:
+            return False, False, f"warmup ({len(candles)}/{needed} candles)"
 
         closes = [c["close"] for c in candles]
         fast_series = ema(closes, ema_fast)
         slow_series = ema(closes, ema_slow)
         if len(fast_series) <= slope_lookback or not slow_series:
-            return False, False
+            return False, False, "ema-warmup"
 
         close_now = float(closes[-1])
         ema_fast_now = fast_series[-1]
         ema_fast_then = fast_series[-1 - slope_lookback]
         ema_slow_now = slow_series[-1]
+        slope = ema_fast_now - ema_fast_then
 
-        long_ok = close_now > ema_slow_now and ema_fast_now > ema_slow_now and ema_fast_now > ema_fast_then
-        short_ok = close_now < ema_slow_now and ema_fast_now < ema_slow_now and ema_fast_now < ema_fast_then
-        return long_ok, short_ok
+        long_ok = close_now > ema_slow_now and ema_fast_now > ema_slow_now and slope > 0
+        short_ok = close_now < ema_slow_now and ema_fast_now < ema_slow_now and slope < 0
+        summary = (f"close={close_now:.4f} ema_slow={ema_slow_now:.4f} "
+                   f"ema_fast={ema_fast_now:.4f} slope={slope:+.4f}")
+        return long_ok, short_ok, summary
 
     def _entry_indicators(self, symbol: str) -> Optional[_EntryIndicators]:
         """Compute every entry-interval indicator a single decision needs."""
@@ -329,50 +362,77 @@ class AdaptiveTrendPullback(Strategy):
     def _eval_long_entry(
         self, symbol: str, ind: _EntryIndicators,
     ) -> Optional[tuple[Signal, float]]:
-        p = self.params
-        if not self._pullback_ok(ind, is_long=True):
-            return None
-        if ind.close <= ind.open_:                                 # not bullish
-            return None
-        if ind.close <= ind.prev_close:                            # not higher
-            return None
-        if ind.vol_sma <= 0 or ind.volume <= ind.vol_sma:          # volume must expand
-            return None
-        if ind.adx_now <= float(p.get("adx_min", 20)):
-            return None
-        if ind.atr_now <= ind.atr_sma:
-            return None
-        if ind.rsi_now >= float(p.get("rsi_max_long", 70)):
-            return None
-        if ind.close <= ind.ema_now:                               # must hold above EMA
-            return None
-        if ind.close <= ind.pullback_high:                         # must break the swing
+        if self._first_failed_long_gate(ind) is not None:
             return None
         return self._build_signal(symbol, ind, Action.OPEN_LONG)
 
     def _eval_short_entry(
         self, symbol: str, ind: _EntryIndicators,
     ) -> Optional[tuple[Signal, float]]:
-        p = self.params
-        if not self._pullback_ok(ind, is_long=False):
-            return None
-        if ind.close >= ind.open_:
-            return None
-        if ind.close >= ind.prev_close:
-            return None
-        if ind.vol_sma <= 0 or ind.volume <= ind.vol_sma:
-            return None
-        if ind.adx_now <= float(p.get("adx_min", 20)):
-            return None
-        if ind.atr_now <= ind.atr_sma:
-            return None
-        if ind.rsi_now <= float(p.get("rsi_min_short", 30)):
-            return None
-        if ind.close >= ind.ema_now:
-            return None
-        if ind.close >= ind.pullback_low:
+        if self._first_failed_short_gate(ind) is not None:
             return None
         return self._build_signal(symbol, ind, Action.OPEN_SHORT)
+
+    def _first_failed_long_gate(
+        self, ind: _EntryIndicators,
+    ) -> Optional[tuple[str, str]]:
+        """Walk long-entry gates in order; return (name, detail) of the first to fail.
+
+        Returns None if every gate passes. Short-circuits — no work done after the
+        first failure, so the reported reason is the earliest one in evaluation order.
+        """
+        p = self.params
+        if not self._pullback_ok(ind, is_long=True):
+            return ("pullback",
+                    f"no_touch ema={ind.ema_now:.4f} vwap={ind.vwap_now}")
+        if ind.close <= ind.open_:
+            return ("bullish_close", f"close={ind.close:.4f} open={ind.open_:.4f}")
+        if ind.close <= ind.prev_close:
+            return ("higher_close", f"close={ind.close:.4f} prev={ind.prev_close:.4f}")
+        if ind.vol_sma <= 0 or ind.volume <= ind.vol_sma:
+            return ("volume", f"vol={ind.volume:.2f} sma={ind.vol_sma:.2f}")
+        adx_min = float(p.get("adx_min", 20))
+        if ind.adx_now <= adx_min:
+            return ("adx", f"adx={ind.adx_now:.2f} min={adx_min}")
+        if ind.atr_now <= ind.atr_sma:
+            return ("atr_below_sma", f"atr={ind.atr_now:.4f} sma={ind.atr_sma:.4f}")
+        rsi_max = float(p.get("rsi_max_long", 70))
+        if ind.rsi_now >= rsi_max:
+            return ("rsi_overbought", f"rsi={ind.rsi_now:.2f} max={rsi_max}")
+        if ind.close <= ind.ema_now:
+            return ("close_below_ema", f"close={ind.close:.4f} ema={ind.ema_now:.4f}")
+        if ind.close <= ind.pullback_high:
+            return ("pullback_breakout",
+                    f"close={ind.close:.4f} pullback_high={ind.pullback_high:.4f}")
+        return None
+
+    def _first_failed_short_gate(
+        self, ind: _EntryIndicators,
+    ) -> Optional[tuple[str, str]]:
+        p = self.params
+        if not self._pullback_ok(ind, is_long=False):
+            return ("pullback",
+                    f"no_touch ema={ind.ema_now:.4f} vwap={ind.vwap_now}")
+        if ind.close >= ind.open_:
+            return ("bearish_close", f"close={ind.close:.4f} open={ind.open_:.4f}")
+        if ind.close >= ind.prev_close:
+            return ("lower_close", f"close={ind.close:.4f} prev={ind.prev_close:.4f}")
+        if ind.vol_sma <= 0 or ind.volume <= ind.vol_sma:
+            return ("volume", f"vol={ind.volume:.2f} sma={ind.vol_sma:.2f}")
+        adx_min = float(p.get("adx_min", 20))
+        if ind.adx_now <= adx_min:
+            return ("adx", f"adx={ind.adx_now:.2f} min={adx_min}")
+        if ind.atr_now <= ind.atr_sma:
+            return ("atr_below_sma", f"atr={ind.atr_now:.4f} sma={ind.atr_sma:.4f}")
+        rsi_min = float(p.get("rsi_min_short", 30))
+        if ind.rsi_now <= rsi_min:
+            return ("rsi_oversold", f"rsi={ind.rsi_now:.2f} min={rsi_min}")
+        if ind.close >= ind.ema_now:
+            return ("close_above_ema", f"close={ind.close:.4f} ema={ind.ema_now:.4f}")
+        if ind.close >= ind.pullback_low:
+            return ("pullback_breakdown",
+                    f"close={ind.close:.4f} pullback_low={ind.pullback_low:.4f}")
+        return None
 
     def _build_signal(
         self, symbol: str, ind: _EntryIndicators, action: Action,
@@ -798,7 +858,31 @@ class AdaptiveTrendPullback(Strategy):
             self._exit_position(symbol, "dead trade")
             return
 
-        self._update_trailing_stop(mp, candles)
+        trail_moved = self._update_trailing_stop(mp, candles)
+        if not trail_moved:
+            self._log_managed_hold(mp, candles, candles_since_entry)
+
+    def _log_managed_hold(
+        self, mp: _ManagedPosition, candles: list[dict], candles_since_entry: int,
+    ) -> None:
+        """Emit a one-line HOLD log explaining why no exit/trail action was taken."""
+        close = float(candles[-1]["close"])
+        entry = float(mp.entry_price)
+        unreal_per_unit = (close - entry) if mp.side == "LONG" else (entry - close)
+        r_progress = unreal_per_unit / mp.r_distance if mp.r_distance > 0 else 0.0
+        atr_period = int(self.params.get("atr_period", 14))
+        atr_series = atr(candles, atr_period)
+        atr_now = atr_series[-1] if atr_series else 0.0
+        adx_series = adx(candles, int(self.params.get("adx_period", 14)))
+        adx_now = adx_series[-1] if adx_series else 0.0
+        extreme = mp.highest_close if mp.side == "LONG" else mp.lowest_close
+        logger.info(
+            "{} {} {} HOLD position — side={} close={:.4f} {}={:.4f} R={:+.2f} "
+            "ADX={:.1f} ATR={:.4f} candles_since_entry={}",
+            self.tag, mp.symbol, self._entry_interval, mp.side, close,
+            "high_close" if mp.side == "LONG" else "low_close",
+            extreme, r_progress, adx_now, atr_now, candles_since_entry,
+        )
 
     def _update_extrema(self, mp: _ManagedPosition, candles: list[dict]) -> None:
         close = float(candles[-1]["close"])
@@ -958,21 +1042,23 @@ class AdaptiveTrendPullback(Strategy):
 
     def _update_trailing_stop(
         self, mp: _ManagedPosition, candles: list[dict],
-    ) -> None:
+    ) -> bool:
+        """Return True if a new trailing stop was placed, False otherwise."""
         atr_period = int(self.params.get("atr_period", 14))
         atr_series = atr(candles, atr_period)
         if not atr_series:
-            return
+            return False
         new_trail_price = self._compute_trail_level(mp, atr_series[-1])
 
         state = self.state_manager.get_state(mp.symbol)
         if state.position == Position.NONE or state.size <= 0:
-            return
+            return False
 
         if not self._trail_is_more_favorable(mp, state, new_trail_price):
-            return
+            return False
 
         self._replace_trail(mp, new_trail_price, state.size)
+        return True
 
     def _compute_trail_level(self, mp: _ManagedPosition, atr_now: float) -> Decimal:
         trail_mult = float(self.params.get("trail_atr_mult", 2.0))

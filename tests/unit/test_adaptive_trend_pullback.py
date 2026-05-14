@@ -566,6 +566,69 @@ def test_adopt_pre_existing_only_adopts_own_entries():
     assert "BTCUSDT" in s._managed
 
 
+def test_first_failed_long_gate_returns_none_when_all_pass():
+    s = _build({"pullback_proximity_pct": 100.0, "adx_min": 0, "rsi_max_long": 101})
+    ind = _EntryIndicators(
+        candles=[], close=130.5, prev_close=129.5, open_=129.5, volume=10000,
+        ema_now=128.0, atr_now=2.0, atr_sma=1.0, adx_now=30.0, rsi_now=50.0,
+        vol_sma=200, vwap_now=None,
+        pullback_bars=[_c(0, 120, 121, 119.0, 120, 100)],
+        pullback_high=121.0, pullback_low=119.0,
+    )
+    assert s._first_failed_long_gate(ind) is None
+
+
+def test_first_failed_long_gate_reports_volume_when_volume_low():
+    s = _build({"pullback_proximity_pct": 100.0, "adx_min": 0, "rsi_max_long": 101})
+    # pullback OK (proximity 100%), bullish OK, higher OK, then volume fails
+    ind = _EntryIndicators(
+        candles=[], close=130.5, prev_close=129.5, open_=129.5, volume=10,
+        ema_now=128.0, atr_now=2.0, atr_sma=1.0, adx_now=30.0, rsi_now=50.0,
+        vol_sma=200, vwap_now=None,
+        pullback_bars=[_c(0, 120, 121, 119.0, 120, 100)],
+        pullback_high=121.0, pullback_low=119.0,
+    )
+    fail = s._first_failed_long_gate(ind)
+    assert fail is not None
+    assert fail[0] == "volume"
+
+
+def test_first_failed_long_gate_short_circuits_before_volume():
+    s = _build({"pullback_proximity_pct": 100.0, "adx_min": 0, "rsi_max_long": 101})
+    # Bullish gate fails first (close <= open), so volume isn't even inspected.
+    ind = _EntryIndicators(
+        candles=[], close=129.0, prev_close=128.0, open_=130.0, volume=10,
+        ema_now=128.0, atr_now=2.0, atr_sma=1.0, adx_now=30.0, rsi_now=50.0,
+        vol_sma=200, vwap_now=None,
+        pullback_bars=[_c(0, 120, 121, 119.0, 120, 100)],
+        pullback_high=121.0, pullback_low=119.0,
+    )
+    fail = s._first_failed_long_gate(ind)
+    assert fail is not None
+    assert fail[0] == "bullish_close"  # not "volume" — short-circuit worked
+
+
+def test_regime_summary_returns_diagnostic_string():
+    s = _build()
+    s._buffers["BTCUSDT"]["4h"] = [
+        _c(i * MS_4H, 100 + i, 101 + i, 99 + i, 100 + i, 10) for i in range(50)
+    ]
+    long_ok, short_ok, summary = s._regime_summary("BTCUSDT")
+    assert long_ok is True
+    assert short_ok is False
+    assert "close=" in summary
+    assert "slope=" in summary
+
+
+def test_regime_summary_warmup_reports_candle_count():
+    s = _build()
+    s._buffers["BTCUSDT"]["4h"] = [_c(i * MS_4H, 100, 101, 99, 100, 10) for i in range(5)]
+    long_ok, short_ok, summary = s._regime_summary("BTCUSDT")
+    assert (long_ok, short_ok) == (False, False)
+    assert "warmup" in summary
+    assert "5/" in summary
+
+
 def test_adopt_pre_existing_ignores_other_strategy_entries():
     s = _build()
     s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("1"))
