@@ -1,80 +1,76 @@
-trading:
-  symbols:
-    - BTCUSDT
-    - ETHUSDT
-    - SOLUSDT
-    - BNBUSDT
-    - LINKUSDT
-  interval: "15m"
-  # candle_limit is auto-computed from interval: (200 * 60 / interval_minutes) + 50.
-  # Set explicitly here only if you need to override (e.g. candle_limit: 500).
-  strategy: ema_trend_momentum
-  # ── Strategy parameter tuning guide ────────────────────────────────────────
-  # Periods below are used AS-IS — there is no auto-scaling.
-  # When you change trading.interval, update fast_period / slow_period /
-  # rsi_period / volume_lookback to match. Suggested values by interval:
-  #
-  #   interval │ fast │ slow │ rsi_period │ volume_lookback
-  #   ─────────┼──────┼──────┼────────────┼────────────────
-  #   1m       │  3–5 │ 8–13 │     9      │      10
-  #   5m       │  6–9 │13–21 │    14      │      15
-  #   15m      │   9  │  21  │    14      │      20   ← current
-  #   1h       │ 9–12 │21–26 │    14      │      20
-  #   4h       │ 9–12 │21–26 │    14      │      14
-  #
-  # Rules of thumb:
-  #   • slow / fast ratio ≈ 2–3× (9/21 and 12/26 are classic pairs).
-  #   • RSI 14 is reliable across most intervals; tighten to 9 for 1m–3m.
-  #   • volume_lookback of 20 works for most intervals; drop to 10 for 1m.
-  #   • trend_period (1h 200 EMA) is interval-independent — keep it at 200.
-  #   • RSI entry bands (50–70 long / 30–50 short) are interval-independent.
-  # ────────────────────────────────────────────────────────────────────────────
-  strategy_params:
-    fast_period: 9              # Fast EMA period — crossover trigger
-    slow_period: 21             # Slow EMA period — should be ~2–3× fast_period
-    trend_period: 200           # EMA period on 1h for trend gate (interval-independent)
-    rsi_period: 14              # RSI lookback period
-    volume_lookback: 20         # Number of prior candles used to compute the RVOL baseline
-    volume_multiplier: 1.5      # Current candle volume must exceed the baseline by this multiple
-    rsi_long_low: 50            # RSI floor for long entry — momentum must be building
-    rsi_long_high: 70           # RSI ceiling for long entry — avoid overbought entries
-    rsi_short_low: 30           # RSI floor for short entry — avoid oversold entries
-    rsi_short_high: 50          # RSI ceiling for short entry — momentum must be falling
-    rsi_exit_overbought: 75     # Force-exit long when RSI reaches this (momentum exhaustion)
-    rsi_exit_oversold: 25       # Force-exit short when RSI reaches this (momentum exhaustion)
-    adx_period: 14              # ADX smoothing period — Wilder's method, same as RSI
-    min_adx: 27                 # Skip entry if ADX < this — market is ranging (20=weak, 25=confirmed, 30=strong)
-    stagnation_candles: 4       # Re-check momentum health every N candles while in a position
-    stagnation_min_pct: 0.2     # Price must move at least this % in your favour per window; if not AND ADX/RSI have decayed, close
-    stagnation_reversal_pct: 0.15  # Close if price moves more than this % against the trade from checkpoint (filters out sub-0.15% noise bounces)
+# Top-level symbols: every strategy below watches every symbol in this list.
+symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - BNBUSDT
+  - LINKUSDT
 
-entry:
-  max_price_deviation_pct: 0.3      # Abort IOC entry if price drifts more than this % from signal price
+leverage: 20
 
-risk:
-  max_position_size_usdt: 2000.0    # Maximum USDT notional value per open position
-  max_daily_loss_usdt: 50.0         # Bot stops opening new trades once cumulative daily loss hits this
-  kill_switch: false                 # Set true to immediately block all new order attempts
-  leverage: 20                       # Leverage multiplier set on position open (applied to all symbols)
-  stop_loss_limit_pct: 0.4          # Hard SL: stop-limit trigger this % against entry (preferred exit, less slippage)
-  stop_loss_market_pct: 0.6         # Safety-net SL: slightly wider than limit — fires if limit SL can't fill (e.g. fast gap)
-  take_profit_limit_pct: 3.0        # Maker GTC limit TP placed this % in-profit from entry price
-  trailing_take_profit_activation_pct: 1.0  # Activate trailing TP once unrealized profit reaches this % from entry
-  trailing_take_profit_callback_rate: 0.5   # Trail by this % from peak — fires when price retraces this amount
-  sl_profit_trigger_pct: 0.6        # When unrealized profit reaches this %, move both stop orders to lock in profit
-  sl_profit_lock_pct: 0.2           # Move stop-limit to this % above (long) or below (short) entry on milestone
-  sl_profit_market_lock_pct: 0.1    # Move stop-market to this % above (long) or below (short) entry — safety net if limit can't fill
+# Strategies. Each entry runs at its own interval over all symbols. If two
+# strategies fire on the same symbol simultaneously, the one listed first wins.
+# Params are shared across all symbols for that strategy.
+strategies:
+  - name: ema_trend_momentum
+    interval: 15m
+    params:
+      # Position sizing
+      max_position_size_usdt: 2000.0     # USDT notional per position
 
-trade_manager:
-  poll_interval_secs: 5             # How often to check position/order state against Binance (recommended: 5–10s)
-  min_residual_notional_usdt: 10.0  # When a partial TP fill leaves a residual below this value (USDT), close it directly instead of re-placing stops
+      # Indicator periods (must match the interval — see tuning guide below)
+      fast_period: 9
+      slow_period: 21
+      trend_period: 200                  # 1h EMA — interval-independent
+      rsi_period: 14
+      volume_lookback: 20
+      adx_period: 14
+
+      # Entry gates
+      volume_multiplier: 1.5
+      rsi_long_low: 50
+      rsi_long_high: 70
+      rsi_short_low: 30
+      rsi_short_high: 50
+      min_adx: 27
+
+      # Exit pricing (placeholder — strategy will own this fully in a later pass)
+      stop_loss_pct: 0.4
+      stop_loss_market_pct: 0.6
+      take_profit_pct: 3.0
+      trailing_take_profit_activation_pct: 1.0
+      trailing_take_profit_callback_rate: 0.5
+
+      # Entry execution
+      max_price_deviation_pct: 0.3
+    live_trade_manager:
+      enabled: false  # base LiveTradeManager has no behavior yet; enable when a subclass is in place
+
+# Tuning guide — keep periods in sync with `interval`:
+#   interval │ fast │ slow │ rsi_period │ volume_lookback
+#   ─────────┼──────┼──────┼────────────┼────────────────
+#   1m       │  3–5 │ 8–13 │      9     │      10
+#   5m       │  6–9 │13–21 │     14     │      15
+#   15m      │   9  │  21  │     14     │      20   ← current
+#   1h       │ 9–12 │21–26 │     14     │      20
+#   4h       │ 9–12 │21–26 │     14     │      14
+# RSI bands and trend_period are interval-independent.
+
+risk_guard:
+  max_concurrent_positions: 3
+  max_daily_loss_usdt: 50.0
+
+state_manager:
+  poll_interval_secs: 10
+  grace_period_secs: 15
+  pnl_refresh_every_n_polls: 6
+  pnl_reporter:
+    enabled: true
+    csv_file: logs/pnl.csv
 
 logging:
   level: INFO
   log_file: logs/bot.log
   rotation: "10 MB"
   retention: "7 days"
-  debug_log_file: logs/bot.debug.log   # Optional: write all DEBUG logs to a separate file (remove key to disable)
-
-reporting:
-  pnl_csv_file: logs/pnl.csv          # Daily P&L — one row per symbol + TOTAL, appended at 00:00:05 UTC
+  debug_log_file: logs/bot.debug.log

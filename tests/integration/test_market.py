@@ -79,19 +79,17 @@ def test_parse_kline_ws_non_kline_event_returns_none():
     assert market.parse_kline_ws({"e": "trade", "p": "30000.00"}) is None
 
 
-def test_start_kline_streams_connects(symbol):
+def test_start_kline_streams_connects(client, symbol):
     received: list = []
 
-    twm = market.start_kline_streams(
-        api_key=os.environ["BINANCE_API_KEY"],
-        api_secret=os.environ["BINANCE_API_SECRET"],
+    mgr = market.start_kline_streams(
+        client=client,
         testnet=True,
-        symbols=[symbol],
-        interval="1m",
-        on_closed_candle=lambda sym, candle: received.append((sym, candle)),
+        pairs=[(symbol, "1m")],
+        on_closed_candle=lambda sym, interval, candle: received.append((sym, interval, candle)),
     )
     try:
         time.sleep(3)
-        assert twm.is_alive(), "ThreadedWebsocketManager thread should be alive after connecting"
+        assert mgr._thread is not None and mgr._thread.is_alive()
     finally:
-        twm.stop()
+        mgr.stop()

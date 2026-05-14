@@ -152,25 +152,31 @@ def parse_kline_ws(msg: dict) -> dict | None:
     }
 
 
+def _interval_ms(interval: str) -> int:
+    n, unit = int(interval[:-1]), interval[-1]
+    return {"m": n * 60_000, "h": n * 3_600_000, "d": n * 86_400_000}[unit]
+
+
 class _KlineStreamManager:
     """Direct WebSocket connection to Binance Futures kline streams.
 
-    Replaces ThreadedWebsocketManager, which has a known bug where
-    start_kline_futures_socket() ignores testnet=True and always connects
-    to the mainnet fstream URL (python-binance issues #929, #1040).
+    Subscribes to many (symbol, interval) pairs on a single connection. On every closed
+    candle, detects time gaps against the last-seen candle for the same (symbol, interval)
+    and REST-fills missing candles before delivering the new one.
     """
 
     def __init__(
         self,
+        client: Client,
         testnet: bool,
-        symbols: list[str],
-        interval: str,
-        on_closed_candle: Callable[[str, dict], None],
+        pairs: list[tuple[str, str]],
+        on_closed_candle: Callable[[str, str, dict], None],
     ) -> None:
+        self._client = client
         self._testnet = testnet
-        self._symbols = symbols
-        self._interval = interval
+        self._pairs = pairs
         self._on_closed_candle = on_closed_candle
+        self._last_open_time: dict[tuple[str, str], int] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -195,11 +201,23 @@ class _KlineStreamManager:
             if not self._stop.is_set():
                 logger.error("Kline WS thread error: {}", exc)
         finally:
+            # Cancel pending tasks (websockets keepalive, recv) so they don't
+            # try to schedule callbacks on a closed loop after we close it.
+            try:
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
             self._loop.close()
 
     async def _stream_loop(self) -> None:
         base = _FSTREAM_TESTNET_URL if self._testnet else _FSTREAM_URL
-        streams = "/".join(f"{s.lower()}@kline_{self._interval}" for s in self._symbols)
+        streams = "/".join(f"{s.lower()}@kline_{i}" for s, i in self._pairs)
         url = f"{base}/stream?streams={streams}"
 
         while not self._stop.is_set():
@@ -210,13 +228,7 @@ class _KlineStreamManager:
                         if self._stop.is_set():
                             return
                         try:
-                            wrapper = json.loads(raw)
-                            data = wrapper.get("data", wrapper)
-                            stream = wrapper.get("stream", "")
-                            symbol = stream.split("@")[0].upper() if "@" in stream else ""
-                            candle = parse_kline_ws(data)
-                            if candle is not None and symbol:
-                                self._on_closed_candle(symbol, candle)
+                            self._handle_message(raw)
                         except Exception as exc:
                             logger.error("WS kline handler error: {}", exc)
             except asyncio.CancelledError:
@@ -230,34 +242,76 @@ class _KlineStreamManager:
                 except asyncio.CancelledError:
                     return
 
+    def _handle_message(self, raw: str) -> None:
+        wrapper = json.loads(raw)
+        data = wrapper.get("data", wrapper)
+        stream = wrapper.get("stream", "")
+        if "@" not in stream:
+            return
+        symbol_part, kline_part = stream.split("@", 1)
+        symbol = symbol_part.upper()
+        interval = kline_part.split("_", 1)[1] if "_" in kline_part else ""
+        candle = parse_kline_ws(data)
+        if candle is None or not symbol or not interval:
+            return
+        self._deliver_with_gap_fill(symbol, interval, candle)
+
+    def _deliver_with_gap_fill(self, symbol: str, interval: str, candle: dict) -> None:
+        key = (symbol, interval)
+        last = self._last_open_time.get(key)
+        step = _interval_ms(interval)
+        if last is not None and candle["open_time"] > last + step:
+            missing_start = last + step
+            missing_end = candle["open_time"] - 1
+            try:
+                filled = get_futures_ohlcv(
+                    self._client, symbol, interval, limit=1500,
+                    start_str=_ms_to_iso(missing_start),
+                    end_str=_ms_to_iso(missing_end),
+                )
+                logger.warning("[ws] gap-fill {} {}: filled {} candle(s) between {} and {}",
+                               symbol, interval, len(filled), missing_start, missing_end)
+                for c in filled:
+                    if c["open_time"] > last:
+                        self._on_closed_candle(symbol, interval, c)
+                        self._last_open_time[key] = c["open_time"]
+            except Exception as exc:
+                logger.error("[ws] gap-fill {} {} failed: {}", symbol, interval, exc)
+
+        self._last_open_time[key] = candle["open_time"]
+        self._on_closed_candle(symbol, interval, candle)
+
+
+def _ms_to_iso(ms: int) -> str:
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def start_kline_streams(
-    api_key: str,
-    api_secret: str,
+    client: Client,
     testnet: bool,
-    symbols: list[str],
-    interval: str,
-    on_closed_candle: Callable[[str, dict], None],
+    pairs: list[tuple[str, str]],
+    on_closed_candle: Callable[[str, str, dict], None],
 ) -> _KlineStreamManager:
-    """Subscribe to futures kline streams for each symbol and call on_closed_candle on every close.
+    """Subscribe to futures kline streams for every (symbol, interval) pair.
 
-    The callback is invoked from a background thread — callers must ensure any shared state
-    they access inside the callback is thread-safe (e.g. by routing through a queue).
+    Detects gaps after reconnect by comparing the new candle's open_time to the last
+    one delivered for the same (symbol, interval); REST-fills any missing candles
+    before delivering the new one. Reconnects automatically on disconnect.
 
     Args:
-        api_key: Binance API key.
-        api_secret: Binance API secret.
+        client: Authenticated Binance client (used for REST gap-fills).
         testnet: If True, connects to the futures testnet WebSocket endpoint.
-        symbols: List of trading pairs to subscribe to.
-        interval: Kline interval, e.g. "5m".
-        on_closed_candle: Called with (symbol, candle_dict) whenever a candle closes.
+        pairs: List of (symbol, interval) tuples to subscribe to.
+        on_closed_candle: Called with (symbol, interval, candle_dict) on every close.
+            Invoked from a background thread — route shared state through a queue.
 
     Returns:
         The running _KlineStreamManager. Call .stop() on shutdown.
     """
-    mgr = _KlineStreamManager(testnet, symbols, interval, on_closed_candle)
+    mgr = _KlineStreamManager(client, testnet, pairs, on_closed_candle)
     mgr.start()
-    logger.info("Kline WebSocket streams started for {} @ {}", symbols, interval)
+    logger.info("Kline WS started ({} streams): {}", len(pairs), pairs)
     return mgr
 
 

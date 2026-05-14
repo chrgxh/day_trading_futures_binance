@@ -1,30 +1,36 @@
 # Binance Futures Trading Bot
 
-Automated futures trading bot for Binance. Subscribes to Binance Futures kline WebSocket streams and evaluates technical indicators on every candle close, placing orders when a signal triggers subject to risk controls.
+Automated futures trading bot for Binance. Multiple strategies run in parallel at independent intervals over a shared list of symbols. Each strategy owns its own entry mechanics, SL/TP pricing, and optional post-fill lifecycle hooks. The bot itself is a thin orchestrator — startup wiring and WebSocket routing only.
 
 ## Structure
 
 ```
-bot.py                   — main loop, orchestration, risk controls
-strategies.py            — pluggable strategy functions + STRATEGIES registry
+bot.py                              — entry point: load config, wire objects, route candles
+core/
+  types.py                          — Position, Action, Signal, SymbolState
+  state_manager.py                  — single Binance poller, source of truth for live state
+  risk_guard.py                     — entry gate: max positions, one-per-symbol, daily loss
+  pnl_reporter.py                   — daily P&L CSV + email (lifecycle owned by StateManager)
+  strategies/
+    base.py                         — Strategy ABC: candle buffer, signal, execution
+    live_trade_manager.py           — optional per-strategy post-fill lifecycle hooks
+    ema_trend_momentum.py           — active strategy
 utils/
-  general.py             — shared primitives: build_client, with_retry, round_price, send_crash_email, send_daily_report_email, order normalizers
-  account.py             — account state: connection, balances, positions, symbol info, leverage, recent trades
-  orders.py              — regular orders: market, limit, tp_limit, get_open_orders, cancel, cancel_all
-  algo_orders.py         — conditional orders: stop/TP market and limit variants, cancel_algo
-  positions.py           — position management: close_position
-  market.py              — public data: OHLCV candles, mark price, WebSocket kline streams
-  trade_manager.py       — background trade state manager: monitors positions, reconciles orders on external fills
-  pnl_reporter.py        — daily P&L reporter: appends net P&L per symbol to logs/pnl.csv at UTC midnight and emails a summary
-  indicators.py          — signal types (Signal, TradeSignal) and raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h)
-config.yaml              — symbols, interval, risk limits, strategy selection (safe to commit)
-.env                     — mainnet API keys and runtime flags (never commit)
-.env.testnet             — testnet API keys for integration tests (never commit)
+  general.py                        — build_client, with_retry, round_price, emails, normalizers
+  account.py                        — connection, balances, positions, symbol info, trades
+  orders.py                         — regular orders + get_open_orders
+  algo_orders.py                    — conditional orders (stop/TP market & limit)
+  positions.py                      — close_position
+  market.py                         — OHLCV, mark price, multi-(symbol,interval) WS with gap-fill
+  indicators.py                     — SMA, EMA, MACD, ADX, RSI, resample_to_1h, interval_to_minutes
+config.yaml                         — symbols, leverage, strategies list, risk_guard, state_manager, logging
+.env                                — mainnet API keys (never commit)
+.env.testnet                        — testnet API keys for integration tests (never commit)
 tests/
-  unit/                  — fast unit tests (no network), run with plain pytest
-  integration/           — testnet integration tests, one file per module
-logs/                    — runtime log output, mounted volume (bot.log, pnl.csv, optionally bot.debug.log)
-sandbox.ipynb            — manual testnet notebook for ad-hoc scenario testing
+  unit/                             — fast unit tests (no network)
+  integration/                      — testnet integration tests
+logs/                               — runtime logs (mounted volume): bot.log, pnl.csv, bot.debug.log
+sandbox.ipynb                       — manual testnet notebook
 ```
 
 ## Configuration
@@ -34,26 +40,63 @@ Copy `.env.example` to `.env` and fill in your credentials:
 ```
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
-BINANCE_TESTNET=true        # set to false for mainnet
+BINANCE_TESTNET=true                # set to false for mainnet
 
-# optional — crash and daily report email notifications via Resend
+# optional — crash + daily report emails via Resend
 RESEND_API_KEY=
 CRASH_NOTIFY_EMAIL=
-CRASH_NOTIFY_FROM_EMAIL=    # must be a verified sender domain in Resend
+CRASH_NOTIFY_FROM_EMAIL=            # must be a verified sender domain in Resend
 ```
 
-For integration tests, copy `.env.testnet.example` to `.env.testnet` and fill in your testnet credentials (including the Resend vars if you want to run `test_notifications`).
+For integration tests, copy `.env.testnet.example` to `.env.testnet` and fill in your testnet credentials (plus the Resend vars if you want to run `test_notifications`).
 
-Strategy selection and parameters live in `config.yaml` under `trading.strategy` and `trading.strategy_params`. Available strategies:
+### config.yaml
 
-| Key | Description |
-|---|---|
-| `ema_trend_momentum` | **(active)** EMA crossover gated by 1h 200 EMA trend, RVOL spike, RSI momentum band, and ADX regime filter (ADX < `min_adx` blocks entry in ranging markets). No fresh crossover required — any tick where all gates pass opens a trade, so cold-starts and post-close re-entries are immediate. |
-| `ma_crossover` | Simple SMA crossover (fast period vs slow period). |
+Single source of truth for everything non-secret. Shape:
 
-To add a new strategy: write a function `(candles, symbol, position, params) -> TradeSignal` in [strategies.py](strategies.py) and register it in `STRATEGIES`.
+```yaml
+symbols: [BTCUSDT, ETHUSDT, SOLUSDT]   # every strategy watches every symbol
+leverage: 20
 
-**Changing the interval** (`trading.interval` in `config.yaml`): the bot auto-computes the candle prefetch limit and paginates REST requests when needed. Strategy params (`fast_period`, `slow_period`, `rsi_period`, `volume_lookback`) are used as-is — update them manually when switching intervals. `config.yaml` contains a tuning guide with recommended values for 1m / 5m / 15m / 1h / 4h.
+strategies:                            # ordered; first listed wins on a symbol collision
+  - name: ema_trend_momentum
+    interval: 15m
+    params: {...}                      # shared across all symbols for this strategy
+    live_trade_manager:
+      enabled: false
+      params: {}
+
+risk_guard:
+  max_concurrent_positions: 3
+  max_daily_loss_usdt: 50.0
+
+state_manager:
+  poll_interval_secs: 10
+  grace_period_secs: 15
+  pnl_refresh_every_n_polls: 6
+  pnl_reporter:
+    enabled: true
+    csv_file: logs/pnl.csv
+
+logging:
+  level: INFO
+  log_file: logs/bot.log
+  rotation: "10 MB"
+  retention: "7 days"
+  debug_log_file: logs/bot.debug.log
+```
+
+### Adding a strategy
+
+1. Add a class in `core/strategies/your_strategy.py` extending `Strategy`. Implement `compute_signal(symbol, candles)` and `execute_open(signal)`.
+2. Register it in `core/strategies/__init__.py`'s `STRATEGIES` dict.
+3. Add an entry under `strategies:` in `config.yaml` with its `name`, `interval`, and `params`.
+
+Strategies decide:
+- What action to take on each candle (`compute_signal`).
+- What `entry_price`, `stop_loss_price`, and `take_profit_price` to aim for.
+- How to actually enter the position (`execute_open` — IOC, market, layered limits, whatever).
+- Whether they want a `LiveTradeManager` for post-fill lifecycle (SL migration, partial-fill handling, stagnation, etc.) — subclass `LiveTradeManager` and override `on_open` / `on_update` / `on_close`.
 
 ## Running
 
@@ -67,25 +110,20 @@ python bot.py
 docker compose up --build
 ```
 
+## Architecture in one paragraph
+
+`StateManager` polls Binance every few seconds and is the single source of truth for live state — positions, orders, daily P&L. It cancels orphan orders and warns on untracked positions; it never tries to manage positions itself. `RiskGuard` is a stateless gate that reads StateManager and enforces max-positions / one-per-symbol / daily-loss limits. Strategies receive closed candles via WebSocket, ask StateManager whether their symbol is free, compute a signal, and (for OPEN actions) consult RiskGuard before placing orders themselves. Each strategy can optionally attach a `LiveTradeManager` that subscribes to StateManager updates for post-fill lifecycle. The bot itself only does wiring and WebSocket routing.
+
 ## Daily P&L report
 
 At 00:00:05 UTC each day the bot:
 
-1. Appends rows to `logs/pnl.csv` covering the just-completed UTC calendar day — one row per symbol plus a TOTAL row (header written only on first file creation):
+1. Appends rows to `logs/pnl.csv` for the just-completed UTC day — one row per symbol plus a TOTAL row.
+2. Sends an email to `CRASH_NOTIFY_EMAIL` with the P&L table and every WARNING / ERROR / CRITICAL log line from that day.
 
-```
-date,symbol,realized_pnl,commission,net_pnl,trade_count
-2026-05-10,BTCUSDT,4.5100,-0.2790,4.2310,6
-2026-05-10,ETHUSDT,-1.0800,-0.0440,-1.1240,3
-2026-05-10,SOLUSDT,0.0000,0.0000,0.0000,0
-2026-05-10,TOTAL,3.4300,-0.3230,3.1070,9
-```
+The email is silently skipped if Resend env vars are absent. The CSV path is configurable via `state_manager.pnl_reporter.csv_file`.
 
-2. Sends an email to `CRASH_NOTIFY_EMAIL` with subject `[Bot Report] YYYY-MM-DD — Net P&L: X.XXXX USDT`. The email contains the same P&L table and a section listing every WARNING, ERROR, and CRITICAL log line from that day. If the day was clean the log section says "No warnings or errors logged for this day." The email is silently skipped if the Resend env vars are absent.
-
-Net P&L = realized P&L − trading commission. The CSV path is configurable via `reporting.pnl_csv_file` in `config.yaml`.
-
-> **Note:** the report only fires if the bot is alive at midnight. If the bot is stopped before midnight and restarted after, that day's report is skipped.
+> **Note:** the report only fires if the bot is alive at midnight. A bot stopped before midnight and restarted after skips that day's report.
 
 ## Testing
 
@@ -101,43 +139,14 @@ Integration tests run against the live Binance testnet and require `.env.testnet
 pytest -m integration
 ```
 
-Run a specific module's tests:
-
-```bash
-pytest tests/integration/test_orders.py -m integration -v
-pytest tests/integration/test_algo_orders.py -m integration -v
-pytest tests/integration/test_positions.py -m integration -v
-pytest tests/integration/test_trade_manager.py -m integration -v
-pytest tests/integration/test_pnl_reporter.py -m integration -v
-pytest tests/integration/test_notifications.py -m integration -v
-```
-
-Plain `pytest` (no `-m integration`) runs unit tests only and skips all integration tests.
+Plain `pytest` (no `-m integration`) runs unit tests only and skips integration tests.
 
 ## Safety defaults
 
-- `BINANCE_TESTNET=true` — connects to testnet by default
-- Kill switch in `config.yaml` (`risk.kill_switch: true`) blocks all trades instantly
-- Max position size and max daily loss enforced in `bot.py` before any order reaches the exchange
-- **IOC limit entry** — places an IOC limit order at the current best ask (BUY) or best bid (SELL), retrying until fully filled or aborted:
-  - `entry.max_price_deviation_pct` (default `0.3`) — abort entry if price drifts more than this % from the signal candle close price; on partial fill at abort, stops are still placed to protect the live position
-- Four exit orders placed automatically on every position open:
-  - `risk.stop_loss_limit_pct` (default `1.5`) — stop-limit, preferred SL exit with less slippage
-  - `risk.stop_loss_market_pct` (default `1.8`) — stop-market, safety net if price gaps past the limit
-  - `risk.take_profit_limit_pct` (default `3.0`) — maker GTC limit TP sitting on the book at +3% (long) / -3% (short) from entry; earns the maker rebate and catches wicks
-  - `risk.trailing_take_profit_activation_pct` / `risk.trailing_take_profit_callback_rate` — trailing stop that activates at 1.0% profit and trails by 0.5% from peak
-  - All four are auto-cancelled by Binance when the position closes (`reduceOnly` orders are dropped when position hits zero)
-- **SL profit-lock milestone** — once unrealized P&L (read directly from Binance) reaches `risk.sl_profit_trigger_pct` (default `0.6`%), `TradeManager` automatically moves both stops to profit-lock levels between candles:
-  - `risk.sl_profit_lock_pct` (default `0.2`) — stop-limit moves to this % above (long) / below (short) entry, locking in a minimum profit
-  - `risk.sl_profit_market_lock_pct` (default `0.1`) — stop-market safety net, slightly worse than the limit in case of a fast gap
-  - New orders are placed first, old ones cancelled after — no unprotected window. Fires at most once per trade
-- **Stagnation / reversal exit** — on every HOLD candle, `bot.py` calls `TradeManager.tick_stagnation()`. Every `strategy_params.stagnation_candles` (default `4`) candles it evaluates two conditions:
-  1. **Stagnation**: price moved less than `strategy_params.stagnation_min_pct` (default `0.2`%) in your favour from the last checkpoint AND ADX is below `strategy_params.min_adx` AND RSI has left the entry momentum zone — all three required
-  2. **Reversal**: price moved more than `strategy_params.stagnation_reversal_pct` (default `0.15`%) against the trade from the last checkpoint — fires regardless of ADX or RSI
-
-  Either condition → closes the position. On a passing window the checkpoint price resets to the current price, so each window measures progress from where the last window ended, not from entry. Same-candle re-entry is suppressed after a stagnation close.
-- `TradeManager` polls Binance every `trade_manager.poll_interval_secs` (default `5`) seconds per tracked symbol. Silent when nothing changes. On external close: identifies which exit order fired, cancels only the remaining leftover orders, verifies they're gone, and logs realized P&L (WIN/LOSS). On partial TP fill: if the residual is below `trade_manager.min_residual_notional_usdt` (default `10` USDT), closes it directly with a market order; otherwise re-places stop orders at the reduced size, verifies they're live, and logs cumulative P&L
-
-## Strategy notes
-
-`theory/gates.md` — explains what each entry gate does, why it exists, and its known limitations (lag, false positives, tuning levers). Useful reference when reviewing filtered trades or adjusting thresholds.
+- `BINANCE_TESTNET=true` — connects to testnet by default.
+- `risk_guard.max_concurrent_positions` — caps how many symbols can be live at once.
+- One-position-per-symbol is absolute (enforced by RiskGuard, regardless of strategy).
+- `risk_guard.max_daily_loss_usdt` — once tripped, blocks new entries for the rest of the UTC day; existing positions run their course; a single warning email is sent; bot resumes next UTC day automatically.
+- `StateManager` cancels orphan orders (orders with no matching position) and warns on untracked positions (position with no exit orders), with a configurable grace window so freshly placed orders are not misclassified.
+- WebSocket gap recovery — on every candle close, missing candles after a reconnect are REST-fetched and back-filled before being delivered to strategies; a `[ws] gap-fill` warning is logged.
+- Per-strategy exit orders: the active `ema_trend_momentum` strategy places four reduceOnly exits on every position open (stop-limit, stop-market, trailing TP, GTC limit TP), all anchored to the actual fill price. Binance auto-cancels them when the position hits zero.

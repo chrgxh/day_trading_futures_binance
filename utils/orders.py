@@ -114,7 +114,7 @@ def get_open_orders(client: Client, symbol: str) -> list[dict]:
         algo_resp = with_retry(lambda: client.futures_get_open_algo_orders(symbol=symbol))
         algo = algo_resp.get("orders", []) if isinstance(algo_resp, dict) else algo_resp
         result = [_normalize_order(o) for o in regular] + [_normalize_algo_order(o) for o in algo]
-        logger.info("Open orders for {} (regular={} algo={})", symbol, len(regular), len(algo))
+        logger.debug("Open orders for {} (regular={} algo={})", symbol, len(regular), len(algo))
         return result
     except (BinanceAPIException, BinanceRequestException) as exc:
         logger.error("get_open_orders failed for {}: {}", symbol, exc)
