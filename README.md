@@ -14,7 +14,7 @@ core/
   strategies/
     base.py                         — Strategy ABC: candle buffer, signal, execution
     live_trade_manager.py           — optional per-strategy post-fill lifecycle hooks
-    ema_trend_momentum.py           — active strategy
+    adaptive_trend_pullback.py      — active strategy
 utils/
   general.py                        — build_client, with_retry, round_price, emails, normalizers
   account.py                        — connection, balances, positions, symbol info, trades
@@ -22,8 +22,8 @@ utils/
   algo_orders.py                    — conditional orders (stop/TP market & limit)
   positions.py                      — close_position
   market.py                         — OHLCV, mark price, multi-(symbol,interval) WS with gap-fill
-  indicators.py                     — SMA, EMA, MACD, ADX, RSI, resample_to_1h, interval_to_minutes
-config.yaml                         — symbols, leverage, strategies list, risk_guard, state_manager, logging
+  indicators.py                     — SMA, EMA, MACD, ADX, ATR, RSI, daily_anchored_vwap, resample_to_1h
+config.yaml                         — symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 .env                                — mainnet API keys (never commit)
 .env.testnet                        — testnet API keys for integration tests (never commit)
 tests/
@@ -56,15 +56,18 @@ Single source of truth for everything non-secret. Shape:
 
 ```yaml
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT]   # every strategy watches every symbol
-leverage: 20
 
 strategies:                            # ordered; first listed wins on a symbol collision
-  - name: ema_trend_momentum
-    interval: 15m
-    params: {...}                      # shared across all symbols for this strategy
-    live_trade_manager:
-      enabled: false
-      params: {}
+  - name: adaptive_trend_pullback
+    params:                            # shared across all symbols for this strategy
+      entry_interval: 30m              # strategy declares its own intervals here
+      regime_interval: 4h
+      leverage: 5
+      notional_per_trade_usdt: 100.0
+      # ...indicator periods, exit thresholds, etc.
+    # live_trade_manager:              # optional, omit if the strategy manages exits itself
+    #   enabled: true
+    #   params: {...}
 
 risk_guard:
   max_concurrent_positions: 3
@@ -88,15 +91,16 @@ logging:
 
 ### Adding a strategy
 
-1. Add a class in `core/strategies/your_strategy.py` extending `Strategy`. Implement `compute_signal(symbol, candles)` and `execute_open(signal)`.
+1. Add a class in `core/strategies/your_strategy.py` extending `Strategy`. Implement `compute_signal(symbol, candles)` and `execute_open(signal)`. In `__init__`, pass `intervals=[...]` to `super().__init__` — usually derived from `params` so config drives the timeframes (e.g. `params["entry_interval"]`, `params["regime_interval"]`).
 2. Register it in `core/strategies/__init__.py`'s `STRATEGIES` dict.
-3. Add an entry under `strategies:` in `config.yaml` with its `name`, `interval`, and `params`.
+3. Add an entry under `strategies:` in `config.yaml` with its `name` and `params` block. The strategy declares its own intervals via params — there is no top-level `interval` field.
 
 Strategies decide:
-- What action to take on each candle (`compute_signal`).
+- Which intervals they need (`self.intervals`) — the bot subscribes to one WebSocket stream per unique `(symbol, interval)` pair across all strategies.
+- What action to take on each closed candle (`_tick(symbol, interval)` — override for multi-interval routing, or rely on the default which calls `compute_signal`).
 - What `entry_price`, `stop_loss_price`, and `take_profit_price` to aim for.
 - How to actually enter the position (`execute_open` — IOC, market, layered limits, whatever).
-- Whether they want a `LiveTradeManager` for post-fill lifecycle (SL migration, partial-fill handling, stagnation, etc.) — subclass `LiveTradeManager` and override `on_open` / `on_update` / `on_close`.
+- Whether they want a `LiveTradeManager` for post-fill lifecycle tied to StateManager poll cadence (SL migration, partial-fill handling, stagnation) — subclass `LiveTradeManager` and override `on_open` / `on_update` / `on_close`. Strategies whose exit logic is tied to closed candles (not poll cadence) should skip the LTM and manage exits directly in `_tick`.
 
 ## Running
 
@@ -149,4 +153,4 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips integration 
 - `risk_guard.max_daily_loss_usdt` — once tripped, blocks new entries for the rest of the UTC day; existing positions run their course; a single warning email is sent; bot resumes next UTC day automatically.
 - `StateManager` cancels orphan orders (orders with no matching position) and warns on untracked positions (position with no exit orders), with a configurable grace window so freshly placed orders are not misclassified.
 - WebSocket gap recovery — on every candle close, missing candles after a reconnect are REST-fetched and back-filled before being delivered to strategies; a `[ws] gap-fill` warning is logged.
-- Per-strategy exit orders: the active `ema_trend_momentum` strategy places four reduceOnly exits on every position open (stop-limit, stop-market, trailing TP, GTC limit TP), all anchored to the actual fill price. Binance auto-cancels them when the position hits zero.
+- Per-strategy exit orders: the active `adaptive_trend_pullback` strategy places two reduceOnly exits per entry (an ATR-based stop-market and a GTX post-only TP1 limit at 1.5R for 40% of size), both anchored to the actual fill price. The runner's trailing stop is recomputed on every closed entry-interval candle (place-then-cancel) so the position is never momentarily unprotected. Trend-invalidation and dead-trade exits fire from inside the strategy on closed candles.

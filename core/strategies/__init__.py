@@ -1,8 +1,8 @@
 """Strategy registry. Add a new strategy class and register it in STRATEGIES."""
 
+from core.strategies.adaptive_trend_pullback import AdaptiveTrendPullback
 from core.strategies.base import Strategy
-from core.strategies.ema_trend_momentum import EmaTrendMomentum
 
 STRATEGIES: dict[str, type[Strategy]] = {
-    "ema_trend_momentum": EmaTrendMomentum,
+    "adaptive_trend_pullback": AdaptiveTrendPullback,
 }

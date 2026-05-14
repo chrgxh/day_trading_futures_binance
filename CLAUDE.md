@@ -28,9 +28,9 @@ day-trading-bot/
 │   ├── pnl_reporter.py          # Daily P&L CSV + email report (lifecycle owned by StateManager)
 │   └── strategies/
 │       ├── __init__.py          # STRATEGIES registry
-│       ├── base.py              # Strategy ABC — owns candle buffer, signal computation, execution
+│       ├── base.py              # Strategy ABC — multi-interval buffers, signal computation, execution
 │       ├── live_trade_manager.py# Optional per-strategy post-fill lifecycle hooks
-│       └── ema_trend_momentum.py# Active strategy
+│       └── adaptive_trend_pullback.py  # Active strategy
 ├── utils/
 │   ├── general.py               # build_client, with_retry, round_price, send_*_email, order normalizers
 │   ├── account.py               # Account state: connection, balances, positions, symbol info, leverage, trades
@@ -38,8 +38,8 @@ day-trading-bot/
 │   ├── algo_orders.py           # Conditional orders: stop/TP market and limit, cancel_algo
 │   ├── positions.py             # Position management: close_position
 │   ├── market.py                # Public market data: OHLCV, mark price, multi-(symbol,interval) WS with gap recovery
-│   └── indicators.py            # Raw indicators (SMA, EMA, MACD, ADX, RSI, resample_to_1h, interval_to_minutes)
-├── config.yaml                  # symbols, leverage, strategies list, risk_guard, state_manager, logging
+│   └── indicators.py            # Raw indicators (SMA, EMA, MACD, ADX, ATR, RSI, daily_anchored_vwap, resample_to_1h)
+├── config.yaml                  # symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 ├── .env                         # Secrets ONLY — never committed
 ├── .env.example
 ├── .env.testnet                 # Testnet secrets for integration tests — never committed
@@ -58,7 +58,7 @@ day-trading-bot/
 │   │   ├── test_risk_guard.py
 │   │   ├── test_live_trade_manager.py
 │   │   ├── test_strategy_base.py
-│   │   └── test_ema_trend_momentum.py
+│   │   └── test_adaptive_trend_pullback.py
 │   └── integration/             # Testnet integration tests
 │       ├── conftest.py
 │       ├── test_account.py
@@ -106,19 +106,31 @@ Stateless gate. `allow_open(symbol, strategy)` returns False if:
 
 ### Strategy (ABC)
 One instance per strategy entry in config. Each strategy:
-- Owns a per-symbol candle buffer (private state).
+- Declares one or more `intervals` (derived from `params` such as `entry_interval` and `regime_interval`) — the bot subscribes to a WebSocket stream for every `(symbol, interval)` pair across all strategies.
+- Owns a per-`(symbol, interval)` candle buffer (`self._buffers[symbol][interval]`).
 - Implements `compute_signal(symbol, candles) -> Signal | None` — pure decision logic, returns a `Signal` with `entry_price`, `stop_loss_price`, `take_profit_price` for OPEN actions.
 - Implements `execute_open(signal)` — owns the entry mechanics (IOC, market, layered limits, whatever) and places its own exit orders via broker primitives.
 - Calls `state_manager.mark_change(symbol)` before/after placing orders to suppress orphan warnings during the grace window.
-- Optionally owns a `LiveTradeManager` (per-strategy lifecycle hooks).
+- Optionally owns a `LiveTradeManager` (per-strategy lifecycle hooks tied to StateManager poll cadence). Strategies whose lifecycle decisions are tied to closed candles (not poll cadence) skip the LTM and manage exits directly in `_tick`.
 
-`on_candle(symbol, candle)` is the only entry point the bot calls. It updates the buffer, checks `state_manager.has_position(symbol)` (skip if any position exists — first strategy in config wins), runs `compute_signal`, and if it's an OPEN action calls `risk_guard.allow_open`, then `execute_open`.
+`on_candle(symbol, interval, candle)` is the only entry point the bot calls. The default `_tick(symbol, interval)` updates the buffer, checks `state_manager.has_position(symbol)`, runs `compute_signal`, and dispatches to `risk_guard.allow_open` / `execute_open`. Multi-interval strategies override `_tick` to coordinate across intervals (e.g. higher-TF regime filter + lower-TF execution).
 
 ### LiveTradeManager (optional, per-strategy)
 Base class with three override points: `on_open(symbol)`, `on_update(state)`, `on_close(symbol)`. Subscribes to `StateManager` updates. The base class has no behavior — concrete subclasses implement strategy-specific lifecycle logic (e.g. SL migration, partial-fill re-stop, stagnation exits). Configured per strategy in `config.yaml`; absent if a strategy doesn't need it.
 
-### Active strategy: `ema_trend_momentum`
-Five-gate entry: (1) fast/slow EMA alignment, (2) price above/below 1h 200 EMA (resampled from the strategy's sub-hourly buffer), (3) RVOL spike, (4) RSI band, (5) ADX ≥ `min_adx`. Computes `entry_price` (candle close) and SL/TP prices from percentages in `params` — the per-strategy SL/TP calculation will be reworked later. Execution is IOC limit, chasing best ask/bid until filled or price drifts beyond `max_price_deviation_pct`. After fill places four reduceOnly exits (stop-limit, stop-market, trailing TP, GTC limit TP) anchored to the actual fill price.
+### Active strategy: `adaptive_trend_pullback`
+Multi-timeframe trend-pullback system. Both intervals (`entry_interval`, `regime_interval`) and every indicator period are configurable in `params`.
+
+- **Regime filter (regime_interval, e.g. 4h):** longs require `close > EMA_slow`, `EMA_fast > EMA_slow`, and positive `EMA_fast` slope over `regime_slope_lookback` bars. Shorts inverse.
+- **Entry gates (entry_interval, e.g. 30m, longs; shorts inverse):** pullback (at least one of the last `pullback_lookback` prior bar lows within `pullback_proximity_pct` of `EMA_fast` or daily-anchored VWAP), close > prev close, bullish close, volume > volume_SMA, ADX > `adx_min`, ATR > SMA(ATR), RSI < `rsi_max_long`, close > `EMA_fast`, close > pullback high. Daily-anchored VWAP resets at UTC 00:00 and is toggled via `vwap_enabled`.
+- **SL/TP per signal:** stop = close − `stop_atr_mult` × ATR; TP1 = close + `tp1_r_multiple` × R, sized to `tp1_size_pct` of filled qty, placed as GTX post-only LIMIT reduce-only (retries `tp1_retry_attempts` times on rejection, then accepts no-TP1 with a warning).
+- **Entry execution:** IOC limit chasing best ask/bid, re-quoting every `ioc_poll_secs` (default 3s — rate-limit-safe) until filled, drifted past `max_price_deviation_pct`, or `entry_timeout_secs` elapsed.
+- **Exits managed inside the strategy on every closed entry-interval candle** (no LiveTradeManager). Three checks per candle, in order:
+  1. **Trend invalidation** (exit on any): close beyond `invalidation_structure_lookback`-bar low/high (structure break); `EMA_fast` slope flip; close beyond `EMA_fast` by ≥ `invalidation_strong_close_atr_mult` × ATR against the position; ADX drop > `invalidation_momentum_adx_drop` over last `invalidation_momentum_lookback` bars AND ADX < `invalidation_momentum_adx_floor` (momentum collapse).
+  2. **Dead-trade exit** (only after `candles_since_entry > dead_trade_min_candles`, exit on all): ADX < ADX `dead_trade_adx_lookback` bars ago AND ADX < `dead_trade_adx_floor`; ATR < SMA(ATR, `atr_sma_period`); unrealized PnL per unit < `dead_trade_r_floor` × R. Rechecked every closed entry-interval candle.
+  3. **Trailing stop update:** trail = `highest_close_since_entry` − `trail_atr_mult` × ATR (inverted for shorts). Only moved when more favorable. Place-then-cancel ordering (new stop placed first, then old one cancelled) so the position is never momentarily unprotected.
+- **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
+- **Restart recovery:** pre-existing positions are not adopted. Internal `_ManagedPosition` state (entry ATR, R distance, highest close) is in-memory only.
 
 ### Multi-strategy on the same symbol
 Symbol ownership is absolute and short-lived. The first strategy in `config.yaml.strategies` that fires on a given symbol opens the position; every other strategy sees `state_manager.has_position(symbol) == True` and stays silent until the position closes. Strategies do not coordinate directly — they coordinate through StateManager.

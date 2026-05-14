@@ -1,10 +1,10 @@
-"""Unit tests for rsi() and resample_to_1h() in utils/indicators.py."""
+"""Unit tests for indicators in utils/indicators.py."""
 
 from decimal import Decimal
 
 import pytest
 
-from utils.indicators import resample_to_1h, rsi
+from utils.indicators import atr, daily_anchored_vwap, resample_to_1h, rsi
 
 D = Decimal
 MS_15M = 900_000
@@ -103,3 +103,82 @@ def test_resample_preserves_chronological_order():
     result = resample_to_1h(candles)
     assert len(result) == 4
     assert [b["open_time"] for b in result] == [0, MS_1H, 2 * MS_1H, 3 * MS_1H]
+
+
+# ---------------------------------------------------------------------------
+# atr — Wilder's true range with smoothing
+# ---------------------------------------------------------------------------
+
+def test_atr_returns_empty_when_insufficient_data():
+    candles = [_candle(i * MS_15M, 10, 11, 9, 10.5, 100) for i in range(10)]
+    assert atr(candles, period=14) == []
+
+
+def test_atr_constant_range_equals_range():
+    # Every candle has high-low = 2, no overnight gaps → TR = 2 everywhere → ATR = 2
+    candles = [_candle(i * MS_15M, 10, 11, 9, 10, 100) for i in range(30)]
+    series = atr(candles, period=14)
+    assert series
+    assert all(abs(v - 2.0) < 1e-9 for v in series)
+
+
+def test_atr_handles_gap_via_close_diff():
+    # A gap-up makes |high - prev_close| the true range, not high - low.
+    candles = [
+        _candle(0, 10, 11, 9, 10.5, 100),
+        _candle(MS_15M, 20, 21, 19, 20.5, 100),  # huge gap up
+    ]
+    # Only 2 candles → ATR needs period+1 minimum, this is a smoke check it
+    # returns empty rather than crashes.
+    assert atr(candles, period=14) == []
+
+
+def test_atr_length_matches_formula():
+    n = 30
+    candles = [_candle(i * MS_15M, 10, 11 + (i % 3), 9 - (i % 2), 10, 100) for i in range(n)]
+    series = atr(candles, period=14)
+    # Wilder: len(TR)=n-1, ATR series length = (n-1) - period + 1 = n - period
+    assert len(series) == n - 14
+
+
+# ---------------------------------------------------------------------------
+# daily_anchored_vwap — resets every UTC midnight
+# ---------------------------------------------------------------------------
+
+MS_PER_DAY = 86_400_000
+
+
+def test_vwap_empty_returns_empty():
+    assert daily_anchored_vwap([]) == []
+
+
+def test_vwap_constant_price_equals_price():
+    # All candles same price → VWAP = typical = close
+    candles = [_candle(i * MS_15M, 10, 10, 10, 10, 100) for i in range(20)]
+    series = daily_anchored_vwap(candles)
+    assert len(series) == 20
+    assert all(abs(v - 10.0) < 1e-9 for v in series)
+
+
+def test_vwap_resets_at_utc_midnight():
+    # Day 1 has high prices, day 2 has low prices. Day 2 VWAP must NOT inherit day 1.
+    day1 = [_candle(t, 100, 100, 100, 100, 50) for t in range(0, MS_PER_DAY, MS_15M)]
+    day2 = [_candle(MS_PER_DAY + t, 10, 10, 10, 10, 50) for t in range(0, MS_PER_DAY, MS_15M)]
+    series = daily_anchored_vwap(day1 + day2)
+    # Last day-1 value ≈ 100; first day-2 value must be 10 (reset), not a blend.
+    assert abs(series[len(day1) - 1] - 100.0) < 1e-9
+    assert abs(series[len(day1)] - 10.0) < 1e-9
+
+
+def test_vwap_volume_weighting():
+    # Two candles in same UTC day:
+    #   bar 0: price 10, volume 100  → contributes 10*100 = 1000 PV
+    #   bar 1: price 20, volume 300  → contributes 20*300 = 6000 PV
+    # VWAP after bar 1 = (1000+6000) / (100+300) = 17.5
+    candles = [
+        _candle(0, 10, 10, 10, 10, 100),
+        _candle(MS_15M, 20, 20, 20, 20, 300),
+    ]
+    series = daily_anchored_vwap(candles)
+    assert abs(series[0] - 10.0) < 1e-9
+    assert abs(series[1] - 17.5) < 1e-9

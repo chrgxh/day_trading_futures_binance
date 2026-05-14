@@ -6,55 +6,72 @@ symbols:
   - BNBUSDT
   - LINKUSDT
 
-leverage: 20
-
-# Strategies. Each entry runs at its own interval over all symbols. If two
-# strategies fire on the same symbol simultaneously, the one listed first wins.
-# Params are shared across all symbols for that strategy.
+# Strategies. Each strategy declares its own intervals (in params) and runs over
+# every symbol above. If two strategies fire on the same symbol simultaneously,
+# the one listed first wins (one position per symbol, absolute).
 strategies:
-  - name: ema_trend_momentum
-    interval: 15m
+  - name: adaptive_trend_pullback
     params:
-      # Position sizing
-      max_position_size_usdt: 2000.0     # USDT notional per position
+      # ---- Intervals (drive WebSocket subscriptions + buffer wiring) -------
+      entry_interval: 30m        # all entry, exit, and trail decisions fire on close
+      regime_interval: 4h        # macro trend filter, read-only
 
-      # Indicator periods (must match the interval — see tuning guide below)
-      fast_period: 9
-      slow_period: 21
-      trend_period: 200                  # 1h EMA — interval-independent
-      rsi_period: 14
-      volume_lookback: 20
+      # ---- Sizing & leverage ----------------------------------------------
+      leverage: 5                # set per-symbol at startup
+      notional_per_trade_usdt: 100.0   # full USDT notional per entry; qty = notional / entry_price
+
+      # ---- Regime filter (regime_interval) --------------------------------
+      regime_ema_fast: 50
+      regime_ema_slow: 200
+      regime_slope_lookback: 5   # EMA_fast[-1] vs EMA_fast[-1-N]
+
+      # ---- 30m entry indicators -------------------------------------------
+      ema_fast: 50               # EMA on entry_interval (used for pullback + slope + close gate)
+      slope_lookback: 5
       adx_period: 14
+      adx_min: 20
+      atr_period: 14
+      atr_sma_period: 20         # "ATR > rolling avg" filter; also reused in dead-trade check
+      rsi_period: 14
+      rsi_max_long: 70
+      rsi_min_short: 30
+      volume_sma_period: 20
 
-      # Entry gates
-      volume_multiplier: 1.5
-      rsi_long_low: 50
-      rsi_long_high: 70
-      rsi_short_low: 30
-      rsi_short_high: 50
-      min_adx: 27
+      # ---- Pullback definition --------------------------------------------
+      # Directional touch: for LONGS the bar's LOW must reach down to (or below)
+      # EMA_fast/VWAP — a small tolerance above is allowed for noisy wicks.
+      # For SHORTS the bar's HIGH must reach up to (or above) the reference.
+      # This is intentionally tighter than a symmetric "within X%" check, which
+      # passes nearly every bar in a trending market.
+      pullback_lookback: 3              # number of PRIOR bars to scan
+      pullback_proximity_pct: 0.05      # wick tolerance above (long) / below (short) the reference
+      vwap_enabled: true                # daily-anchored VWAP at UTC 00:00; false → EMA-only
 
-      # Exit pricing (placeholder — strategy will own this fully in a later pass)
-      stop_loss_pct: 0.4
-      stop_loss_market_pct: 0.6
-      take_profit_pct: 3.0
-      trailing_take_profit_activation_pct: 1.0
-      trailing_take_profit_callback_rate: 0.5
+      # ---- Entry execution (IOC chase) ------------------------------------
+      max_price_deviation_pct: 0.15     # walk-away cap vs signal entry price
+      ioc_poll_secs: 3.0                # re-quote cadence; 3s keeps us well under rate limits
+      entry_timeout_secs: 60.0          # hard cap on the entire IOC loop
 
-      # Entry execution
-      max_price_deviation_pct: 0.3
-    live_trade_manager:
-      enabled: false  # base LiveTradeManager has no behavior yet; enable when a subclass is in place
+      # ---- Exits: stop, TP1, trail ----------------------------------------
+      stop_atr_mult: 1.5                # initial stop distance from fill (in ATRs)
+      tp1_r_multiple: 1.5               # TP1 distance from fill (in R)
+      tp1_size_pct: 0.40                # fraction of filled qty placed at TP1
+      tp1_retry_attempts: 2             # retries when GTX rejected (would be taker)
+      tp1_retry_interval_secs: 3.0
+      trail_atr_mult: 2.0               # trail = max_close - 2*ATR (recomputed each closed entry candle)
 
-# Tuning guide — keep periods in sync with `interval`:
-#   interval │ fast │ slow │ rsi_period │ volume_lookback
-#   ─────────┼──────┼──────┼────────────┼────────────────
-#   1m       │  3–5 │ 8–13 │      9     │      10
-#   5m       │  6–9 │13–21 │     14     │      15
-#   15m      │   9  │  21  │     14     │      20   ← current
-#   1h       │ 9–12 │21–26 │     14     │      20
-#   4h       │ 9–12 │21–26 │     14     │      14
-# RSI bands and trend_period are interval-independent.
+      # ---- Exits: trend invalidation (any-of, on every closed entry candle)
+      invalidation_structure_lookback: 20      # close below N-bar low (long) / above N-bar high (short)
+      invalidation_strong_close_atr_mult: 0.5  # close beyond EMA_fast by >= mult*ATR against position
+      invalidation_momentum_lookback: 3        # ADX drop measured over last K bars
+      invalidation_momentum_adx_drop: 5        # ADX must drop by more than this AND
+      invalidation_momentum_adx_floor: 20      # ADX must be below this for collapse exit
+
+      # ---- Exits: dead trade (after candle N, all-of) ----------------------
+      dead_trade_min_candles: 24        # candles since entry before the gate engages
+      dead_trade_adx_lookback: 6        # ADX[0] < ADX[-N] AND ADX < floor
+      dead_trade_adx_floor: 22
+      dead_trade_r_floor: 1.0           # unrealized PnL per unit < N*R
 
 risk_guard:
   max_concurrent_positions: 3
@@ -74,3 +91,36 @@ logging:
   rotation: "10 MB"
   retention: "7 days"
   debug_log_file: logs/bot.debug.log
+
+# ---------------------------------------------------------------------------
+# Example: adding a second strategy with a LiveTradeManager (commented out).
+#
+# Strategies run in the order they appear here — the first to fire on a symbol
+# wins. A LiveTradeManager subscribes to StateManager updates and gets hooks
+# (on_open / on_update / on_close) for per-strategy post-fill lifecycle logic.
+# Most strategies (including adaptive_trend_pullback above) don't need one
+# because they react to closed candles, not poll cadence.
+# ---------------------------------------------------------------------------
+#
+# strategies:
+#   - name: adaptive_trend_pullback   # first strategy keeps its block above
+#     params:
+#       entry_interval: 30m
+#       regime_interval: 4h
+#       leverage: 5
+#       notional_per_trade_usdt: 100.0
+#       # ...rest of params...
+#
+#   - name: example_other_strategy    # second strategy at a different interval
+#     params:
+#       entry_interval: 5m
+#       leverage: 3
+#       notional_per_trade_usdt: 50.0
+#       # ...strategy-specific params...
+#     live_trade_manager:
+#       enabled: true                 # mount a LiveTradeManager for this strategy
+#       params:
+#         # Strategy-specific lifecycle parameters consumed by the LTM subclass,
+#         # e.g. break-even trigger, partial-TP thresholds, stagnation timeouts.
+#         break_even_at_r: 1.0
+#         stagnation_max_candles: 40

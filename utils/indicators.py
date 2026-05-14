@@ -140,6 +140,85 @@ def rsi(prices: list, period: int = 14) -> float:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
+def atr(candles: list[dict], period: int = 14) -> list[float]:
+    """Average True Range using Wilder's smoothing.
+
+    Returns the ATR series aligned to candles (length = len(candles) - period).
+    The element at index i corresponds to the ATR computed over candles[i:i+period+1].
+    Returns an empty list if there are fewer than period + 1 candles.
+    Arithmetic is performed in float for performance.
+
+    Args:
+        candles: OHLCV dicts in chronological order; each must have 'high', 'low', 'close'.
+        period: Wilder smoothing period (default 14).
+    """
+    if len(candles) < period + 1:
+        return []
+
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
+
+    trs: list[float] = []
+    for i in range(1, len(candles)):
+        h, l, prev_c = highs[i], lows[i], closes[i - 1]
+        trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+
+    atr_val = sum(trs[:period]) / period
+    result: list[float] = [atr_val]
+    for tr in trs[period:]:
+        atr_val = (atr_val * (period - 1) + tr) / period
+        result.append(atr_val)
+    return result
+
+
+def daily_anchored_vwap(candles: list[dict], anchor_hour_utc: int = 0) -> list[float]:
+    """Daily-anchored VWAP that resets each UTC day at `anchor_hour_utc`.
+
+    Volume-weighted average of typical price (high+low+close)/3 over each
+    anchor-to-anchor window. Returns one value per input candle so callers can
+    align it with closes_30m[i] etc.
+
+    Args:
+        candles: OHLCV dicts with 'open_time' in milliseconds, 'high', 'low',
+            'close', and 'volume' fields.
+        anchor_hour_utc: Hour of day (0-23 UTC) at which the running VWAP resets.
+
+    Returns:
+        List of VWAP values, one per candle. Empty if `candles` is empty.
+    """
+    if not candles:
+        return []
+
+    ms_per_hour = 3_600_000
+    ms_per_day = 86_400_000
+    anchor_offset_ms = anchor_hour_utc * ms_per_hour
+
+    result: list[float] = []
+    cum_pv = 0.0
+    cum_v = 0.0
+    current_day_bucket: Optional[int] = None
+
+    for c in candles:
+        adj = c["open_time"] - anchor_offset_ms
+        day_bucket = adj // ms_per_day
+        if day_bucket != current_day_bucket:
+            cum_pv = 0.0
+            cum_v = 0.0
+            current_day_bucket = day_bucket
+
+        h = float(c["high"])
+        l = float(c["low"])
+        cl = float(c["close"])
+        v = float(c["volume"])
+        typical = (h + l + cl) / 3.0
+        cum_pv += typical * v
+        cum_v += v
+        result.append(cum_pv / cum_v if cum_v > 0 else typical)
+
+    return result
+
+
 def resample_to_1h(candles: list[dict]) -> list[dict]:
     """Aggregate sub-hourly OHLCV candles into complete 1h bars.
 

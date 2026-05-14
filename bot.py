@@ -95,7 +95,6 @@ def build_strategies(
         cls = STRATEGIES[name]
         strategy = cls(
             name=name,
-            interval=entry["interval"],
             symbols=symbols,
             params=entry.get("params", {}),
             client=client,
@@ -105,29 +104,33 @@ def build_strategies(
             live_trade_manager=ltm,
         )
         strategies.append(strategy)
-        logger.info("Built strategy {} @ {} (ltm={})", name, entry["interval"], ltm is not None)
+        logger.info("Built strategy {} @ {} (ltm={})", name, strategy.intervals, ltm is not None)
     return strategies
 
 
 def unique_intervals(strategies: Iterable[Strategy]) -> list[str]:
     seen: list[str] = []
     for s in strategies:
-        if s.interval not in seen:
-            seen.append(s.interval)
+        for interval in s.intervals:
+            if interval not in seen:
+                seen.append(interval)
     return seen
 
 
 def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) -> None:
+    # Group (strategy, interval) requests by interval; fetch enough candles per
+    # symbol to satisfy the most-demanding strategy at that interval.
     by_interval: dict[str, list[Strategy]] = {}
     for s in strategies:
-        by_interval.setdefault(s.interval, []).append(s)
+        for interval in s.intervals:
+            by_interval.setdefault(interval, []).append(s)
     for interval, ss in by_interval.items():
-        limit = max(s.candle_limit() for s in ss)
+        limit = max(s.candle_limit(interval) for s in ss)
         logger.info("Warmup @ {}: fetching {} candles per symbol", interval, limit)
         for symbol in symbols:
             candles = market.get_futures_ohlcv(client, symbol, interval, limit=limit)
             for s in ss:
-                s.warmup(symbol, candles)
+                s.warmup(symbol, interval, candles)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +207,8 @@ def _run() -> None:
 
     by_interval: dict[str, list[Strategy]] = {}
     for s in strategies:
-        by_interval.setdefault(s.interval, []).append(s)
+        for interval in s.intervals:
+            by_interval.setdefault(interval, []).append(s)
 
     try:
         while not shutdown.is_set():
@@ -214,7 +218,7 @@ def _run() -> None:
             symbol, interval, candle = item
             for s in by_interval.get(interval, []):
                 if symbol in s.symbols:
-                    s.on_candle(symbol, candle)
+                    s.on_candle(symbol, interval, candle)
     finally:
         state_manager.stop()
         twm.stop()

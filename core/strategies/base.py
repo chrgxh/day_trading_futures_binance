@@ -1,14 +1,17 @@
 """Strategy ABC.
 
 A Strategy owns:
-- a candle buffer per symbol (its private state)
+- a per-(symbol, interval) candle buffer (its private state)
 - the signal computation (compute_signal)
-- the execution mechanics (execute_open / execute_close) — IOC, market, layered limits, etc.
-- an optional LiveTradeManager for post-fill lifecycle
+- the execution mechanics (execute_open) — IOC, market, layered limits, etc.
+- an optional LiveTradeManager for post-fill lifecycle (most strategies don't need it)
 
-The bot is dumb routing only. It calls strategy.on_candle(symbol, candle); the strategy
-is responsible for everything else, including consulting the StateManager to check whether
-the symbol is held (one-position-per-symbol rule is enforced via RiskGuard before any entry).
+A strategy can subscribe to multiple intervals (e.g. a 4h regime filter + a 30m
+execution timeframe). The bot is dumb routing only. It calls
+strategy.on_candle(symbol, interval, candle); the strategy is responsible for
+everything else, including consulting the StateManager to check whether the
+symbol is held (one-position-per-symbol absolute, enforced via RiskGuard before
+any entry).
 """
 
 from __future__ import annotations
@@ -28,16 +31,17 @@ if TYPE_CHECKING:
 
 
 class Strategy(ABC):
-    """Per-strategy class. One instance handles all symbols at one interval.
+    """Per-strategy class. One instance handles all symbols at one or more intervals.
 
-    Subclasses implement compute_signal(symbol) -> Signal and the open/close execution.
+    Subclasses implement compute_signal and execute_open. Multi-interval strategies
+    can override _tick(symbol, interval) for cross-interval routing.
     """
 
     def __init__(
         self,
         *,
         name: str,
-        interval: str,
+        intervals: list[str],
         symbols: list[str],
         params: dict,
         client: Client,
@@ -46,8 +50,10 @@ class Strategy(ABC):
         risk_guard: "RiskGuard",
         live_trade_manager: Optional["LiveTradeManager"] = None,
     ) -> None:
+        if not intervals:
+            raise ValueError(f"Strategy {name!r} requires at least one interval")
         self.name = name
-        self.interval = interval
+        self.intervals = list(intervals)
         self.symbols = symbols
         self.params = params
         self.client = client
@@ -55,7 +61,9 @@ class Strategy(ABC):
         self.state_manager = state_manager
         self.risk_guard = risk_guard
         self.live_trade_manager = live_trade_manager
-        self._buffers: dict[str, list[dict]] = {s: [] for s in symbols}
+        self._buffers: dict[str, dict[str, list[dict]]] = {
+            s: {i: [] for i in self.intervals} for s in symbols
+        }
 
         if live_trade_manager is not None:
             live_trade_manager.attach(self)
@@ -65,44 +73,51 @@ class Strategy(ABC):
     def tag(self) -> str:
         return f"[{self.name}]"
 
-    def candle_limit(self) -> int:
-        """Number of warmup candles this strategy needs per symbol. Override if more is needed."""
+    def candle_limit(self, interval: str) -> int:
+        """Number of warmup candles this strategy needs per (symbol, interval).
+
+        Override to tune per-interval. Default 250 covers most indicator warmup needs.
+        """
         return 250
 
-    def warmup(self, symbol: str, candles: list[dict]) -> None:
-        """Seed the per-symbol candle buffer with REST history."""
-        self._buffers[symbol] = list(candles)
-        logger.info("{} {} warmup: {} candles", self.tag, symbol, len(candles))
+    def warmup(self, symbol: str, interval: str, candles: list[dict]) -> None:
+        """Seed the per-symbol, per-interval candle buffer with REST history."""
+        self._buffers[symbol][interval] = list(candles)
+        logger.info("{} {} {} warmup: {} candles", self.tag, symbol, interval, len(candles))
 
-    def on_candle(self, symbol: str, candle: dict) -> None:
-        """Append the closed candle, check eligibility, run the strategy."""
-        self._append_candle(symbol, candle)
+    def on_candle(self, symbol: str, interval: str, candle: dict) -> None:
+        """Append the closed candle and run the strategy tick."""
+        self._append_candle(symbol, interval, candle)
         try:
-            self._tick(symbol)
+            self._tick(symbol, interval)
         except Exception as exc:
-            logger.exception("{} {} tick error: {}", self.tag, symbol, exc)
+            logger.exception("{} {} {} tick error: {}", self.tag, symbol, interval, exc)
 
-    def _append_candle(self, symbol: str, candle: dict) -> None:
-        buf = self._buffers[symbol]
+    def _append_candle(self, symbol: str, interval: str, candle: dict) -> None:
+        buf = self._buffers[symbol][interval]
         if buf and candle["open_time"] == buf[-1]["open_time"]:
             buf[-1] = candle
         else:
             buf.append(candle)
-            limit = self.candle_limit()
+            limit = self.candle_limit(interval)
             if len(buf) > limit:
                 del buf[: len(buf) - limit]
 
-    def _tick(self, symbol: str) -> None:
-        """One tick: skip if symbol is held by anything, else compute and act."""
+    def _tick(self, symbol: str, interval: str) -> None:
+        """Default tick: skip if symbol is held, else compute and act.
+
+        Single-interval strategies can rely on this. Multi-interval strategies
+        should override to coordinate across intervals.
+        """
         # If any position exists on this symbol — opened by us, another strategy,
         # or pre-existing on restart — this strategy stays silent. One-per-symbol absolute.
         if self.state_manager.has_position(symbol):
             return
 
-        signal = self.compute_signal(symbol, self._buffers[symbol])
+        signal = self.compute_signal(symbol, self._buffers[symbol][interval])
         if signal is None:
             return
-        logger.info("{} {} {} — {}", self.tag, symbol, signal.action.value, signal.reason)
+        logger.info("{} {} {} {} — {}", self.tag, symbol, interval, signal.action.value, signal.reason)
 
         from core.types import Action
         if signal.action not in (Action.OPEN_LONG, Action.OPEN_SHORT):
