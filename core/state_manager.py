@@ -19,11 +19,13 @@ import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from binance.client import Client
 from loguru import logger
 
+from core.position_store import PositionStore
 from core.types import Position, SymbolState
 from utils import account, algo_orders, orders
 
@@ -40,6 +42,7 @@ class StateManager:
         grace_period_secs: int = 15,
         pnl_refresh_every_n_polls: int = 6,
         pnl_reporter: Optional["DailyPnLReporter"] = None,  # noqa: F821 (forward)
+        positions_file: Path | str | None = None,
     ) -> None:
         self._client = client
         self._symbols = list(symbols)
@@ -60,6 +63,14 @@ class StateManager:
         self._daily_pnl: Decimal = Decimal("0")
         self._trade_count: int = 0
         self._daily_pnl_day: str = ""  # YYYY-MM-DD UTC of last refresh
+
+        # Persistent ownership store. Loaded eagerly so strategies can call
+        # get_owner() during adopt_pre_existing before start() runs.
+        self._store: PositionStore | None = None
+        if positions_file is not None:
+            self._store = PositionStore(positions_file)
+            self._store.load()
+        self._known_strategies: set[str] = set()
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -136,6 +147,95 @@ class StateManager:
         return time.time() < self._grace_until.get(symbol, 0.0)
 
     # ------------------------------------------------------------------
+    # Persistent ownership (positions.json)
+    # ------------------------------------------------------------------
+
+    def attach_strategy(self, name: str) -> None:
+        """Mark a strategy as currently configured. Owners not in this set are
+        pruned from the persistent store (their position is left untouched on
+        Binance — see [state] log line)."""
+        with self._lock:
+            self._known_strategies.add(name)
+
+    def get_owner(self, symbol: str) -> Optional[dict[str, Any]]:
+        """Return the persisted ownership entry for `symbol`, or None.
+
+        Strategies call this in `adopt_pre_existing` to recover the state they
+        were managing before restart.
+        """
+        if self._store is None:
+            return None
+        with self._lock:
+            return self._store.get(symbol)
+
+    def register_owner(
+        self,
+        symbol: str,
+        *,
+        strategy_name: str,
+        side: str,
+        entry_price: Any,
+        qty: Any,
+        strategy_state: dict[str, Any],
+        orders: dict[str, Any],
+    ) -> None:
+        """Record that `strategy_name` owns the position on `symbol`. Persists immediately."""
+        if self._store is None:
+            return
+        with self._lock:
+            self._store.upsert(
+                symbol,
+                strategy=strategy_name, side=side,
+                entry_price=entry_price, qty=qty,
+                strategy_state=strategy_state, orders=orders,
+            )
+            self._store.save()
+
+    def update_owner(
+        self,
+        symbol: str,
+        *,
+        strategy_state: dict[str, Any] | None = None,
+        orders: dict[str, Any] | None = None,
+        qty: Any | None = None,
+    ) -> None:
+        """Patch a subset of fields on the owner entry. No-op if symbol absent."""
+        if self._store is None:
+            return
+        with self._lock:
+            self._store.patch(symbol, strategy_state=strategy_state, orders=orders, qty=qty)
+            self._store.save()
+
+    def unregister_owner(self, symbol: str) -> None:
+        if self._store is None:
+            return
+        with self._lock:
+            if self._store.remove(symbol):
+                self._store.save()
+
+    def _prune_and_save_store(self) -> None:
+        """Drop entries whose position no longer exists on Binance or whose
+        strategy is no longer configured. Then persist."""
+        if self._store is None:
+            return
+        with self._lock:
+            for symbol, entry in self._store.all().items():
+                state = self._states.get(symbol)
+                if state is not None and state.position == Position.NONE:
+                    if self._store.remove(symbol):
+                        logger.info("[state] {} position closed — dropped owner entry", symbol)
+                    continue
+                owner_strategy = entry.get("strategy")
+                if owner_strategy not in self._known_strategies:
+                    if self._store.remove(symbol):
+                        logger.warning(
+                            "[state] {} owner strategy {!r} not registered — dropped entry; "
+                            "position left untracked on Binance",
+                            symbol, owner_strategy,
+                        )
+            self._store.save()
+
+    # ------------------------------------------------------------------
     # Polling loop
     # ------------------------------------------------------------------
 
@@ -202,6 +302,8 @@ class StateManager:
                     cb(state)
                 except Exception as exc:
                     logger.warning("[state] subscriber error for {}: {}", symbol, exc)
+
+        self._prune_and_save_store()
 
     def _log_diff(self, prev: SymbolState | None, new: SymbolState) -> None:
         """Log only when something meaningful changed."""

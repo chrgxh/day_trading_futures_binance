@@ -69,6 +69,10 @@ class Strategy(ABC):
             live_trade_manager.attach(self)
             state_manager.subscribe(live_trade_manager.on_state_update)
 
+        # Register with the persistent ownership store so its entries are not
+        # pruned as "unknown strategy" on poll.
+        state_manager.attach_strategy(self.name)
+
     @property
     def tag(self) -> str:
         return f"[{self.name}]"
@@ -140,3 +144,41 @@ class Strategy(ABC):
         After fill: place exit orders using signal.stop_loss_price / signal.take_profit_price,
         then register the trade with self.live_trade_manager (if attached).
         """
+
+    # ------------------------------------------------------------------
+    # Persistence hooks (override if the strategy needs restart recovery)
+    # ------------------------------------------------------------------
+
+    def serialize_state(self, symbol: str) -> dict:
+        """Return a JSON-serializable blob of strategy-specific state for `symbol`.
+
+        Stored under `strategy_state` in `state/positions.json`. The default
+        returns an empty dict — strategies that need restart recovery override.
+        """
+        return {}
+
+    def adopt(self, symbol: str, entry: dict) -> None:
+        """Rehydrate internal state for a position carried across restart.
+
+        `entry` is the persisted dict from PositionStore (keys: strategy, side,
+        entry_price, qty, strategy_state, orders, opened_at). The default is a
+        no-op — strategies that adopt override.
+        """
+        return
+
+    def adopt_pre_existing(self) -> None:
+        """Iterate persisted owner entries and adopt the ones owned by this strategy.
+
+        Called by `bot.py` between strategy construction and `state_manager.start()`.
+        Subclasses normally don't need to override — they override `adopt` instead.
+        """
+        for symbol in self.symbols:
+            entry = self.state_manager.get_owner(symbol)
+            if entry is None or entry.get("strategy") != self.name:
+                continue
+            try:
+                self.adopt(symbol, entry)
+                logger.info("{} {} adopted from persisted state (side={}, qty={})",
+                            self.tag, symbol, entry.get("side"), entry.get("qty"))
+            except Exception as exc:
+                logger.exception("{} {} adopt failed: {}", self.tag, symbol, exc)

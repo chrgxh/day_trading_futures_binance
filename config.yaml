@@ -81,6 +81,10 @@ state_manager:
   poll_interval_secs: 10
   grace_period_secs: 15
   pnl_refresh_every_n_polls: 6
+  # Persistent ownership store: maps live positions -> owning strategy + saved
+  # strategy_state + saved exit order IDs. Rewritten on every poll. On restart,
+  # strategies adopt entries whose positions still exist on Binance.
+  positions_file: state/positions.json
   pnl_reporter:
     enabled: true
     csv_file: logs/pnl.csv

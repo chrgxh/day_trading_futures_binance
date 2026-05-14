@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -425,3 +425,156 @@ def test_sync_keeps_managed_when_position_still_open():
     s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("1"))
     s._sync_managed("BTCUSDT")
     assert "BTCUSDT" in s._managed
+
+
+# ---------------------------------------------------------------------------
+# Persistence: serialize_state + adopt
+# ---------------------------------------------------------------------------
+
+def test_serialize_state_returns_managed_fields():
+    s = _build()
+    mp = _make_mp(side="LONG", entry=100.0, atr_val=2.0)
+    mp.highest_close = 110.0
+    mp.lowest_close = 95.0
+    mp.entry_candle_open_time = 123456
+    s._managed["BTCUSDT"] = mp
+    blob = s.serialize_state("BTCUSDT")
+    assert blob["entry_atr"] == 2.0
+    assert blob["r_distance"] == 3.0  # 1.5 * 2.0
+    assert blob["highest_close"] == 110.0
+    assert blob["lowest_close"] == 95.0
+    assert blob["entry_candle_open_time"] == 123456
+
+
+def test_serialize_state_empty_when_unmanaged():
+    s = _build()
+    assert s.serialize_state("BTCUSDT") == {}
+
+
+def test_adopt_skips_when_no_position():
+    s = _build()
+    s.state_manager.get_state.return_value = _state(position=Position.NONE)
+    entry = {
+        "strategy": "adaptive_trend_pullback", "side": "LONG",
+        "entry_price": "100", "qty": "1",
+        "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
+                           "highest_close": 100.0, "lowest_close": 100.0,
+                           "entry_candle_open_time": 0},
+        "orders": {"stop_loss_id": 7, "tp1_id": 8},
+    }
+    s.adopt("BTCUSDT", entry)
+    assert "BTCUSDT" not in s._managed
+
+
+def test_adopt_rehydrates_managed_position_when_orders_alive():
+    s = _build()
+    live_state = _state(position=Position.LONG, size=D("1"))
+    live_state.orders = [
+        {"order_id": 7, "side": "SELL", "is_algo": True, "order_type": "STOP_MARKET",
+         "stop_price": D("97")},
+        {"order_id": 8, "side": "SELL", "is_algo": False, "order_type": "LIMIT",
+         "price": D("103")},
+    ]
+    s.state_manager.get_state.return_value = live_state
+    entry = {
+        "strategy": "adaptive_trend_pullback", "side": "LONG",
+        "entry_price": "100", "qty": "1",
+        "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
+                           "highest_close": 108.0, "lowest_close": 100.0,
+                           "entry_candle_open_time": 42},
+        "orders": {"stop_loss_id": 7, "tp1_id": 8},
+    }
+    s.adopt("BTCUSDT", entry)
+    mp = s._managed["BTCUSDT"]
+    assert mp.side == "LONG"
+    assert mp.entry_price == D("100")
+    assert mp.entry_atr == 2.0
+    assert mp.r_distance == 3.0
+    assert mp.highest_close == 108.0
+    assert mp.entry_candle_open_time == 42
+    assert mp.current_stop_order_id == 7
+    assert mp.tp1_order_id == 8
+
+
+def test_adopt_replaces_missing_stop_long():
+    s = _build()
+    live_state = _state(position=Position.LONG, size=D("1"))
+    live_state.orders = []  # no SL on Binance
+    s.state_manager.get_state.return_value = live_state
+    entry = {
+        "strategy": "adaptive_trend_pullback", "side": "LONG",
+        "entry_price": "100", "qty": "1",
+        "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
+                           "highest_close": 100.0, "lowest_close": 100.0,
+                           "entry_candle_open_time": 0},
+        "orders": {"stop_loss_id": 99, "tp1_id": None},
+    }
+    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
+               return_value={"order_id": 123}) as place_stop:
+        s.adopt("BTCUSDT", entry)
+        place_stop.assert_called_once()
+        args, kwargs = place_stop.call_args
+        # symbol, side, qty, stop_price — entry - r_distance = 97
+        assert args[1] == "BTCUSDT"
+        assert args[2] == "SELL"
+        assert args[3] == D("1")
+        assert args[4] == D("97.0")
+    mp = s._managed["BTCUSDT"]
+    assert mp.current_stop_order_id == 123
+    assert mp.tp1_order_id is None
+
+
+def test_adopt_replaces_missing_stop_short():
+    s = _build()
+    live_state = _state(position=Position.SHORT, size=D("1"))
+    live_state.orders = []
+    s.state_manager.get_state.return_value = live_state
+    entry = {
+        "strategy": "adaptive_trend_pullback", "side": "SHORT",
+        "entry_price": "100", "qty": "1",
+        "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
+                           "highest_close": 100.0, "lowest_close": 100.0,
+                           "entry_candle_open_time": 0},
+        "orders": {"stop_loss_id": 99, "tp1_id": None},
+    }
+    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
+               return_value={"order_id": 456}) as place_stop:
+        s.adopt("BTCUSDT", entry)
+        args, _ = place_stop.call_args
+        # short: stop = entry + r_distance = 103, exit side BUY
+        assert args[2] == "BUY"
+        assert args[4] == D("103.0")
+    assert s._managed["BTCUSDT"].current_stop_order_id == 456
+
+
+def test_adopt_pre_existing_only_adopts_own_entries():
+    s = _build()
+    s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("1"))
+    s.state_manager.get_owner.side_effect = lambda sym: {
+        "BTCUSDT": {
+            "strategy": "adaptive_trend_pullback", "side": "LONG",
+            "entry_price": "100", "qty": "1",
+            "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
+                               "highest_close": 100.0, "lowest_close": 100.0,
+                               "entry_candle_open_time": 0},
+            "orders": {"stop_loss_id": None, "tp1_id": None},
+        },
+    }.get(sym)
+    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
+               return_value={"order_id": 999}):
+        s.adopt_pre_existing()
+    assert "BTCUSDT" in s._managed
+
+
+def test_adopt_pre_existing_ignores_other_strategy_entries():
+    s = _build()
+    s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("1"))
+    s.state_manager.get_owner.side_effect = lambda sym: {
+        "BTCUSDT": {
+            "strategy": "different_strategy", "side": "LONG",
+            "entry_price": "100", "qty": "1",
+            "strategy_state": {}, "orders": {},
+        },
+    }.get(sym)
+    s.adopt_pre_existing()
+    assert "BTCUSDT" not in s._managed

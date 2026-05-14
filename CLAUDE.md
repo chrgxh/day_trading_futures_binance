@@ -24,6 +24,7 @@ day-trading-bot/
 │   ├── __init__.py
 │   ├── types.py                 # Position, Action, Signal, SymbolState dataclasses
 │   ├── state_manager.py         # Single Binance poller, source of truth for live state
+│   ├── position_store.py        # Persistent JSON store: symbol → owning strategy + state + order IDs
 │   ├── risk_guard.py            # Entry gate: max positions, one-per-symbol, daily loss
 │   ├── pnl_reporter.py          # Daily P&L CSV + email report (lifecycle owned by StateManager)
 │   └── strategies/
@@ -55,6 +56,7 @@ day-trading-bot/
 │   │   ├── test_indicators.py
 │   │   ├── test_general.py
 │   │   ├── test_state_manager.py
+│   │   ├── test_position_store.py
 │   │   ├── test_risk_guard.py
 │   │   ├── test_live_trade_manager.py
 │   │   ├── test_strategy_base.py
@@ -68,6 +70,7 @@ day-trading-bot/
 │       ├── test_positions.py
 │       └── test_notifications.py
 ├── logs/                        # Mounted volume, not in image
+├── state/                       # Mounted volume — positions.json (owning-strategy cache)
 └── sandbox.ipynb                # Manual testnet notebook
 ```
 
@@ -82,7 +85,7 @@ day-trading-bot/
 ## Architecture
 
 ### Bot.py (thin orchestrator)
-Loads config, builds the Binance client, fetches symbol info once, builds `StateManager`, builds `RiskGuard`, builds the configured strategies, prefetches warmup candles per unique `(symbol, interval)`, opens a single WebSocket connection covering every `(symbol, interval)` pair, and routes closed candles to matching strategies. No strategy logic, no risk logic, no order placement.
+Loads config, builds the Binance client, fetches symbol info once, builds `StateManager` (which loads `state/positions.json`), builds `RiskGuard`, builds the configured strategies (each `attach_strategy`s itself to StateManager via the base class), prefetches warmup candles per unique `(symbol, interval)`, then calls `state_manager.start()` (sync poll + polling thread) and `strategy.adopt_pre_existing()` for each strategy to rehydrate any positions carried across restart. Finally opens a single WebSocket connection covering every `(symbol, interval)` pair and routes closed candles to matching strategies. No strategy logic, no risk logic, no order placement.
 
 ### StateManager
 Single Binance poller. On every `state_manager.poll_interval_secs`:
@@ -95,8 +98,25 @@ Single Binance poller. On every `state_manager.poll_interval_secs`:
 - Every `state_manager.pnl_refresh_every_n_polls`, refreshes daily net P&L and trade count by querying `account.get_futures_recent_trades` per symbol for the current UTC day.
 - Daily P&L resets at UTC midnight.
 - Optionally drives a `DailyPnLReporter` (CSV + email) at UTC midnight.
+- **Persistent ownership store (`state/positions.json`):** atomically rewritten on every poll. After updating `SymbolState`, prunes entries whose position is gone on Binance or whose owner strategy is no longer configured (warning logged for the latter). Strategies use `register_owner` / `update_owner` / `get_owner` to record and recover the strategy-specific state they need across restart. Binance is always the source of truth; the file is a cache.
 
 On `start()`, runs one synchronous poll before returning so callers see accurate state immediately (covers the restart-recovery case).
+
+### PositionStore (`core/position_store.py`)
+A thin JSON store keyed by symbol. Schema (versioned for future migrations):
+
+```
+{ "version": 1, "updated_at": "<UTC ISO>", "positions": {
+    "<SYMBOL>": {
+      "strategy": "<name>", "opened_at": "<UTC ISO>",
+      "side": "LONG"|"SHORT", "entry_price": "<dec>", "qty": "<dec>",
+      "strategy_state": { ... opaque blob owned by strategy ... },
+      "orders": { "stop_loss_id": <int>, "tp1_id": <int>, ... }
+    }, ...
+}}
+```
+
+Writes use a write-to-temp-then-rename so crashes never leave a partial file. A corrupt or wrong-version file is quarantined (`<file>.corrupt-<ts>`) and the store starts empty. Lifecycle is owned by `StateManager` — no other module touches it.
 
 ### RiskGuard
 Stateless gate. `allow_open(symbol, strategy)` returns False if:
@@ -111,6 +131,8 @@ One instance per strategy entry in config. Each strategy:
 - Implements `compute_signal(symbol, candles) -> Signal | None` — pure decision logic, returns a `Signal` with `entry_price`, `stop_loss_price`, `take_profit_price` for OPEN actions.
 - Implements `execute_open(signal)` — owns the entry mechanics (IOC, market, layered limits, whatever) and places its own exit orders via broker primitives.
 - Calls `state_manager.mark_change(symbol)` before/after placing orders to suppress orphan warnings during the grace window.
+- After a fill, calls `state_manager.register_owner(symbol, ...)` with the strategy-specific state needed to resume management after a restart; updates that entry via `state_manager.update_owner(...)` whenever local state or order IDs change (e.g. extrema, trailing stop replacement).
+- Overrides `serialize_state(symbol)` and `adopt(symbol, entry)` if it needs restart recovery. The base `adopt_pre_existing()` walks symbols, looks up the owner entry, and calls `adopt` for entries whose `strategy` matches `self.name`.
 - Optionally owns a `LiveTradeManager` (per-strategy lifecycle hooks tied to StateManager poll cadence). Strategies whose lifecycle decisions are tied to closed candles (not poll cadence) skip the LTM and manage exits directly in `_tick`.
 
 `on_candle(symbol, interval, candle)` is the only entry point the bot calls. The default `_tick(symbol, interval)` updates the buffer, checks `state_manager.has_position(symbol)`, runs `compute_signal`, and dispatches to `risk_guard.allow_open` / `execute_open`. Multi-interval strategies override `_tick` to coordinate across intervals (e.g. higher-TF regime filter + lower-TF execution).
@@ -130,7 +152,7 @@ Multi-timeframe trend-pullback system. Both intervals (`entry_interval`, `regime
   2. **Dead-trade exit** (only after `candles_since_entry > dead_trade_min_candles`, exit on all): ADX < ADX `dead_trade_adx_lookback` bars ago AND ADX < `dead_trade_adx_floor`; ATR < SMA(ATR, `atr_sma_period`); unrealized PnL per unit < `dead_trade_r_floor` × R. Rechecked every closed entry-interval candle.
   3. **Trailing stop update:** trail = `highest_close_since_entry` − `trail_atr_mult` × ATR (inverted for shorts). Only moved when more favorable. Place-then-cancel ordering (new stop placed first, then old one cancelled) so the position is never momentarily unprotected.
 - **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
-- **Restart recovery:** pre-existing positions are not adopted. Internal `_ManagedPosition` state (entry ATR, R distance, highest close) is in-memory only.
+- **Restart recovery:** positions opened by this strategy are persisted to `state/positions.json` via StateManager. `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, and the running `highest_close` / `lowest_close`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs against live Binance orders. If the saved stop-loss is missing on adopt (cancelled or filled during downtime), a fresh STOP_MARKET is placed at `entry_price ± r_distance` (warning logged). Missing TP1 is not re-created.
 
 ### Multi-strategy on the same symbol
 Symbol ownership is absolute and short-lived. The first strategy in `config.yaml.strategies` that fires on a given symbol opens the position; every other strategy sees `state_manager.has_position(symbol) == True` and stays silent until the position closes. Strategies do not coordinate directly — they coordinate through StateManager.
@@ -139,7 +161,9 @@ Symbol ownership is absolute and short-lived. The first strategy in `config.yaml
 One `_KlineStreamManager` connection covers every `(symbol, interval)` pair. The bot opens streams for `pairs = unique_intervals × symbols`. Gap recovery on every closed candle: if `new.open_time - last.open_time > interval_ms`, REST-fetches the missing range via `get_futures_ohlcv` and delivers the back-filled candles before the new one, logging a `[ws] gap-fill` warning. Reconnects automatically on disconnect.
 
 ### Restart recovery
-StateManager's first synchronous poll discovers any positions already open on Binance. They are recorded in `SymbolState` and block entries on those symbols (one-per-symbol). No strategy claims them and no `LiveTradeManager` manages them — they run their course on their existing exit orders. The grace period prevents false orphan-cancellation during the first poll.
+Startup order in `bot.py`: build StateManager (loads `state/positions.json`) → build strategies (each calls `state_manager.attach_strategy` in the base `__init__`) → warmup → `state_manager.start()` (sync poll populates `_states`, prunes file entries whose Binance position is gone or whose strategy is no longer configured) → `strategy.adopt_pre_existing()` per strategy (rehydrates internal state and reconciles order IDs against live Binance orders).
+
+If the file shows a position with a strategy that's no longer in `config.yaml`, the entry is dropped and a warning is logged; the position itself is left untouched on Binance ("untracked-position" — see StateManager). Positions that exist on Binance but have no entry in the file are treated the same way (untracked) — adoption is opt-in by file presence.
 
 ### Crash notifications
 `bot.run()` wraps `_run()`. Any unhandled exception triggers `general.send_crash_email()` with the exception type, message, and traceback, then re-raises. Per-tick errors inside a strategy are caught and logged — they do not crash the bot.

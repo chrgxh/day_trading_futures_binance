@@ -528,6 +528,136 @@ class AdaptiveTrendPullback(Strategy):
             current_stop_order_id=stop_order_id,
             tp1_order_id=tp1_order_id,
         )
+        self.state_manager.register_owner(
+            symbol,
+            strategy_name=self.name,
+            side="LONG" if is_long else "SHORT",
+            entry_price=fill_price,
+            qty=filled_qty,
+            strategy_state=self.serialize_state(symbol),
+            orders=self._orders_dict(symbol),
+        )
+
+    def _orders_dict(self, symbol: str) -> dict:
+        mp = self._managed.get(symbol)
+        if mp is None:
+            return {}
+        return {
+            "stop_loss_id": mp.current_stop_order_id,
+            "tp1_id": mp.tp1_order_id,
+        }
+
+    def _persist_managed(self, symbol: str) -> None:
+        """Push the latest in-memory state for `symbol` to the persistent store."""
+        if symbol not in self._managed:
+            return
+        self.state_manager.update_owner(
+            symbol,
+            strategy_state=self.serialize_state(symbol),
+            orders=self._orders_dict(symbol),
+            qty=self._managed[symbol].initial_qty,
+        )
+
+    # ------------------------------------------------------------------
+    # Persistence (overrides for restart recovery)
+    # ------------------------------------------------------------------
+
+    def serialize_state(self, symbol: str) -> dict:
+        mp = self._managed.get(symbol)
+        if mp is None:
+            return {}
+        return {
+            "entry_atr": mp.entry_atr,
+            "r_distance": mp.r_distance,
+            "entry_candle_open_time": mp.entry_candle_open_time,
+            "highest_close": mp.highest_close,
+            "lowest_close": mp.lowest_close,
+        }
+
+    def adopt(self, symbol: str, entry: dict) -> None:
+        """Rehydrate _ManagedPosition for `symbol` from the persisted entry.
+
+        Reconciles saved order IDs against current open orders on Binance; if the
+        saved stop is missing (cancelled or hit while the bot was down) and the
+        position is still live, a fresh STOP_MARKET is placed at the original
+        stop distance derived from entry_price and r_distance.
+        """
+        state = self.state_manager.get_state(symbol)
+        if state.position == Position.NONE:
+            logger.info("{} {} adopt skipped — Binance reports no position", self.tag, symbol)
+            return
+
+        side = entry.get("side") or state.position.value
+        try:
+            entry_price = Decimal(str(entry["entry_price"]))
+            qty = Decimal(str(entry["qty"]))
+        except (KeyError, ValueError) as exc:
+            logger.error("{} {} adopt failed — bad entry/qty: {}", self.tag, symbol, exc)
+            return
+
+        ss = entry.get("strategy_state") or {}
+        try:
+            entry_atr = float(ss["entry_atr"])
+            r_distance = float(ss["r_distance"])
+        except (KeyError, ValueError, TypeError):
+            logger.error("{} {} adopt failed — missing entry_atr/r_distance in saved state",
+                         self.tag, symbol)
+            return
+
+        entry_candle_open_time = int(ss.get("entry_candle_open_time", 0))
+        highest = float(ss.get("highest_close", float(entry_price)))
+        lowest = float(ss.get("lowest_close", float(entry_price)))
+
+        saved_orders = entry.get("orders") or {}
+        live_ids = {o["order_id"] for o in state.orders}
+        stop_id = saved_orders.get("stop_loss_id")
+        tp1_id = saved_orders.get("tp1_id")
+        stop_alive = stop_id in live_ids if stop_id is not None else False
+        tp1_alive = tp1_id in live_ids if tp1_id is not None else False
+
+        if not stop_alive:
+            stop_id = self._adopt_replace_stop(symbol, side, qty, entry_price, r_distance)
+        if not tp1_alive:
+            tp1_id = None  # TP1 is optional; don't try to recreate it (sizing already happened)
+
+        self._managed[symbol] = _ManagedPosition(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            entry_atr=entry_atr,
+            r_distance=r_distance,
+            initial_qty=qty,
+            entry_candle_open_time=entry_candle_open_time,
+            highest_close=highest,
+            lowest_close=lowest,
+            current_stop_order_id=stop_id,
+            tp1_order_id=tp1_id,
+        )
+        # Push reconciled orders back to disk so the file mirrors live state.
+        self.state_manager.update_owner(symbol, orders=self._orders_dict(symbol))
+
+    def _adopt_replace_stop(
+        self, symbol: str, side: str, qty: Decimal, entry_price: Decimal, r_distance: float,
+    ) -> Optional[int]:
+        is_long = side == "LONG"
+        tick_size = self.sym_infos[symbol]["tick_size"]
+        if is_long:
+            stop_price = round_price(entry_price - Decimal(str(r_distance)), tick_size)
+        else:
+            stop_price = round_price(entry_price + Decimal(str(r_distance)), tick_size)
+        exit_side = "SELL" if is_long else "BUY"
+        self.state_manager.mark_change(symbol)
+        try:
+            new_stop = algo_orders.place_stop_market_order(
+                self.client, symbol, exit_side, qty, stop_price,
+            )
+            logger.warning("{} {} adopt: original stop missing — placed new STOP_MARKET @ {} (id={})",
+                           self.tag, symbol, stop_price, new_stop["order_id"])
+            return new_stop["order_id"]
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.error("{} {} adopt: could not re-place stop @ {}: {}",
+                         self.tag, symbol, stop_price, exc)
+            return None
 
     def _ioc_chase_for_signal(
         self, symbol: str, signal: Signal, qty: Decimal, tick_size: Decimal,
@@ -672,12 +802,17 @@ class AdaptiveTrendPullback(Strategy):
 
     def _update_extrema(self, mp: _ManagedPosition, candles: list[dict]) -> None:
         close = float(candles[-1]["close"])
+        changed = False
         if mp.side == "LONG":
             if close > mp.highest_close:
                 mp.highest_close = close
+                changed = True
         else:
             if close < mp.lowest_close:
                 mp.lowest_close = close
+                changed = True
+        if changed:
+            self._persist_managed(mp.symbol)
 
     # ---- Trend invalidation: any-of -----------------------------------
 
@@ -886,6 +1021,7 @@ class AdaptiveTrendPullback(Strategy):
             except (BinanceAPIException, BinanceRequestException) as exc:
                 logger.warning("{} {} could not cancel old stop {} after replacing: {}",
                                self.tag, mp.symbol, old_id, exc)
+        self._persist_managed(mp.symbol)
         self.state_manager.mark_change(mp.symbol)
         logger.info("{} {} trail moved to {} (qty={}, new_id={})",
                     self.tag, mp.symbol, new_trail_price, qty, new_stop["order_id"])

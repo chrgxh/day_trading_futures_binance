@@ -172,8 +172,8 @@ def _run() -> None:
         grace_period_secs=int(sm_cfg.get("grace_period_secs", 15)),
         pnl_refresh_every_n_polls=int(sm_cfg.get("pnl_refresh_every_n_polls", 6)),
         pnl_reporter=pnl_reporter,
+        positions_file=sm_cfg.get("positions_file"),
     )
-    state_manager.start()
 
     rg_cfg = cfg["risk_guard"]
     risk_guard = RiskGuard(
@@ -187,6 +187,16 @@ def _run() -> None:
         state_manager=state_manager, risk_guard=risk_guard, symbols=symbols,
     )
     warmup_strategies(client, strategies, symbols)
+
+    # Strategies are now built (state_manager.attach_strategy called for each)
+    # and warmed up. Start polling — the first sync poll prunes entries whose
+    # position is gone on Binance or whose strategy is no longer configured.
+    state_manager.start()
+
+    # With _states populated from the first sync poll, each strategy can adopt
+    # its persisted positions and reconcile saved order IDs against live state.
+    for s in strategies:
+        s.adopt_pre_existing()
 
     pairs = [(sym, interval) for interval in unique_intervals(strategies) for sym in symbols]
     event_queue: queue.SimpleQueue = queue.SimpleQueue()

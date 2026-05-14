@@ -1,6 +1,7 @@
 .env
 .env.testnet
 logs/
+state/
 .git/
 .venv/
 __pycache__/
