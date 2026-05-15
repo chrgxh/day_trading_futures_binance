@@ -138,8 +138,8 @@ strategies:
       time_exit_hard_candles: 16        # ~8h on 30m — unconditional exit
 
 risk_guard:
-  max_concurrent_positions: 3
-  max_daily_loss_usdt: 50.0
+  max_concurrent_positions: 5
+  max_daily_loss_usdt: 1000.0
 
 state_manager:
   poll_interval_secs: 10
