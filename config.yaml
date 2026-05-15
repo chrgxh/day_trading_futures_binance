@@ -17,8 +17,8 @@ strategies:
       regime_interval: 4h        # macro trend filter, read-only
 
       # ---- Sizing & leverage ----------------------------------------------
-      leverage: 5                # set per-symbol at startup
-      notional_per_trade_usdt: 100.0   # full USDT notional per entry; qty = notional / entry_price
+      leverage: 20                # set per-symbol at startup
+      notional_per_trade_usdt: 2000.0   # full USDT notional per entry; qty = notional / entry_price
 
       # ---- Regime filter (regime_interval) --------------------------------
       regime_ema_fast: 50
@@ -81,8 +81,8 @@ strategies:
       macro_interval: 1d         # macro bias: UP → longs only, DOWN → shorts only, NEUTRAL → skip
 
       # ---- Sizing & leverage ----------------------------------------------
-      leverage: 5                # set per-symbol at startup
-      notional_per_trade_usdt: 100.0   # qty = notional / entry_price
+      leverage: 20                # set per-symbol at startup
+      notional_per_trade_usdt: 2000.0   # qty = notional / entry_price
 
       # ---- Macro bias filter (macro_interval) — directional gate ----------
       macro_ema_fast: 50
