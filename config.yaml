@@ -73,6 +73,70 @@ strategies:
       dead_trade_adx_floor: 22
       dead_trade_r_floor: 1.0           # unrealized PnL per unit < N*R
 
+  - name: bb_rsi_mean_reversion
+    params:
+      # ---- Intervals (drive WebSocket subscriptions + buffer wiring) -------
+      entry_interval: 30m        # all entry, exit, and time-stop decisions fire on close
+      regime_interval: 4h        # must be range-bound (low ADX, flat EMAs)
+      macro_interval: 1d         # macro bias: UP → longs only, DOWN → shorts only, NEUTRAL → skip
+
+      # ---- Sizing & leverage ----------------------------------------------
+      leverage: 5                # set per-symbol at startup
+      notional_per_trade_usdt: 100.0   # qty = notional / entry_price
+
+      # ---- Macro bias filter (macro_interval) — directional gate ----------
+      macro_ema_fast: 50
+      macro_ema_slow: 200
+
+      # ---- Regime filter (regime_interval) — RANGE ONLY -------------------
+      regime_adx_period: 14
+      regime_adx_max_range: 20.0       # ADX <= this AND EMAs flat → range
+      regime_adx_min_trend: 25.0       # ADX > this → trending, no trade / exit if held
+      regime_ema_fast: 50
+      regime_ema_slow: 200
+      regime_ema_flatness_pct: 2.0     # |EMA_fast - EMA_slow| / close, in %
+
+      # ---- 30m Bollinger Bands + companions -------------------------------
+      bb_period: 20
+      bb_num_std: 2.0
+      rsi_period: 14
+      rsi_oversold: 30.0
+      rsi_overbought: 70.0
+      atr_period: 14
+      atr_sma_period: 20               # "ATR > rolling avg" filter (entry + invalidation)
+      volume_sma_period: 20
+
+      # ---- Entry gates ----------------------------------------------------
+      pierce_lookback: 2                # current + prior bar(s) checked for band pierce
+      volume_max_mult: 1.5              # block if volume > N * volume_SMA (panic spike)
+      max_pierce_atr_mult: 1.0          # block if (bb_lower - close) > N * ATR (too far)
+      atr_max_expansion_mult: 1.2       # block if ATR > N * ATR_SMA
+
+      # ---- Entry execution (single-shot IOC LIMIT, NO chasing) ------------
+      # Single IOC LIMIT at the signal close: fills at that price or better,
+      # otherwise skips the trade. Pays the taker fee on entry by design — the
+      # alternative GTX/post-only design has us silently missing valid reclaim
+      # setups when the book has already drifted. No params needed.
+
+      # ---- Exits: stop + dual TP -----------------------------------------
+      stop_atr_mult: 1.0                # ATR-stop distance from fill (in ATRs)
+      structure_stop_lookback: 5        # bars to scan for the swing low/high
+      structure_stop_buffer_atr_mult: 0.1   # buffer past the swing (in ATRs)
+      # Final stop = more conservative (closer to entry) of ATR stop and structure stop.
+      tp1_size_pct: 0.70                # fraction taken at the bb middle
+      tp2_size_pct: 0.30                # fraction taken at the opposite band (0 → skip)
+
+      # ---- Break-even SL move (fires once any TP partial-fills) -----------
+      break_even_offset_atr_mult: 0.0   # 0 = exact break-even; small +ve to cover fees
+
+      # ---- Exits: trend invalidation (any-of) -----------------------------
+      max_outside_band_candles: 2       # N consecutive closes outside the relevant band → exit
+      max_rsi_extreme_candles: 2        # N consecutive RSI<oversold (long) or >overbought (short) → exit
+
+      # ---- Exits: time stop ----------------------------------------------
+      time_exit_soft_candles: 8         # ~4h on 30m — soft exit if no mid-touch AND close wrong side of entry
+      time_exit_hard_candles: 16        # ~8h on 30m — unconditional exit
+
 risk_guard:
   max_concurrent_positions: 3
   max_daily_loss_usdt: 50.0

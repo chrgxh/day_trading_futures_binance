@@ -14,7 +14,8 @@ core/
   strategies/
     base.py                         — Strategy ABC: candle buffer, signal, execution
     live_trade_manager.py           — optional per-strategy post-fill lifecycle hooks
-    adaptive_trend_pullback.py      — active strategy
+    adaptive_trend_pullback.py      — trend-pullback strategy
+    bb_rsi_mean_reversion.py        — Bollinger-Band + RSI mean-reversion strategy
 utils/
   general.py                        — build_client, with_retry, round_price, emails, normalizers
   account.py                        — connection, balances, positions, symbol info, trades
@@ -22,7 +23,7 @@ utils/
   algo_orders.py                    — conditional orders (stop/TP market & limit)
   positions.py                      — close_position
   market.py                         — OHLCV, mark price, multi-(symbol,interval) WS with gap-fill
-  indicators.py                     — SMA, EMA, MACD, ADX, ATR, RSI, daily_anchored_vwap, resample_to_1h
+  indicators.py                     — SMA, EMA, MACD, ADX, ATR, RSI, bollinger_bands, daily_anchored_vwap, resample_to_1h
 config.yaml                         — symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 .env                                — mainnet API keys (never commit)
 .env.testnet                        — testnet API keys for integration tests (never commit)
@@ -153,4 +154,6 @@ Plain `pytest` (no `-m integration`) runs unit tests only and skips integration 
 - `risk_guard.max_daily_loss_usdt` — once tripped, blocks new entries for the rest of the UTC day; existing positions run their course; a single warning email is sent; bot resumes next UTC day automatically.
 - `StateManager` cancels orphan orders (orders with no matching position) and warns on untracked positions (position with no exit orders), with a configurable grace window so freshly placed orders are not misclassified.
 - WebSocket gap recovery — on every candle close, missing candles after a reconnect are REST-fetched and back-filled before being delivered to strategies; a `[ws] gap-fill` warning is logged.
-- Per-strategy exit orders: the active `adaptive_trend_pullback` strategy places two reduceOnly exits per entry (an ATR-based stop-market and a GTX post-only TP1 limit at 1.5R for 40% of size), both anchored to the actual fill price. The runner's trailing stop is recomputed on every closed entry-interval candle (place-then-cancel) so the position is never momentarily unprotected. Trend-invalidation and dead-trade exits fire from inside the strategy on closed candles.
+- Per-strategy exit orders:
+  - `adaptive_trend_pullback` places two reduceOnly exits per entry (an ATR-based stop-market and a GTX post-only TP1 limit at 1.5R for 40% of size), both anchored to the actual fill price. The runner's trailing stop is recomputed on every closed entry-interval candle (place-then-cancel) so the position is never momentarily unprotected. Trend-invalidation and dead-trade exits fire from inside the strategy on closed candles.
+  - `bb_rsi_mean_reversion` (range-only, macro-aligned) first checks a daily macro bias (1D EMA50/EMA200): UP → longs only, DOWN → shorts only, NEUTRAL → no entry. Then requires the 4h regime to be range-bound (ADX ≤ 20, flat EMAs). On entry it picks the more conservative of an ATR stop and a structure stop (swing low/high) and places a STOP_MARKET there, plus up to two reduceOnly GTC LIMIT take-profits — TP1 at the Bollinger middle band (default 70% of size), TP2 at the opposite band (default 30%). When TP1 partial-fills, the SL is moved to break-even on the next closed candle (place-then-cancel, never unprotected) so the runner can't turn a partial winner back into a loser. Entry is a single-shot IOC LIMIT at the signal close: fills at that price or better, otherwise skips (no chasing, no retry, no resting order). Pays the taker fee on entry by design; exits are maker-priced. Invalidation and time-stop exits fire on closed entry-interval candles.

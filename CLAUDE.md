@@ -31,7 +31,8 @@ day-trading-bot/
 │       ├── __init__.py          # STRATEGIES registry
 │       ├── base.py              # Strategy ABC — multi-interval buffers, signal computation, execution
 │       ├── live_trade_manager.py# Optional per-strategy post-fill lifecycle hooks
-│       └── adaptive_trend_pullback.py  # Active strategy
+│       ├── adaptive_trend_pullback.py  # Trend-pullback strategy
+│       └── bb_rsi_mean_reversion.py    # Bollinger-Band + RSI mean-reversion strategy
 ├── utils/
 │   ├── general.py               # build_client, with_retry, round_price, send_*_email, order normalizers
 │   ├── account.py               # Account state: connection, balances, positions, symbol info, leverage, trades
@@ -39,7 +40,7 @@ day-trading-bot/
 │   ├── algo_orders.py           # Conditional orders: stop/TP market and limit, cancel_algo
 │   ├── positions.py             # Position management: close_position
 │   ├── market.py                # Public market data: OHLCV, mark price, multi-(symbol,interval) WS with gap recovery
-│   └── indicators.py            # Raw indicators (SMA, EMA, MACD, ADX, ATR, RSI, daily_anchored_vwap, resample_to_1h)
+│   └── indicators.py            # Raw indicators (SMA, EMA, MACD, ADX, ATR, RSI, bollinger_bands, daily_anchored_vwap, resample_to_1h)
 ├── config.yaml                  # symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 ├── .env                         # Secrets ONLY — never committed
 ├── .env.example
@@ -60,7 +61,8 @@ day-trading-bot/
 │   │   ├── test_risk_guard.py
 │   │   ├── test_live_trade_manager.py
 │   │   ├── test_strategy_base.py
-│   │   └── test_adaptive_trend_pullback.py
+│   │   ├── test_adaptive_trend_pullback.py
+│   │   └── test_bb_rsi_mean_reversion.py
 │   └── integration/             # Testnet integration tests
 │       ├── conftest.py
 │       ├── test_account.py
@@ -153,6 +155,26 @@ Multi-timeframe trend-pullback system. Both intervals (`entry_interval`, `regime
   3. **Trailing stop update:** trail = `highest_close_since_entry` − `trail_atr_mult` × ATR (inverted for shorts). Only moved when more favorable. Place-then-cancel ordering (new stop placed first, then old one cancelled) so the position is never momentarily unprotected.
 - **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
 - **Restart recovery:** positions opened by this strategy are persisted to `state/positions.json` via StateManager. `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, and the running `highest_close` / `lowest_close`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs against live Binance orders. If the saved stop-loss is missing on adopt (cancelled or filled during downtime), a fresh STOP_MARKET is placed at `entry_price ± r_distance` (warning logged). Missing TP1 is not re-created.
+
+### Active strategy: `bb_rsi_mean_reversion`
+Bollinger-Band + RSI mean-reversion system, intended to trade only in non-trending regimes. All three intervals (`macro_interval`, `regime_interval`, `entry_interval`) and every indicator period / threshold are configurable in `params`.
+
+- **Macro bias filter (macro_interval, e.g. 1d):** checked first. `close > EMA_slow AND EMA_fast > EMA_slow` → UP (longs only). `close < EMA_slow AND EMA_fast < EMA_slow` → DOWN (shorts only). Anything else → NEUTRAL → skip all entries. Prevents taking both sides in the same range and getting stop-hunted in both directions by an underlying directional drift.
+- **Regime filter (regime_interval, e.g. 4h):** range-only. Requires `ADX <= regime_adx_max_range` AND `|EMA_fast − EMA_slow| / close <= regime_ema_flatness_pct`. `ADX > regime_adx_min_trend` explicitly disqualifies; the band in between is the "gray zone" — no trade.
+- **Entry gates (entry_interval, e.g. 30m, longs; shorts inverse):** band pierce within `pierce_lookback` recent bars (current/previous low OR close below `bb_lower`); `RSI < rsi_oversold`; current `close > bb_lower` (reclaim); bullish candle; `close > prev_close`; `volume <= volume_max_mult × volume_SMA` (no panic spike); pierce depth `(bb_lower − close)` ≤ `max_pierce_atr_mult × ATR`; `ATR <= atr_max_expansion_mult × ATR_SMA`.
+- **SL/TP per signal:** the strategy picks the MORE CONSERVATIVE (closer-to-entry) of an ATR stop and a structure stop:
+  - ATR stop = entry ∓ `stop_atr_mult × ATR` (default 1.0 — tighter than trend).
+  - Structure stop = swing low/high over `structure_stop_lookback` bars, ∓ `structure_stop_buffer_atr_mult × ATR` for headroom.
+  - Final stop = `max(atr_stop, structure_stop)` for longs / `min` for shorts.
+  - R-distance is computed against the chosen stop, so dead-trade / hard-SL-close math always reflects actual risk.
+  - TP1 = `bb_middle` at signal close, `tp1_size_pct` of qty (GTC reduce-only LIMIT). TP2 = opposite band at signal close, `tp2_size_pct` of qty (GTC reduce-only LIMIT; skipped if `tp2_size_pct == 0`).
+- **Break-even SL move:** the first closed candle on which the position size has shrunk vs `initial_qty` (i.e. a TP has partially filled) triggers `_move_stop_to_break_even`: places a new STOP_MARKET at `entry_price ± break_even_offset_atr_mult × entry_atr` for the *remaining* qty, then cancels the old stop (place-then-cancel — never momentarily unprotected). The `stop_moved_to_be` flag is persisted so adopt-on-restart doesn't re-fire it.
+- **Entry execution:** single-shot IOC LIMIT at the signal close. Binance fills whatever is available at the signal price or better; the remainder is cancelled immediately. If nothing fills, the strategy walks away — by design we'd rather miss the trade than buy after the bounce has already moved. Pays the taker fee on entry; TPs are maker-priced (GTC LIMIT reduce-only). No chasing, no retry, no resting order, so the orphan-cancel / grace-period concerns that apply to GTX never come up. SL + TPs are placed synchronously immediately after the IOC returns a non-zero `executed_qty` — zero unprotected window.
+- **Exits managed inside the strategy on every closed entry-interval candle** (no LiveTradeManager). Two check groups, in order:
+  1. **Trend invalidation** (exit on any): 4h `ADX > regime_adx_min_trend` (range thesis broken); `ATR > atr_max_expansion_mult × ATR_SMA` (volatility expansion); `max_outside_band_candles` consecutive closes outside the relevant band; `max_rsi_extreme_candles` consecutive RSI extremes against the trade; close beyond entry by ≥ `stop_atr_mult × entry_ATR` against the position (hard SL re-check on close).
+  2. **Time exit:** unconditional after `time_exit_hard_candles`; soft exit after `time_exit_soft_candles` IF `touched_middle` is still False AND the current close is on the *wrong side of entry* ("trade simply isn't working" — cleaner than an arbitrary fraction-of-R threshold).
+- **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
+- **Restart recovery:** `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, `outside_band_streak`, `rsi_extreme_streak`, `touched_middle`, and `stop_moved_to_be`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs (stop_loss_id / tp1_id / tp2_id) against live Binance orders. Missing stop is re-placed at `entry_price ± r_distance`; missing TPs are not recreated (their qty was already split off the original fill).
 
 ### Multi-strategy on the same symbol
 Symbol ownership is absolute and short-lived. The first strategy in `config.yaml.strategies` that fires on a given symbol opens the position; every other strategy sees `state_manager.has_position(symbol) == True` and stays silent until the position closes. Strategies do not coordinate directly — they coordinate through StateManager.

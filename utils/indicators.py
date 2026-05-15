@@ -172,6 +172,42 @@ def atr(candles: list[dict], period: int = 14) -> list[float]:
     return result
 
 
+def bollinger_bands(
+    prices: list, period: int = 20, num_std: float = 2.0,
+) -> tuple[list[float], list[float], list[float]]:
+    """Bollinger Bands using population standard deviation.
+
+    Middle band is a simple moving average of length `period`; upper and lower
+    bands are middle ± num_std * stdev. Returns three lists of equal length,
+    max(0, len(prices) - period + 1). Arithmetic is performed in float for
+    performance.
+
+    Args:
+        prices: Price series in chronological order (Decimal or float).
+        period: SMA window (default 20).
+        num_std: Standard-deviation multiplier for the bands (default 2.0).
+
+    Returns:
+        (upper, middle, lower) — three same-length lists. Empty lists if there
+        are fewer than `period` prices.
+    """
+    if len(prices) < period or period <= 0:
+        return [], [], []
+    data = [float(p) for p in prices]
+    middle: list[float] = []
+    upper: list[float] = []
+    lower: list[float] = []
+    for i in range(period - 1, len(data)):
+        window = data[i - period + 1: i + 1]
+        m = sum(window) / period
+        var = sum((x - m) ** 2 for x in window) / period
+        sd = var ** 0.5
+        middle.append(m)
+        upper.append(m + num_std * sd)
+        lower.append(m - num_std * sd)
+    return upper, middle, lower
+
+
 def daily_anchored_vwap(candles: list[dict], anchor_hour_utc: int = 0) -> list[float]:
     """Daily-anchored VWAP that resets each UTC day at `anchor_hour_utc`.
 

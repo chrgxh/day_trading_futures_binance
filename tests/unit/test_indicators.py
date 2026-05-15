@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from utils.indicators import atr, daily_anchored_vwap, resample_to_1h, rsi
+from utils.indicators import atr, bollinger_bands, daily_anchored_vwap, resample_to_1h, rsi
 
 D = Decimal
 MS_15M = 900_000
@@ -168,6 +168,43 @@ def test_vwap_resets_at_utc_midnight():
     # Last day-1 value ≈ 100; first day-2 value must be 10 (reset), not a blend.
     assert abs(series[len(day1) - 1] - 100.0) < 1e-9
     assert abs(series[len(day1)] - 10.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# bollinger_bands
+# ---------------------------------------------------------------------------
+
+def test_bollinger_bands_empty_when_insufficient_data():
+    upper, middle, lower = bollinger_bands([D("1")] * 5, period=20)
+    assert upper == [] and middle == [] and lower == []
+
+
+def test_bollinger_bands_constant_series_zero_width():
+    prices = [D("100")] * 30
+    upper, middle, lower = bollinger_bands(prices, period=20, num_std=2.0)
+    # Constant series → stdev 0 → all three bands collapse onto the mean.
+    assert all(abs(u - 100.0) < 1e-9 for u in upper)
+    assert all(abs(m - 100.0) < 1e-9 for m in middle)
+    assert all(abs(l - 100.0) < 1e-9 for l in lower)
+    # Length = len(prices) - period + 1 = 11
+    assert len(middle) == 11
+
+
+def test_bollinger_bands_known_window():
+    # Window of 5: [1, 2, 3, 4, 5]. Mean = 3. Population stdev = sqrt(2) ≈ 1.4142.
+    prices = [D(str(x)) for x in [1, 2, 3, 4, 5]]
+    upper, middle, lower = bollinger_bands(prices, period=5, num_std=2.0)
+    assert len(middle) == 1
+    assert abs(middle[0] - 3.0) < 1e-9
+    expected_sd = (2.0) ** 0.5
+    assert abs(upper[0] - (3.0 + 2.0 * expected_sd)) < 1e-9
+    assert abs(lower[0] - (3.0 - 2.0 * expected_sd)) < 1e-9
+
+
+def test_bollinger_bands_upper_above_middle_above_lower():
+    prices = [D(str(100 + (i % 7))) for i in range(50)]
+    upper, middle, lower = bollinger_bands(prices, period=20, num_std=2.0)
+    assert all(u >= m >= l for u, m, l in zip(upper, middle, lower))
 
 
 def test_vwap_volume_weighting():
