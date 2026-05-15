@@ -79,7 +79,7 @@ from loguru import logger
 
 from core.strategies.base import Strategy
 from core.types import Action, Position, Signal
-from utils import algo_orders, orders, positions
+from utils import algo_orders, orders
 from utils.general import round_price
 from utils.indicators import adx, atr, bollinger_bands, ema, rsi
 
@@ -135,6 +135,8 @@ class BBRsiMeanReversion(Strategy):
     in params. See module docstring.
     """
 
+    _managed: dict[str, _ManagedPosition]  # narrows base's dict[str, Any]
+
     def __init__(self, *, params: dict, **kwargs) -> None:
         self._entry_interval = str(params.get("entry_interval", "30m"))
         self._regime_interval = str(params.get("regime_interval", "4h"))
@@ -146,7 +148,6 @@ class BBRsiMeanReversion(Strategy):
                 seen.add(iv)
                 intervals.append(iv)
         super().__init__(intervals=intervals, params=params, **kwargs)
-        self._managed: dict[str, _ManagedPosition] = {}
 
     # ------------------------------------------------------------------
     # Warmup sizing
@@ -567,12 +568,6 @@ class BBRsiMeanReversion(Strategy):
             f"vol={ind.volume:.2f}/{ind.vol_sma:.2f}"
         )
 
-    def _latest_entry_atr(self, symbol: str) -> Optional[float]:
-        candles = self._buffers[symbol][self._entry_interval]
-        atr_period = int(self.params.get("atr_period", 14))
-        series = atr(candles, atr_period)
-        return series[-1] if series else None
-
     # ==================================================================
     # Entry execution (orchestrator + helpers)
     # ==================================================================
@@ -644,10 +639,6 @@ class BBRsiMeanReversion(Strategy):
                     filled_qty, fill_price, stop_price, tp1_price, tp2_price,
                     stop_order_id, tp1_order_id, tp2_order_id)
 
-    def _compute_position_qty(self, entry_price: Decimal, step_size: Decimal) -> Decimal:
-        notional = Decimal(str(self.params.get("notional_per_trade_usdt", 100)))
-        return (notional / entry_price // step_size) * step_size
-
     def _compute_exit_prices(
         self,
         fill_price: Decimal,
@@ -707,26 +698,6 @@ class BBRsiMeanReversion(Strategy):
                            self.tag, symbol, label, exc, label)
             return None
 
-    def _place_initial_stop(
-        self, symbol: str, exit_side: str, qty: Decimal, stop_price: Decimal,
-    ) -> Optional[int]:
-        try:
-            stop = algo_orders.place_stop_market_order(
-                self.client, symbol, exit_side, qty, stop_price,
-            )
-            return stop["order_id"]
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} initial stop placement failed: {}", self.tag, symbol, exc)
-            return None
-
-    def _emergency_close(self, symbol: str) -> None:
-        logger.error("{} {} no stop in place — emergency-closing position", self.tag, symbol)
-        try:
-            positions.close_position(self.client, symbol)
-        except Exception as exc:
-            logger.critical("{} {} emergency close ALSO failed: {}", self.tag, symbol, exc)
-        self.state_manager.mark_change(symbol)
-
     def _record_managed(
         self, *,
         symbol: str, is_long: bool, fill_price: Decimal, entry_atr: float,
@@ -764,17 +735,6 @@ class BBRsiMeanReversion(Strategy):
             "tp1_id": mp.tp1_order_id,
             "tp2_id": mp.tp2_order_id,
         }
-
-    def _persist_managed(self, symbol: str) -> None:
-        """Push the latest in-memory state for `symbol` to the persistent store."""
-        if symbol not in self._managed:
-            return
-        self.state_manager.update_owner(
-            symbol,
-            strategy_state=self.serialize_state(symbol),
-            orders=self._orders_dict(symbol),
-            qty=self._managed[symbol].initial_qty,
-        )
 
     # ------------------------------------------------------------------
     # Persistence (overrides for restart recovery)
@@ -865,42 +825,9 @@ class BBRsiMeanReversion(Strategy):
         )
         self.state_manager.update_owner(symbol, orders=self._orders_dict(symbol))
 
-    def _adopt_replace_stop(
-        self, symbol: str, side: str, qty: Decimal, entry_price: Decimal, r_distance: float,
-    ) -> Optional[int]:
-        is_long = side == "LONG"
-        tick_size = self.sym_infos[symbol]["tick_size"]
-        if is_long:
-            stop_price = round_price(entry_price - Decimal(str(r_distance)), tick_size)
-        else:
-            stop_price = round_price(entry_price + Decimal(str(r_distance)), tick_size)
-        exit_side = "SELL" if is_long else "BUY"
-        self.state_manager.mark_change(symbol)
-        try:
-            new_stop = algo_orders.place_stop_market_order(
-                self.client, symbol, exit_side, qty, stop_price,
-            )
-            logger.warning("{} {} adopt: original stop missing — placed new STOP_MARKET @ {} (id={})",
-                           self.tag, symbol, stop_price, new_stop["order_id"])
-            return new_stop["order_id"]
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} adopt: could not re-place stop @ {}: {}",
-                         self.tag, symbol, stop_price, exc)
-            return None
-
     # ==================================================================
     # Position management (orchestrator + helpers)
     # ==================================================================
-
-    def _sync_managed(self, symbol: str) -> None:
-        """Drop the managed entry if the live position is gone (stop hit / manual close)."""
-        if symbol not in self._managed:
-            return
-        state = self.state_manager.get_state(symbol)
-        if state.position == Position.NONE:
-            logger.info("{} {} managed position closed externally — clearing local state",
-                        self.tag, symbol)
-            self._managed.pop(symbol, None)
 
     def _manage_position(self, symbol: str) -> None:
         mp = self._managed[symbol]
@@ -1095,22 +1022,3 @@ class BBRsiMeanReversion(Strategy):
             candles_since_entry,
         )
 
-    # ---- Exit ---------------------------------------------------------
-
-    def _exit_position(self, symbol: str, reason: str) -> None:
-        mp = self._managed.get(symbol)
-        if mp is None:
-            return
-        self.state_manager.mark_change(symbol)
-        try:
-            orders.cancel_all_orders(self.client, symbol)
-        except Exception as exc:
-            logger.warning("{} {} could not cancel orders before exit: {}", self.tag, symbol, exc)
-        try:
-            positions.close_position(self.client, symbol)
-            logger.info("{} {} position closed via {}", self.tag, symbol, reason)
-        except Exception as exc:
-            logger.error("{} {} {} close failed: {}", self.tag, symbol, reason, exc)
-        finally:
-            self._managed.pop(symbol, None)
-            self.state_manager.mark_change(symbol)

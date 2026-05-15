@@ -17,12 +17,17 @@ any entry).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any, Optional
 
 from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
-from core.types import Signal
+from core.types import Position, Signal
+from utils import algo_orders, orders, positions
+from utils.general import round_price
+from utils.indicators import atr
 
 if TYPE_CHECKING:
     from core.risk_guard import RiskGuard
@@ -64,6 +69,11 @@ class Strategy(ABC):
         self._buffers: dict[str, dict[str, list[dict]]] = {
             s: {i: [] for i in self.intervals} for s in symbols
         }
+        # Subclasses that manage post-fill lifecycle store per-symbol records
+        # here (typed as their own `_ManagedPosition` dataclass). Shared helpers
+        # in this base class assume entries expose at least an `initial_qty`
+        # attribute.
+        self._managed: dict[str, Any] = {}
 
         if live_trade_manager is not None:
             live_trade_manager.attach(self)
@@ -144,6 +154,124 @@ class Strategy(ABC):
         After fill: place exit orders using signal.stop_loss_price / signal.take_profit_price,
         then register the trade with self.live_trade_manager (if attached).
         """
+
+    # ------------------------------------------------------------------
+    # Shared post-fill lifecycle helpers
+    #
+    # Strategies that manage their own positions (record local state, place
+    # exit orders, replace stops, etc.) share a number of small primitives.
+    # They live here so each strategy doesn't reimplement them; subclasses
+    # that don't manage positions simply never call them.
+    # ------------------------------------------------------------------
+
+    def _compute_position_qty(self, entry_price: Decimal, step_size: Decimal) -> Decimal:
+        """qty = floor(notional / entry_price, step_size)."""
+        notional = Decimal(str(self.params.get("notional_per_trade_usdt", 100)))
+        return (notional / entry_price // step_size) * step_size
+
+    def _latest_entry_atr(self, symbol: str) -> Optional[float]:
+        """Latest ATR on the entry interval, or None if not warmed up.
+
+        Requires subclass to set `self._entry_interval` and to honour
+        `params["atr_period"]` (default 14).
+        """
+        candles = self._buffers[symbol][self._entry_interval]
+        atr_period = int(self.params.get("atr_period", 14))
+        series = atr(candles, atr_period)
+        return series[-1] if series else None
+
+    def _place_initial_stop(
+        self, symbol: str, exit_side: str, qty: Decimal, stop_price: Decimal,
+    ) -> Optional[int]:
+        """Place a STOP_MARKET; return order id, or None on error (logged)."""
+        try:
+            stop = algo_orders.place_stop_market_order(
+                self.client, symbol, exit_side, qty, stop_price,
+            )
+            return stop["order_id"]
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.error("{} {} initial stop placement failed: {}", self.tag, symbol, exc)
+            return None
+
+    def _emergency_close(self, symbol: str) -> None:
+        """Market-close a position when no protective stop is in place."""
+        logger.error("{} {} no stop in place — emergency-closing position", self.tag, symbol)
+        try:
+            positions.close_position(self.client, symbol)
+        except Exception as exc:
+            logger.critical("{} {} emergency close ALSO failed: {}", self.tag, symbol, exc)
+        self.state_manager.mark_change(symbol)
+
+    def _persist_managed(self, symbol: str) -> None:
+        """Push the latest in-memory state for `symbol` to the persistent store."""
+        if symbol not in self._managed:
+            return
+        self.state_manager.update_owner(
+            symbol,
+            strategy_state=self.serialize_state(symbol),
+            orders=self._orders_dict(symbol),
+            qty=self._managed[symbol].initial_qty,
+        )
+
+    def _orders_dict(self, symbol: str) -> dict:
+        """Strategy-specific order-id snapshot for the persistent store.
+
+        Default is empty; subclasses that track exit orders override.
+        """
+        return {}
+
+    def _sync_managed(self, symbol: str) -> None:
+        """Drop the managed entry if the live position is gone (stop hit / manual close)."""
+        if symbol not in self._managed:
+            return
+        state = self.state_manager.get_state(symbol)
+        if state.position == Position.NONE:
+            logger.info("{} {} managed position closed externally — clearing local state",
+                        self.tag, symbol)
+            self._managed.pop(symbol, None)
+
+    def _adopt_replace_stop(
+        self, symbol: str, side: str, qty: Decimal, entry_price: Decimal, r_distance: float,
+    ) -> Optional[int]:
+        """Re-place a missing stop on adopt at entry_price ± r_distance."""
+        is_long = side == "LONG"
+        tick_size = self.sym_infos[symbol]["tick_size"]
+        if is_long:
+            stop_price = round_price(entry_price - Decimal(str(r_distance)), tick_size)
+        else:
+            stop_price = round_price(entry_price + Decimal(str(r_distance)), tick_size)
+        exit_side = "SELL" if is_long else "BUY"
+        self.state_manager.mark_change(symbol)
+        try:
+            new_stop = algo_orders.place_stop_market_order(
+                self.client, symbol, exit_side, qty, stop_price,
+            )
+            logger.warning("{} {} adopt: original stop missing — placed new STOP_MARKET @ {} (id={})",
+                           self.tag, symbol, stop_price, new_stop["order_id"])
+            return new_stop["order_id"]
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.error("{} {} adopt: could not re-place stop @ {}: {}",
+                         self.tag, symbol, stop_price, exc)
+            return None
+
+    def _exit_position(self, symbol: str, reason: str) -> None:
+        """Cancel all orders + market-close + drop local managed entry."""
+        mp = self._managed.get(symbol)
+        if mp is None:
+            return
+        self.state_manager.mark_change(symbol)
+        try:
+            orders.cancel_all_orders(self.client, symbol)
+        except Exception as exc:
+            logger.warning("{} {} could not cancel orders before exit: {}", self.tag, symbol, exc)
+        try:
+            positions.close_position(self.client, symbol)
+            logger.info("{} {} position closed via {}", self.tag, symbol, reason)
+        except Exception as exc:
+            logger.error("{} {} {} close failed: {}", self.tag, symbol, reason, exc)
+        finally:
+            self._managed.pop(symbol, None)
+            self.state_manager.mark_change(symbol)
 
     # ------------------------------------------------------------------
     # Persistence hooks (override if the strategy needs restart recovery)
