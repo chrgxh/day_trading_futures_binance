@@ -60,6 +60,15 @@ strategies:
       tp1_retry_interval_secs: 3.0
       trail_atr_mult: 2.0               # trail = max_close - 2*ATR (recomputed each closed entry candle)
 
+      # ---- Layered stop (stop-limit + stop-market backstop) ---------------
+      # Every protective stop is a PAIR: a stop-limit at the configured stop
+      # price (preferred fill, maker-leaning) plus a stop-market backstop a
+      # bit further away (guarantees exit if the limit gets skipped). Both
+      # legs are reduce-only; the backstop sizes itself via reduce-only if
+      # the limit fills partially first.
+      stop_limit_buffer_pct: 0.0        # limit price = trigger * (1 ± buffer/100); 0 → limit at trigger
+      stop_market_backstop_pct: 0.1     # backstop trigger = stop * (1 ± offset/100); 0.1 → 0.1% past stop
+
       # ---- Exits: trend invalidation (any-of, on every closed entry candle)
       invalidation_structure_lookback: 20      # close below N-bar low (long) / above N-bar high (short)
       invalidation_strong_close_atr_mult: 0.5  # close beyond EMA_fast by >= mult*ATR against position
@@ -128,6 +137,13 @@ strategies:
 
       # ---- Break-even SL move (fires once any TP partial-fills) -----------
       break_even_offset_atr_mult: 0.0   # 0 = exact break-even; small +ve to cover fees
+
+      # ---- Layered stop (stop-limit + stop-market backstop) ---------------
+      # See adaptive_trend_pullback above for the rationale. Same defaults
+      # work here; tighten the backstop offset if you want stops closer to
+      # the trigger on thin alts.
+      stop_limit_buffer_pct: 0.0        # limit price = trigger * (1 ± buffer/100); 0 → limit at trigger
+      stop_market_backstop_pct: 0.1     # backstop trigger = stop * (1 ± offset/100); 0.1 → 0.1% past stop
 
       # ---- Exits: trend invalidation (any-of) -----------------------------
       max_outside_band_candles: 2       # N consecutive closes outside the relevant band → exit

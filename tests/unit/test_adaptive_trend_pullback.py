@@ -460,7 +460,7 @@ def test_adopt_skips_when_no_position():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
                            "highest_close": 100.0, "lowest_close": 100.0,
                            "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 7, "tp1_id": 8},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": 8},
     }
     s.adopt("BTCUSDT", entry)
     assert "BTCUSDT" not in s._managed
@@ -470,8 +470,10 @@ def test_adopt_rehydrates_managed_position_when_orders_alive():
     s = _build()
     live_state = _state(position=Position.LONG, size=D("1"))
     live_state.orders = [
-        {"order_id": 7, "side": "SELL", "is_algo": True, "order_type": "STOP_MARKET",
+        {"order_id": 7, "side": "SELL", "is_algo": True, "order_type": "STOP",
          "stop_price": D("97")},
+        {"order_id": 70, "side": "SELL", "is_algo": True, "order_type": "STOP_MARKET",
+         "stop_price": D("96.9")},
         {"order_id": 8, "side": "SELL", "is_algo": False, "order_type": "LIMIT",
          "price": D("103")},
     ]
@@ -482,7 +484,7 @@ def test_adopt_rehydrates_managed_position_when_orders_alive():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
                            "highest_close": 108.0, "lowest_close": 100.0,
                            "entry_candle_open_time": 42},
-        "orders": {"stop_loss_id": 7, "tp1_id": 8},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": 8},
     }
     s.adopt("BTCUSDT", entry)
     mp = s._managed["BTCUSDT"]
@@ -492,7 +494,9 @@ def test_adopt_rehydrates_managed_position_when_orders_alive():
     assert mp.r_distance == 3.0
     assert mp.highest_close == 108.0
     assert mp.entry_candle_open_time == 42
-    assert mp.current_stop_order_id == 7
+    assert mp.stop_ids is not None
+    assert mp.stop_ids.limit_id == 7
+    assert mp.stop_ids.market_id == 70
     assert mp.tp1_order_id == 8
 
 
@@ -507,20 +511,29 @@ def test_adopt_replaces_missing_stop_long():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
                            "highest_close": 100.0, "lowest_close": 100.0,
                            "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 99, "tp1_id": None},
+        "orders": {"stop_limit_id": 99, "stop_market_id": 100, "tp1_id": None},
     }
-    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
-               return_value={"order_id": 123}) as place_stop:
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 123}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 124}) as place_market:
         s.adopt("BTCUSDT", entry)
-        place_stop.assert_called_once()
-        args, kwargs = place_stop.call_args
-        # symbol, side, qty, stop_price — entry - r_distance = 97
-        assert args[1] == "BTCUSDT"
-        assert args[2] == "SELL"
-        assert args[3] == D("1")
-        assert args[4] == D("97.0")
+        place_limit.assert_called_once()
+        place_market.assert_called_once()
+        # stop-limit: symbol, side, qty, trigger, limit_price
+        limit_args = place_limit.call_args.args
+        assert limit_args[1] == "BTCUSDT"
+        assert limit_args[2] == "SELL"
+        assert limit_args[3] == D("1")
+        assert limit_args[4] == D("97.0")           # trigger at stop
+        assert limit_args[5] == D("97.0")           # default buffer 0 → limit at trigger
+        # stop-market backstop: 0.1% below stop = 97 * 0.999 = 96.903, rounded to tick 0.1 → 96.9
+        market_args = place_market.call_args.args
+        assert market_args[2] == "SELL"
+        assert market_args[4] == D("96.9")
     mp = s._managed["BTCUSDT"]
-    assert mp.current_stop_order_id == 123
+    assert mp.stop_ids.limit_id == 123
+    assert mp.stop_ids.market_id == 124
     assert mp.tp1_order_id is None
 
 
@@ -535,16 +548,23 @@ def test_adopt_replaces_missing_stop_short():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
                            "highest_close": 100.0, "lowest_close": 100.0,
                            "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 99, "tp1_id": None},
+        "orders": {"stop_limit_id": 99, "stop_market_id": 100, "tp1_id": None},
     }
-    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
-               return_value={"order_id": 456}) as place_stop:
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 456}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 457}) as place_market:
         s.adopt("BTCUSDT", entry)
-        args, _ = place_stop.call_args
-        # short: stop = entry + r_distance = 103, exit side BUY
-        assert args[2] == "BUY"
-        assert args[4] == D("103.0")
-    assert s._managed["BTCUSDT"].current_stop_order_id == 456
+        limit_args = place_limit.call_args.args
+        assert limit_args[2] == "BUY"
+        assert limit_args[4] == D("103.0")          # short: stop = entry + r_distance
+        market_args = place_market.call_args.args
+        assert market_args[2] == "BUY"
+        # backstop 0.1% above 103 = 103.103, rounded to tick 0.1 → 103.1
+        assert market_args[4] == D("103.1")
+    mp = s._managed["BTCUSDT"]
+    assert mp.stop_ids.limit_id == 456
+    assert mp.stop_ids.market_id == 457
 
 
 def test_adopt_pre_existing_only_adopts_own_entries():
@@ -557,11 +577,13 @@ def test_adopt_pre_existing_only_adopts_own_entries():
             "strategy_state": {"entry_atr": 2.0, "r_distance": 3.0,
                                "highest_close": 100.0, "lowest_close": 100.0,
                                "entry_candle_open_time": 0},
-            "orders": {"stop_loss_id": None, "tp1_id": None},
+            "orders": {"stop_limit_id": None, "stop_market_id": None, "tp1_id": None},
         },
     }.get(sym)
-    with patch("core.strategies.adaptive_trend_pullback.algo_orders.place_stop_market_order",
-               return_value={"order_id": 999}):
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 999}), \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 1000}):
         s.adopt_pre_existing()
     assert "BTCUSDT" in s._managed
 

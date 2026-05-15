@@ -113,7 +113,7 @@ A thin JSON store keyed by symbol. Schema (versioned for future migrations):
       "strategy": "<name>", "opened_at": "<UTC ISO>",
       "side": "LONG"|"SHORT", "entry_price": "<dec>", "qty": "<dec>",
       "strategy_state": { ... opaque blob owned by strategy ... },
-      "orders": { "stop_loss_id": <int>, "tp1_id": <int>, ... }
+      "orders": { "stop_limit_id": <int>, "stop_market_id": <int>, "tp1_id": <int>, ... }
     }, ...
 }}
 ```
@@ -139,6 +139,19 @@ One instance per strategy entry in config. Each strategy:
 
 `on_candle(symbol, interval, candle)` is the only entry point the bot calls. The default `_tick(symbol, interval)` updates the buffer, checks `state_manager.has_position(symbol)`, runs `compute_signal`, and dispatches to `risk_guard.allow_open` / `execute_open`. Multi-interval strategies override `_tick` to coordinate across intervals (e.g. higher-TF regime filter + lower-TF execution).
 
+### Layered stops (base helpers)
+Every protective stop placed by a strategy is a PAIR managed via base helpers:
+- A **stop-limit** at the desired stop price (`limit_id`) — preferred fill, pays nothing beyond slippage to the limit price. Limit price defaults to the trigger (`stop_limit_buffer_pct = 0`).
+- A **stop-market backstop** `stop_market_backstop_pct` further from entry (`market_id`) — guarantees exit if the stop-limit gets skipped through or sits unfilled.
+
+Both legs are reduceOnly. If the limit fills partially first, reduce-only sizes the backstop down automatically. The pair is tracked as a `LayeredStopIds(limit_id, market_id)` on each `_ManagedPosition`. Helpers:
+- `_place_layered_stop(symbol, exit_side, qty, stop_price)` — places both legs; cancels any partial success and returns `None` if either fails (caller emergency-closes).
+- `_replace_layered_stop(symbol, exit_side, qty, new_stop_price, old_ids)` — place-new-pair → cancel-old-pair (never unprotected).
+- `_cancel_layered_stop(symbol, ids)` — best-effort cleanup.
+- `_adopt_replace_layered_stop(...)` — restart-recovery; cancels any surviving leg and places a fresh pair sized to the current position.
+
+Both active strategies use these for their initial stop, trail-stop replacement (adaptive), and break-even move (bb_rsi). Defaults live in `config.yaml` per strategy: `stop_limit_buffer_pct: 0.0`, `stop_market_backstop_pct: 0.1`.
+
 ### LiveTradeManager (optional, per-strategy)
 Base class with three override points: `on_open(symbol)`, `on_update(state)`, `on_close(symbol)`. Subscribes to `StateManager` updates. The base class has no behavior — concrete subclasses implement strategy-specific lifecycle logic (e.g. SL migration, partial-fill re-stop, stagnation exits). Configured per strategy in `config.yaml`; absent if a strategy doesn't need it.
 
@@ -152,9 +165,9 @@ Multi-timeframe trend-pullback system. Both intervals (`entry_interval`, `regime
 - **Exits managed inside the strategy on every closed entry-interval candle** (no LiveTradeManager). Three checks per candle, in order:
   1. **Trend invalidation** (exit on any): close beyond `invalidation_structure_lookback`-bar low/high (structure break); `EMA_fast` slope flip; close beyond `EMA_fast` by ≥ `invalidation_strong_close_atr_mult` × ATR against the position; ADX drop > `invalidation_momentum_adx_drop` over last `invalidation_momentum_lookback` bars AND ADX < `invalidation_momentum_adx_floor` (momentum collapse).
   2. **Dead-trade exit** (only after `candles_since_entry > dead_trade_min_candles`, exit on all): ADX < ADX `dead_trade_adx_lookback` bars ago AND ADX < `dead_trade_adx_floor`; ATR < SMA(ATR, `atr_sma_period`); unrealized PnL per unit < `dead_trade_r_floor` × R. Rechecked every closed entry-interval candle.
-  3. **Trailing stop update:** trail = `highest_close_since_entry` − `trail_atr_mult` × ATR (inverted for shorts). Only moved when more favorable. Place-then-cancel ordering (new stop placed first, then old one cancelled) so the position is never momentarily unprotected.
+  3. **Trailing stop update:** trail = `highest_close_since_entry` − `trail_atr_mult` × ATR (inverted for shorts). Only moved when more favorable. Uses the base `_replace_layered_stop` helper — new layered pair (stop-limit + stop-market backstop) is placed first, then both old legs are cancelled, so the position is never momentarily unprotected.
 - **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
-- **Restart recovery:** positions opened by this strategy are persisted to `state/positions.json` via StateManager. `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, and the running `highest_close` / `lowest_close`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs against live Binance orders. If the saved stop-loss is missing on adopt (cancelled or filled during downtime), a fresh STOP_MARKET is placed at `entry_price ± r_distance` (warning logged). Missing TP1 is not re-created.
+- **Restart recovery:** positions opened by this strategy are persisted to `state/positions.json` via StateManager. `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, and the running `highest_close` / `lowest_close`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs against live Binance orders. If either leg of the layered stop is missing on adopt (cancelled or filled during downtime), any surviving leg is cancelled and a fresh pair is placed at `entry_price ± r_distance` (warning logged). Missing TP1 is not re-created.
 
 ### Active strategy: `bb_rsi_mean_reversion`
 Bollinger-Band + RSI mean-reversion system, intended to trade only in non-trending regimes. All three intervals (`macro_interval`, `regime_interval`, `entry_interval`) and every indicator period / threshold are configurable in `params`.
@@ -168,13 +181,13 @@ Bollinger-Band + RSI mean-reversion system, intended to trade only in non-trendi
   - Final stop = `max(atr_stop, structure_stop)` for longs / `min` for shorts.
   - R-distance is computed against the chosen stop, so dead-trade / hard-SL-close math always reflects actual risk.
   - TP1 = `bb_middle` at signal close, `tp1_size_pct` of qty (GTC reduce-only LIMIT). TP2 = opposite band at signal close, `tp2_size_pct` of qty (GTC reduce-only LIMIT; skipped if `tp2_size_pct == 0`).
-- **Break-even SL move:** the first closed candle on which the position size has shrunk vs `initial_qty` (i.e. a TP has partially filled) triggers `_move_stop_to_break_even`: places a new STOP_MARKET at `entry_price ± break_even_offset_atr_mult × entry_atr` for the *remaining* qty, then cancels the old stop (place-then-cancel — never momentarily unprotected). The `stop_moved_to_be` flag is persisted so adopt-on-restart doesn't re-fire it.
+- **Break-even SL move:** the first closed candle on which the position size has shrunk vs `initial_qty` (i.e. a TP has partially filled) triggers `_move_stop_to_break_even`: uses base `_replace_layered_stop` to place a new layered pair (stop-limit + stop-market backstop) at `entry_price ± break_even_offset_atr_mult × entry_atr` for the *remaining* qty, then cancels both old legs — never momentarily unprotected. The `stop_moved_to_be` flag is persisted so adopt-on-restart doesn't re-fire it.
 - **Entry execution:** single-shot IOC LIMIT at the signal close. Binance fills whatever is available at the signal price or better; the remainder is cancelled immediately. If nothing fills, the strategy walks away — by design we'd rather miss the trade than buy after the bounce has already moved. Pays the taker fee on entry; TPs are maker-priced (GTC LIMIT reduce-only). No chasing, no retry, no resting order, so the orphan-cancel / grace-period concerns that apply to GTX never come up. SL + TPs are placed synchronously immediately after the IOC returns a non-zero `executed_qty` — zero unprotected window.
 - **Exits managed inside the strategy on every closed entry-interval candle** (no LiveTradeManager). Two check groups, in order:
   1. **Trend invalidation** (exit on any): 4h `ADX > regime_adx_min_trend` (range thesis broken); `ATR > atr_max_expansion_mult × ATR_SMA` (volatility expansion); `max_outside_band_candles` consecutive closes outside the relevant band; `max_rsi_extreme_candles` consecutive RSI extremes against the trade; close beyond entry by ≥ `stop_atr_mult × entry_ATR` against the position (hard SL re-check on close).
   2. **Time exit:** unconditional after `time_exit_hard_candles`; soft exit after `time_exit_soft_candles` IF `touched_middle` is still False AND the current close is on the *wrong side of entry* ("trade simply isn't working" — cleaner than an arbitrary fraction-of-R threshold).
 - **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
-- **Restart recovery:** `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, `outside_band_streak`, `rsi_extreme_streak`, `touched_middle`, and `stop_moved_to_be`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs (stop_loss_id / tp1_id / tp2_id) against live Binance orders. Missing stop is re-placed at `entry_price ± r_distance`; missing TPs are not recreated (their qty was already split off the original fill).
+- **Restart recovery:** `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, `outside_band_streak`, `rsi_extreme_streak`, `touched_middle`, and `stop_moved_to_be`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs (`stop_limit_id` / `stop_market_id` / `tp1_id` / `tp2_id`) against live Binance orders. If either leg of the layered stop is missing, any surviving leg is cancelled and a fresh pair is placed at `entry_price ± r_distance`. Missing TPs are not recreated (their qty was already split off the original fill).
 
 ### Multi-strategy on the same symbol
 Symbol ownership is absolute and short-lived. The first strategy in `config.yaml.strategies` that fires on a given symbol opens the position; every other strategy sees `state_manager.has_position(symbol) == True` and stays silent until the position closes. Strategies do not coordinate directly — they coordinate through StateManager.

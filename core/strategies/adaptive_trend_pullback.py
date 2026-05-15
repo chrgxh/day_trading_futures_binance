@@ -58,9 +58,9 @@ from typing import Optional
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
-from core.strategies.base import Strategy
+from core.strategies.base import LayeredStopIds, Strategy
 from core.types import Action, Position, Signal
-from utils import algo_orders, market, orders
+from utils import market, orders
 from utils.general import PostOnlyRejected, round_price
 from utils.indicators import adx, atr, daily_anchored_vwap, ema, rsi
 
@@ -78,7 +78,7 @@ class _ManagedPosition:
     entry_candle_open_time: int        # ms epoch of the candle that triggered entry
     highest_close: float               # running max close for longs
     lowest_close: float                # running min close for shorts
-    current_stop_order_id: Optional[int] = None
+    stop_ids: Optional[LayeredStopIds] = None   # layered stop (stop-limit + stop-market backstop)
     tp1_order_id: Optional[int] = None
 
 
@@ -500,20 +500,21 @@ class AdaptiveTrendPullback(Strategy):
         tp1_order_id = self._maybe_place_tp1(
             symbol, exit_side, filled_qty, tp1_price, sym_info["step_size"],
         )
-        stop_order_id = self._place_initial_stop(symbol, exit_side, filled_qty, stop_price)
-        if stop_order_id is None:
+        stop_ids = self._place_layered_stop(symbol, exit_side, filled_qty, stop_price)
+        if stop_ids is None:
             self._emergency_close(symbol)
             return
 
         self._record_managed(
             symbol=symbol, is_long=is_long,
             fill_price=fill_price, entry_atr=entry_atr, r_distance=r_distance,
-            filled_qty=filled_qty, stop_order_id=stop_order_id, tp1_order_id=tp1_order_id,
+            filled_qty=filled_qty, stop_ids=stop_ids, tp1_order_id=tp1_order_id,
         )
         self.state_manager.mark_change(symbol)
-        logger.info("{} {} {} opened qty={} fill={} stop={} tp1={} (id={}, stop_id={})",
+        logger.info("{} {} {} opened qty={} fill={} stop={} tp1={} (tp1_id={}, stop_limit_id={}, stop_market_id={})",
                     self.tag, symbol, "LONG" if is_long else "SHORT",
-                    filled_qty, fill_price, stop_price, tp1_price, tp1_order_id, stop_order_id)
+                    filled_qty, fill_price, stop_price, tp1_price,
+                    tp1_order_id, stop_ids.limit_id, stop_ids.market_id)
 
     def _compute_exit_prices(
         self, fill_price: Decimal, entry_atr: float, is_long: bool, tick_size: Decimal,
@@ -543,7 +544,7 @@ class AdaptiveTrendPullback(Strategy):
     def _record_managed(
         self, *, symbol: str, is_long: bool, fill_price: Decimal, entry_atr: float,
         r_distance: float, filled_qty: Decimal,
-        stop_order_id: Optional[int], tp1_order_id: Optional[int],
+        stop_ids: LayeredStopIds, tp1_order_id: Optional[int],
     ) -> None:
         close = float(fill_price)
         self._managed[symbol] = _ManagedPosition(
@@ -556,7 +557,7 @@ class AdaptiveTrendPullback(Strategy):
             entry_candle_open_time=self._buffers[symbol][self._entry_interval][-1]["open_time"],
             highest_close=close,
             lowest_close=close,
-            current_stop_order_id=stop_order_id,
+            stop_ids=stop_ids,
             tp1_order_id=tp1_order_id,
         )
         self.state_manager.register_owner(
@@ -573,8 +574,11 @@ class AdaptiveTrendPullback(Strategy):
         mp = self._managed.get(symbol)
         if mp is None:
             return {}
+        stop_limit_id = mp.stop_ids.limit_id if mp.stop_ids is not None else None
+        stop_market_id = mp.stop_ids.market_id if mp.stop_ids is not None else None
         return {
-            "stop_loss_id": mp.current_stop_order_id,
+            "stop_limit_id": stop_limit_id,
+            "stop_market_id": stop_market_id,
             "tp1_id": mp.tp1_order_id,
         }
 
@@ -597,10 +601,11 @@ class AdaptiveTrendPullback(Strategy):
     def adopt(self, symbol: str, entry: dict) -> None:
         """Rehydrate _ManagedPosition for `symbol` from the persisted entry.
 
-        Reconciles saved order IDs against current open orders on Binance; if the
-        saved stop is missing (cancelled or hit while the bot was down) and the
-        position is still live, a fresh STOP_MARKET is placed at the original
-        stop distance derived from entry_price and r_distance.
+        Reconciles saved order IDs against current open orders on Binance. The
+        protective stop is a LAYERED pair (stop-limit + stop-market backstop);
+        if either leg is missing on Binance, the surviving leg (if any) is
+        cancelled and a fresh pair is placed at entry_price ± r_distance —
+        adopt always produces a complete, correctly-sized pair.
         """
         state = self.state_manager.get_state(symbol)
         if state.position == Position.NONE:
@@ -630,13 +635,26 @@ class AdaptiveTrendPullback(Strategy):
 
         saved_orders = entry.get("orders") or {}
         live_ids = {o["order_id"] for o in state.orders}
-        stop_id = saved_orders.get("stop_loss_id")
+        saved_limit_id = saved_orders.get("stop_limit_id")
+        saved_market_id = saved_orders.get("stop_market_id")
         tp1_id = saved_orders.get("tp1_id")
-        stop_alive = stop_id in live_ids if stop_id is not None else False
+
+        limit_alive = saved_limit_id in live_ids if saved_limit_id is not None else False
+        market_alive = saved_market_id in live_ids if saved_market_id is not None else False
         tp1_alive = tp1_id in live_ids if tp1_id is not None else False
 
-        if not stop_alive:
-            stop_id = self._adopt_replace_stop(symbol, side, qty, entry_price, r_distance)
+        if limit_alive and market_alive:
+            stop_ids: Optional[LayeredStopIds] = LayeredStopIds(
+                limit_id=saved_limit_id, market_id=saved_market_id,
+            )
+        else:
+            survivor = LayeredStopIds(
+                limit_id=saved_limit_id if limit_alive else None,
+                market_id=saved_market_id if market_alive else None,
+            )
+            stop_ids = self._adopt_replace_layered_stop(
+                symbol, side, qty, entry_price, r_distance, survivor_ids=survivor,
+            )
         if not tp1_alive:
             tp1_id = None  # TP1 is optional; don't try to recreate it (sizing already happened)
 
@@ -650,7 +668,7 @@ class AdaptiveTrendPullback(Strategy):
             entry_candle_open_time=entry_candle_open_time,
             highest_close=highest,
             lowest_close=lowest,
-            current_stop_order_id=stop_id,
+            stop_ids=stop_ids,
             tp1_order_id=tp1_id,
         )
         # Push reconciled orders back to disk so the file mirrors live state.
@@ -999,10 +1017,15 @@ class AdaptiveTrendPullback(Strategy):
     def _trail_is_more_favorable(
         self, mp: _ManagedPosition, state, new_trail_price: Decimal,
     ) -> bool:
-        if mp.current_stop_order_id is None:
+        """Compare against the stop-limit leg's trigger (the primary stop level).
+
+        The stop-market backstop sits further out and trails along with it, so
+        comparing against the primary trigger is the right reference.
+        """
+        if mp.stop_ids is None or mp.stop_ids.limit_id is None:
             return True
         existing = next(
-            (o for o in state.orders if o["order_id"] == mp.current_stop_order_id),
+            (o for o in state.orders if o["order_id"] == mp.stop_ids.limit_id),
             None,
         )
         if existing is None:
@@ -1016,26 +1039,18 @@ class AdaptiveTrendPullback(Strategy):
     ) -> None:
         exit_side = "SELL" if mp.side == "LONG" else "BUY"
         self.state_manager.mark_change(mp.symbol)
-        try:
-            new_stop = algo_orders.place_stop_market_order(
-                self.client, mp.symbol, exit_side, qty, new_trail_price,
-            )
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} trailing stop placement failed: {} — keeping old stop",
-                         self.tag, mp.symbol, exc)
+        new_ids = self._replace_layered_stop(
+            mp.symbol, exit_side, qty, new_trail_price, mp.stop_ids,
+        )
+        if new_ids is None:
+            logger.error("{} {} trailing stop placement failed — keeping old stop",
+                         self.tag, mp.symbol)
             self.state_manager.mark_change(mp.symbol)
             return
-
-        old_id = mp.current_stop_order_id
-        mp.current_stop_order_id = new_stop["order_id"]
-        if old_id is not None:
-            try:
-                algo_orders.cancel_algo_order(self.client, mp.symbol, old_id)
-            except (BinanceAPIException, BinanceRequestException) as exc:
-                logger.warning("{} {} could not cancel old stop {} after replacing: {}",
-                               self.tag, mp.symbol, old_id, exc)
+        mp.stop_ids = new_ids
         self._persist_managed(mp.symbol)
         self.state_manager.mark_change(mp.symbol)
-        logger.info("{} {} trail moved to {} (qty={}, new_id={})",
-                    self.tag, mp.symbol, new_trail_price, qty, new_stop["order_id"])
+        logger.info("{} {} trail moved to {} (qty={}, limit_id={}, market_id={})",
+                    self.tag, mp.symbol, new_trail_price, qty,
+                    new_ids.limit_id, new_ids.market_id)
 

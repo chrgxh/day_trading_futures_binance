@@ -77,9 +77,9 @@ from typing import Optional
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
-from core.strategies.base import Strategy
+from core.strategies.base import LayeredStopIds, Strategy
 from core.types import Action, Position, Signal
-from utils import algo_orders, orders
+from utils import orders
 from utils.general import round_price
 from utils.indicators import adx, atr, bollinger_bands, ema, rsi
 
@@ -99,7 +99,7 @@ class _ManagedPosition:
     rsi_extreme_streak: int = 0        # consecutive closes with RSI on the wrong side
     touched_middle: bool = False       # has the position ever reached the bb_middle?
     stop_moved_to_be: bool = False     # has the SL been moved to break-even after TP1?
-    stop_loss_order_id: Optional[int] = None
+    stop_ids: Optional[LayeredStopIds] = None   # layered stop (stop-limit + stop-market backstop)
     tp1_order_id: Optional[int] = None
     tp2_order_id: Optional[int] = None
 
@@ -622,8 +622,8 @@ class BBRsiMeanReversion(Strategy):
         tp2_order_id = self._maybe_place_tp_limit(symbol, exit_side, tp2_qty, tp2_price, "TP2") \
             if tp2_qty > 0 else None
 
-        stop_order_id = self._place_initial_stop(symbol, exit_side, filled_qty, stop_price)
-        if stop_order_id is None:
+        stop_ids = self._place_layered_stop(symbol, exit_side, filled_qty, stop_price)
+        if stop_ids is None:
             self._emergency_close(symbol)
             return
 
@@ -631,13 +631,14 @@ class BBRsiMeanReversion(Strategy):
             symbol=symbol, is_long=is_long,
             fill_price=fill_price, entry_atr=entry_atr, r_distance=r_distance,
             filled_qty=filled_qty,
-            stop_order_id=stop_order_id, tp1_order_id=tp1_order_id, tp2_order_id=tp2_order_id,
+            stop_ids=stop_ids, tp1_order_id=tp1_order_id, tp2_order_id=tp2_order_id,
         )
         self.state_manager.mark_change(symbol)
-        logger.info("{} {} {} opened qty={} fill={} stop={} tp1={} tp2={} (stop_id={}, tp1_id={}, tp2_id={})",
+        logger.info("{} {} {} opened qty={} fill={} stop={} tp1={} tp2={} "
+                    "(stop_limit_id={}, stop_market_id={}, tp1_id={}, tp2_id={})",
                     self.tag, symbol, "LONG" if is_long else "SHORT",
                     filled_qty, fill_price, stop_price, tp1_price, tp2_price,
-                    stop_order_id, tp1_order_id, tp2_order_id)
+                    stop_ids.limit_id, stop_ids.market_id, tp1_order_id, tp2_order_id)
 
     def _compute_exit_prices(
         self,
@@ -702,7 +703,7 @@ class BBRsiMeanReversion(Strategy):
         self, *,
         symbol: str, is_long: bool, fill_price: Decimal, entry_atr: float,
         r_distance: float, filled_qty: Decimal,
-        stop_order_id: Optional[int], tp1_order_id: Optional[int], tp2_order_id: Optional[int],
+        stop_ids: LayeredStopIds, tp1_order_id: Optional[int], tp2_order_id: Optional[int],
     ) -> None:
         self._managed[symbol] = _ManagedPosition(
             symbol=symbol,
@@ -712,7 +713,7 @@ class BBRsiMeanReversion(Strategy):
             r_distance=r_distance,
             initial_qty=filled_qty,
             entry_candle_open_time=self._buffers[symbol][self._entry_interval][-1]["open_time"],
-            stop_loss_order_id=stop_order_id,
+            stop_ids=stop_ids,
             tp1_order_id=tp1_order_id,
             tp2_order_id=tp2_order_id,
         )
@@ -730,8 +731,11 @@ class BBRsiMeanReversion(Strategy):
         mp = self._managed.get(symbol)
         if mp is None:
             return {}
+        stop_limit_id = mp.stop_ids.limit_id if mp.stop_ids is not None else None
+        stop_market_id = mp.stop_ids.market_id if mp.stop_ids is not None else None
         return {
-            "stop_loss_id": mp.stop_loss_order_id,
+            "stop_limit_id": stop_limit_id,
+            "stop_market_id": stop_market_id,
             "tp1_id": mp.tp1_order_id,
             "tp2_id": mp.tp2_order_id,
         }
@@ -793,15 +797,28 @@ class BBRsiMeanReversion(Strategy):
 
         saved_orders = entry.get("orders") or {}
         live_ids = {o["order_id"] for o in state.orders}
-        stop_id = saved_orders.get("stop_loss_id")
+        saved_limit_id = saved_orders.get("stop_limit_id")
+        saved_market_id = saved_orders.get("stop_market_id")
         tp1_id = saved_orders.get("tp1_id")
         tp2_id = saved_orders.get("tp2_id")
-        stop_alive = stop_id in live_ids if stop_id is not None else False
+
+        limit_alive = saved_limit_id in live_ids if saved_limit_id is not None else False
+        market_alive = saved_market_id in live_ids if saved_market_id is not None else False
         tp1_alive = tp1_id in live_ids if tp1_id is not None else False
         tp2_alive = tp2_id in live_ids if tp2_id is not None else False
 
-        if not stop_alive:
-            stop_id = self._adopt_replace_stop(symbol, side, qty, entry_price, r_distance)
+        if limit_alive and market_alive:
+            stop_ids: Optional[LayeredStopIds] = LayeredStopIds(
+                limit_id=saved_limit_id, market_id=saved_market_id,
+            )
+        else:
+            survivor = LayeredStopIds(
+                limit_id=saved_limit_id if limit_alive else None,
+                market_id=saved_market_id if market_alive else None,
+            )
+            stop_ids = self._adopt_replace_layered_stop(
+                symbol, side, qty, entry_price, r_distance, survivor_ids=survivor,
+            )
         if not tp1_alive:
             tp1_id = None
         if not tp2_alive:
@@ -819,7 +836,7 @@ class BBRsiMeanReversion(Strategy):
             rsi_extreme_streak=rsi_streak,
             touched_middle=touched_middle,
             stop_moved_to_be=stop_moved_to_be,
-            stop_loss_order_id=stop_id,
+            stop_ids=stop_ids,
             tp1_order_id=tp1_id,
             tp2_order_id=tp2_id,
         )
@@ -868,7 +885,7 @@ class BBRsiMeanReversion(Strategy):
         self._log_managed_hold(mp, ind, candles_since_entry)
 
     def _move_stop_to_break_even(self, mp: _ManagedPosition, state) -> None:
-        """Place a new STOP_MARKET at entry (± optional ATR offset) and cancel the old.
+        """Replace the layered stop with a new pair at entry (± optional ATR offset).
 
         Place-then-cancel so the position is never momentarily unprotected. Sized
         to the CURRENT remaining position (state.size), not the original qty —
@@ -886,29 +903,22 @@ class BBRsiMeanReversion(Strategy):
         new_stop_price = round_price(Decimal(str(raw)), tick_size)
 
         self.state_manager.mark_change(mp.symbol)
-        try:
-            new_stop = algo_orders.place_stop_market_order(
-                self.client, mp.symbol, exit_side, state.size, new_stop_price,
-            )
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} break-even stop placement failed: {} — keeping old stop",
-                         self.tag, mp.symbol, exc)
+        new_ids = self._replace_layered_stop(
+            mp.symbol, exit_side, state.size, new_stop_price, mp.stop_ids,
+        )
+        if new_ids is None:
+            logger.error("{} {} break-even stop placement failed — keeping old stop",
+                         self.tag, mp.symbol)
             self.state_manager.mark_change(mp.symbol)
             return
 
-        old_id = mp.stop_loss_order_id
-        mp.stop_loss_order_id = new_stop["order_id"]
+        mp.stop_ids = new_ids
         mp.stop_moved_to_be = True
-        if old_id is not None:
-            try:
-                algo_orders.cancel_algo_order(self.client, mp.symbol, old_id)
-            except (BinanceAPIException, BinanceRequestException) as exc:
-                logger.warning("{} {} could not cancel old stop {} after BE move: {}",
-                               self.tag, mp.symbol, old_id, exc)
         self._persist_managed(mp.symbol)
         self.state_manager.mark_change(mp.symbol)
-        logger.info("{} {} stop moved to break-even @ {} (qty={}, new_id={})",
-                    self.tag, mp.symbol, new_stop_price, state.size, new_stop["order_id"])
+        logger.info("{} {} stop moved to break-even @ {} (qty={}, limit_id={}, market_id={})",
+                    self.tag, mp.symbol, new_stop_price, state.size,
+                    new_ids.limit_id, new_ids.market_id)
 
     def _update_streaks_and_touch(
         self, mp: _ManagedPosition, ind: _EntryIndicators,

@@ -17,6 +17,7 @@ any entry).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -28,6 +29,22 @@ from core.types import Position, Signal
 from utils import algo_orders, orders, positions
 from utils.general import round_price
 from utils.indicators import atr
+
+
+@dataclass
+class LayeredStopIds:
+    """The two algo-order IDs that together form one layered stop.
+
+    `limit_id` — stop-limit (primary, intended fill at trigger price).
+    `market_id` — stop-market backstop (fires further from entry, guarantees exit).
+    Either may be None if a leg was never placed or has been cancelled/filled.
+    """
+
+    limit_id: Optional[int] = None
+    market_id: Optional[int] = None
+
+    def is_complete(self) -> bool:
+        return self.limit_id is not None and self.market_id is not None
 
 if TYPE_CHECKING:
     from core.risk_guard import RiskGuard
@@ -180,18 +197,117 @@ class Strategy(ABC):
         series = atr(candles, atr_period)
         return series[-1] if series else None
 
-    def _place_initial_stop(
+    # ------------------------------------------------------------------
+    # Layered stop primitives
+    #
+    # Every protective stop is a PAIR:
+    #   - A stop-limit at the configured stop_price (preferred fill; pays nothing
+    #     beyond slippage to the limit price).
+    #   - A stop-market backstop `stop_market_backstop_pct` further from entry
+    #     (guarantees exit if the limit gets skipped or sits unfilled).
+    #
+    # Both legs are reduceOnly, sized to the full position qty. Reduce-only caps
+    # the second leg automatically if the first partially fills, so partial fills
+    # are handled by the exchange.
+    #
+    # Tunable per-strategy in `params`:
+    #   stop_limit_buffer_pct  — limit price offset vs trigger (% of price).
+    #                            0.0 → limit at trigger; positive → limit slightly
+    #                            past trigger (more aggressive, more likely to fill).
+    #   stop_market_backstop_pct — backstop trigger offset vs primary stop (% of price).
+    # ------------------------------------------------------------------
+
+    def _layered_stop_pcts(self) -> tuple[Decimal, Decimal]:
+        """Return (limit_buffer_pct, backstop_offset_pct) as Decimals.
+
+        Both are converted from percent values (e.g. 0.1 → 0.001).
+        """
+        limit_buffer = Decimal(str(self.params.get("stop_limit_buffer_pct", 0.0))) / Decimal("100")
+        backstop = Decimal(str(self.params.get("stop_market_backstop_pct", 0.1))) / Decimal("100")
+        return limit_buffer, backstop
+
+    def _compute_layered_stop_prices(
+        self, *, stop_price: Decimal, exit_side: str, tick_size: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        """Derive (limit_trigger, limit_price, market_trigger) from the desired stop.
+
+        `exit_side` is the side of the protective orders ("SELL" closes a LONG,
+        "BUY" closes a SHORT). For SELL (long protection, stop below price), the
+        backstop sits BELOW stop_price; for BUY it sits ABOVE.
+        """
+        limit_buffer_pct, backstop_pct = self._layered_stop_pcts()
+        limit_trigger = stop_price
+        if exit_side == "SELL":
+            limit_price = round_price(stop_price * (Decimal("1") - limit_buffer_pct), tick_size)
+            market_trigger = round_price(stop_price * (Decimal("1") - backstop_pct), tick_size)
+        else:
+            limit_price = round_price(stop_price * (Decimal("1") + limit_buffer_pct), tick_size)
+            market_trigger = round_price(stop_price * (Decimal("1") + backstop_pct), tick_size)
+        return limit_trigger, limit_price, market_trigger
+
+    def _place_layered_stop(
         self, symbol: str, exit_side: str, qty: Decimal, stop_price: Decimal,
-    ) -> Optional[int]:
-        """Place a STOP_MARKET; return order id, or None on error (logged)."""
+    ) -> Optional[LayeredStopIds]:
+        """Place a stop-limit + stop-market backstop pair.
+
+        On success returns a fully-populated `LayeredStopIds`. On failure of
+        EITHER leg, cancels any successfully-placed leg and returns None so the
+        caller can emergency-close (the position would otherwise be unprotected).
+        """
+        tick_size = self.sym_infos[symbol]["tick_size"]
+        limit_trigger, limit_price, market_trigger = self._compute_layered_stop_prices(
+            stop_price=stop_price, exit_side=exit_side, tick_size=tick_size,
+        )
         try:
-            stop = algo_orders.place_stop_market_order(
-                self.client, symbol, exit_side, qty, stop_price,
+            sl = algo_orders.place_stop_limit_order(
+                self.client, symbol, exit_side, qty, limit_trigger, limit_price,
             )
-            return stop["order_id"]
         except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} initial stop placement failed: {}", self.tag, symbol, exc)
+            logger.error("{} {} stop-limit placement failed @ trigger={} limit={}: {}",
+                         self.tag, symbol, limit_trigger, limit_price, exc)
             return None
+        try:
+            sm = algo_orders.place_stop_market_order(
+                self.client, symbol, exit_side, qty, market_trigger,
+            )
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.error("{} {} stop-market backstop placement failed @ {}: {} — cancelling stop-limit {}",
+                         self.tag, symbol, market_trigger, exc, sl["order_id"])
+            try:
+                algo_orders.cancel_algo_order(self.client, symbol, sl["order_id"])
+            except (BinanceAPIException, BinanceRequestException) as cancel_exc:
+                logger.warning("{} {} could not cancel orphaned stop-limit {}: {}",
+                               self.tag, symbol, sl["order_id"], cancel_exc)
+            return None
+        return LayeredStopIds(limit_id=sl["order_id"], market_id=sm["order_id"])
+
+    def _cancel_layered_stop(self, symbol: str, ids: Optional[LayeredStopIds]) -> None:
+        """Best-effort cancellation of both legs. Logs warnings on failure."""
+        if ids is None:
+            return
+        for label, oid in (("stop-limit", ids.limit_id), ("stop-market", ids.market_id)):
+            if oid is None:
+                continue
+            try:
+                algo_orders.cancel_algo_order(self.client, symbol, oid)
+            except (BinanceAPIException, BinanceRequestException) as exc:
+                logger.warning("{} {} could not cancel {} {}: {}",
+                               self.tag, symbol, label, oid, exc)
+
+    def _replace_layered_stop(
+        self, symbol: str, exit_side: str, qty: Decimal,
+        new_stop_price: Decimal, old_ids: Optional[LayeredStopIds],
+    ) -> Optional[LayeredStopIds]:
+        """Place a new layered pair, then cancel the old. Never momentarily unprotected.
+
+        Returns the new ids on success; returns None on failure with the old
+        orders left in place (caller keeps using `old_ids`).
+        """
+        new_ids = self._place_layered_stop(symbol, exit_side, qty, new_stop_price)
+        if new_ids is None:
+            return None
+        self._cancel_layered_stop(symbol, old_ids)
+        return new_ids
 
     def _emergency_close(self, symbol: str) -> None:
         """Market-close a position when no protective stop is in place."""
@@ -230,10 +346,17 @@ class Strategy(ABC):
                         self.tag, symbol)
             self._managed.pop(symbol, None)
 
-    def _adopt_replace_stop(
-        self, symbol: str, side: str, qty: Decimal, entry_price: Decimal, r_distance: float,
-    ) -> Optional[int]:
-        """Re-place a missing stop on adopt at entry_price ± r_distance."""
+    def _adopt_replace_layered_stop(
+        self, symbol: str, side: str, qty: Decimal,
+        entry_price: Decimal, r_distance: float,
+        survivor_ids: Optional[LayeredStopIds] = None,
+    ) -> Optional[LayeredStopIds]:
+        """Re-place a missing layered stop on adopt at entry_price ± r_distance.
+
+        If `survivor_ids` is provided, any surviving leg is cancelled first so the
+        adopt always produces a fresh, correctly-sized pair (no risk of a stale
+        leg sized to the original qty drifting against a partially-filled position).
+        """
         is_long = side == "LONG"
         tick_size = self.sym_infos[symbol]["tick_size"]
         if is_long:
@@ -242,17 +365,16 @@ class Strategy(ABC):
             stop_price = round_price(entry_price + Decimal(str(r_distance)), tick_size)
         exit_side = "SELL" if is_long else "BUY"
         self.state_manager.mark_change(symbol)
-        try:
-            new_stop = algo_orders.place_stop_market_order(
-                self.client, symbol, exit_side, qty, stop_price,
-            )
-            logger.warning("{} {} adopt: original stop missing — placed new STOP_MARKET @ {} (id={})",
-                           self.tag, symbol, stop_price, new_stop["order_id"])
-            return new_stop["order_id"]
-        except (BinanceAPIException, BinanceRequestException) as exc:
-            logger.error("{} {} adopt: could not re-place stop @ {}: {}",
-                         self.tag, symbol, stop_price, exc)
+        if survivor_ids is not None:
+            self._cancel_layered_stop(symbol, survivor_ids)
+        ids = self._place_layered_stop(symbol, exit_side, qty, stop_price)
+        if ids is None:
+            logger.error("{} {} adopt: could not re-place layered stop @ {}",
+                         self.tag, symbol, stop_price)
             return None
+        logger.warning("{} {} adopt: layered stop missing — placed new pair @ {} (limit_id={}, market_id={})",
+                       self.tag, symbol, stop_price, ids.limit_id, ids.market_id)
+        return ids
 
     def _exit_position(self, symbol: str, reason: str) -> None:
         """Cancel all orders + market-close + drop local managed entry."""

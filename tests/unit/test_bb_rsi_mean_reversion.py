@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.strategies.base import LayeredStopIds
 from core.strategies.bb_rsi_mean_reversion import (
     BBRsiMeanReversion,
     _EntryIndicators,
@@ -543,7 +544,7 @@ def test_adopt_skips_when_no_position():
         "strategy_state": {"entry_atr": 1.0, "r_distance": 1.0,
                            "outside_band_streak": 0, "rsi_extreme_streak": 0,
                            "touched_middle": False, "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 7, "tp1_id": 8, "tp2_id": 9},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": 8, "tp2_id": 9},
     }
     s.adopt("BTCUSDT", entry)
     assert "BTCUSDT" not in s._managed
@@ -554,6 +555,7 @@ def test_adopt_rehydrates_when_orders_alive():
     live_state = _state(position=Position.LONG, size=D("1"))
     live_state.orders = [
         {"order_id": 7, "side": "SELL", "is_algo": True},
+        {"order_id": 70, "side": "SELL", "is_algo": True},
         {"order_id": 8, "side": "SELL", "is_algo": False},
         {"order_id": 9, "side": "SELL", "is_algo": False},
     ]
@@ -564,7 +566,7 @@ def test_adopt_rehydrates_when_orders_alive():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 2.0,
                            "outside_band_streak": 1, "rsi_extreme_streak": 0,
                            "touched_middle": True, "entry_candle_open_time": 42},
-        "orders": {"stop_loss_id": 7, "tp1_id": 8, "tp2_id": 9},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": 8, "tp2_id": 9},
     }
     s.adopt("BTCUSDT", entry)
     mp = s._managed["BTCUSDT"]
@@ -574,7 +576,9 @@ def test_adopt_rehydrates_when_orders_alive():
     assert mp.r_distance == 2.0
     assert mp.outside_band_streak == 1
     assert mp.touched_middle is True
-    assert mp.stop_loss_order_id == 7
+    assert mp.stop_ids is not None
+    assert mp.stop_ids.limit_id == 7
+    assert mp.stop_ids.market_id == 70
     assert mp.tp1_order_id == 8
     assert mp.tp2_order_id == 9
 
@@ -590,19 +594,27 @@ def test_adopt_replaces_missing_stop_long():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 2.0,
                            "outside_band_streak": 0, "rsi_extreme_streak": 0,
                            "touched_middle": False, "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 99, "tp1_id": None, "tp2_id": None},
+        "orders": {"stop_limit_id": 99, "stop_market_id": 100, "tp1_id": None, "tp2_id": None},
     }
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order",
-               return_value={"order_id": 321}) as place_stop:
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 321}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 322}) as place_market:
         s.adopt("BTCUSDT", entry)
-        args, _ = place_stop.call_args
-        # symbol, side, qty, stop_price — entry - r_distance = 98
-        assert args[1] == "BTCUSDT"
-        assert args[2] == "SELL"
-        assert args[3] == D("1")
-        assert args[4] == D("98.0")
+        limit_args = place_limit.call_args.args
+        # symbol, side, qty, trigger, limit_price — entry - r_distance = 98
+        assert limit_args[1] == "BTCUSDT"
+        assert limit_args[2] == "SELL"
+        assert limit_args[3] == D("1")
+        assert limit_args[4] == D("98.0")
+        assert limit_args[5] == D("98.0")           # default buffer 0 → limit at trigger
+        # backstop 0.1% below 98 = 97.902, rounded to tick 0.1 → 97.9
+        market_args = place_market.call_args.args
+        assert market_args[2] == "SELL"
+        assert market_args[4] == D("97.9")
     mp = s._managed["BTCUSDT"]
-    assert mp.stop_loss_order_id == 321
+    assert mp.stop_ids.limit_id == 321
+    assert mp.stop_ids.market_id == 322
     assert mp.tp1_order_id is None
     assert mp.tp2_order_id is None
 
@@ -618,15 +630,23 @@ def test_adopt_replaces_missing_stop_short():
         "strategy_state": {"entry_atr": 2.0, "r_distance": 2.0,
                            "outside_band_streak": 0, "rsi_extreme_streak": 0,
                            "touched_middle": False, "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 99, "tp1_id": None, "tp2_id": None},
+        "orders": {"stop_limit_id": 99, "stop_market_id": 100, "tp1_id": None, "tp2_id": None},
     }
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order",
-               return_value={"order_id": 654}) as place_stop:
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 654}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 655}) as place_market:
         s.adopt("BTCUSDT", entry)
-        args, _ = place_stop.call_args
-        assert args[2] == "BUY"
-        assert args[4] == D("102.0")
-    assert s._managed["BTCUSDT"].stop_loss_order_id == 654
+        limit_args = place_limit.call_args.args
+        assert limit_args[2] == "BUY"
+        assert limit_args[4] == D("102.0")
+        market_args = place_market.call_args.args
+        assert market_args[2] == "BUY"
+        # backstop 0.1% above 102 = 102.102, rounded to 102.1
+        assert market_args[4] == D("102.1")
+    mp = s._managed["BTCUSDT"]
+    assert mp.stop_ids.limit_id == 654
+    assert mp.stop_ids.market_id == 655
 
 
 def test_adopt_pre_existing_ignores_other_strategy_entries():
@@ -762,11 +782,15 @@ def test_build_signal_returns_structure_stop_short():
 # Break-even SL move (fires when position size shrinks vs initial)
 # ---------------------------------------------------------------------------
 
+def _layered(limit_id: int = 11, market_id: int = 12) -> LayeredStopIds:
+    return LayeredStopIds(limit_id=limit_id, market_id=market_id)
+
+
 def test_be_move_fires_when_position_size_shrinks():
     s = _build({"break_even_offset_atr_mult": 0.0})
     mp = _make_mp(side="LONG", entry=100.0, atr_val=2.0)
     mp.initial_qty = D("1.0")
-    mp.stop_loss_order_id = 11
+    mp.stop_ids = _layered(11, 12)
 
     # Live state: position open with 30% of initial qty (TP1 = 70% filled)
     live = _state(position=Position.LONG, size=D("0.3"))
@@ -778,21 +802,27 @@ def test_be_move_fires_when_position_size_shrinks():
     ]
     s._managed["BTCUSDT"] = mp
 
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order",
-               return_value={"order_id": 999}) as place_stop, \
-         patch("core.strategies.bb_rsi_mean_reversion.algo_orders.cancel_algo_order") as cancel_old, \
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 999}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 1000}) as place_market, \
+         patch("core.strategies.base.algo_orders.cancel_algo_order") as cancel_old, \
          patch.object(s, "_regime_adx_now", return_value=15.0):
         s._manage_position("BTCUSDT")
-        place_stop.assert_called_once()
-        args, _kw = place_stop.call_args
-        # symbol, exit_side, qty, stop_price
-        assert args[1] == "BTCUSDT"
-        assert args[2] == "SELL"
-        assert args[3] == D("0.3")       # qty matches remaining position
-        assert args[4] == D("100.0")     # break-even = entry
-        cancel_old.assert_called_once_with(s.client, "BTCUSDT", 11)
+        place_limit.assert_called_once()
+        place_market.assert_called_once()
+        # stop-limit: symbol, exit_side, qty, trigger, limit_price
+        limit_args = place_limit.call_args.args
+        assert limit_args[1] == "BTCUSDT"
+        assert limit_args[2] == "SELL"
+        assert limit_args[3] == D("0.3")       # qty matches remaining position
+        assert limit_args[4] == D("100.0")     # break-even = entry
+        # both old legs should have been cancelled (place-then-cancel)
+        cancel_calls = {c.args[2] for c in cancel_old.call_args_list}
+        assert cancel_calls == {11, 12}
     assert mp.stop_moved_to_be is True
-    assert mp.stop_loss_order_id == 999
+    assert mp.stop_ids.limit_id == 999
+    assert mp.stop_ids.market_id == 1000
 
 
 def test_be_move_does_not_fire_again_after_first():
@@ -800,7 +830,7 @@ def test_be_move_does_not_fire_again_after_first():
     mp = _make_mp(side="LONG", entry=100.0, atr_val=2.0)
     mp.initial_qty = D("1.0")
     mp.stop_moved_to_be = True            # already moved once
-    mp.stop_loss_order_id = 11
+    mp.stop_ids = _layered(11, 12)
 
     s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("0.3"))
     s._buffers["BTCUSDT"]["30m"] = [
@@ -808,17 +838,19 @@ def test_be_move_does_not_fire_again_after_first():
     ]
     s._managed["BTCUSDT"] = mp
 
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order") as place_stop, \
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order") as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order") as place_market, \
          patch.object(s, "_regime_adx_now", return_value=15.0):
         s._manage_position("BTCUSDT")
-        place_stop.assert_not_called()
+        place_limit.assert_not_called()
+        place_market.assert_not_called()
 
 
 def test_be_move_does_not_fire_when_size_unchanged():
     s = _build()
     mp = _make_mp(side="LONG", entry=100.0, atr_val=2.0)
     mp.initial_qty = D("1.0")
-    mp.stop_loss_order_id = 11
+    mp.stop_ids = _layered(11, 12)
 
     # Full size still on position — no TP fill yet
     s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("1.0"))
@@ -827,10 +859,12 @@ def test_be_move_does_not_fire_when_size_unchanged():
     ]
     s._managed["BTCUSDT"] = mp
 
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order") as place_stop, \
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order") as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order") as place_market, \
          patch.object(s, "_regime_adx_now", return_value=15.0):
         s._manage_position("BTCUSDT")
-        place_stop.assert_not_called()
+        place_limit.assert_not_called()
+        place_market.assert_not_called()
     assert mp.stop_moved_to_be is False
 
 
@@ -838,7 +872,7 @@ def test_be_move_with_offset_above_entry_long():
     s = _build({"break_even_offset_atr_mult": 0.1})   # entry + 0.1*ATR
     mp = _make_mp(side="LONG", entry=100.0, atr_val=2.0)
     mp.initial_qty = D("1.0")
-    mp.stop_loss_order_id = 11
+    mp.stop_ids = _layered(11, 12)
 
     s.state_manager.get_state.return_value = _state(position=Position.LONG, size=D("0.3"))
     s._buffers["BTCUSDT"]["30m"] = [
@@ -846,21 +880,23 @@ def test_be_move_with_offset_above_entry_long():
     ]
     s._managed["BTCUSDT"] = mp
 
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order",
-               return_value={"order_id": 999}) as place_stop, \
-         patch("core.strategies.bb_rsi_mean_reversion.algo_orders.cancel_algo_order"), \
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 999}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 1000}), \
+         patch("core.strategies.base.algo_orders.cancel_algo_order"), \
          patch.object(s, "_regime_adx_now", return_value=15.0):
         s._manage_position("BTCUSDT")
-        args, _kw = place_stop.call_args
+        limit_args = place_limit.call_args.args
         # 100 + 0.1*2 = 100.2 (rounded to 0.1 tick)
-        assert args[4] == D("100.2")
+        assert limit_args[4] == D("100.2")
 
 
 def test_be_move_short_places_buy_stop_at_entry():
     s = _build({"break_even_offset_atr_mult": 0.0})
     mp = _make_mp(side="SHORT", entry=100.0, atr_val=2.0)
     mp.initial_qty = D("1.0")
-    mp.stop_loss_order_id = 11
+    mp.stop_ids = _layered(11, 12)
 
     s.state_manager.get_state.return_value = _state(position=Position.SHORT, size=D("0.3"))
     s._buffers["BTCUSDT"]["30m"] = [
@@ -868,14 +904,16 @@ def test_be_move_short_places_buy_stop_at_entry():
     ]
     s._managed["BTCUSDT"] = mp
 
-    with patch("core.strategies.bb_rsi_mean_reversion.algo_orders.place_stop_market_order",
-               return_value={"order_id": 999}) as place_stop, \
-         patch("core.strategies.bb_rsi_mean_reversion.algo_orders.cancel_algo_order"), \
+    with patch("core.strategies.base.algo_orders.place_stop_limit_order",
+               return_value={"order_id": 999}) as place_limit, \
+         patch("core.strategies.base.algo_orders.place_stop_market_order",
+               return_value={"order_id": 1000}), \
+         patch("core.strategies.base.algo_orders.cancel_algo_order"), \
          patch.object(s, "_regime_adx_now", return_value=15.0):
         s._manage_position("BTCUSDT")
-        args, _kw = place_stop.call_args
-        assert args[2] == "BUY"
-        assert args[4] == D("100.0")
+        limit_args = place_limit.call_args.args
+        assert limit_args[2] == "BUY"
+        assert limit_args[4] == D("100.0")
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +933,7 @@ def test_adopt_restores_stop_moved_to_be():
     live_state = _state(position=Position.LONG, size=D("0.3"))
     live_state.orders = [
         {"order_id": 7, "side": "SELL", "is_algo": True},
+        {"order_id": 70, "side": "SELL", "is_algo": True},
     ]
     s.state_manager.get_state.return_value = live_state
     entry = {
@@ -904,7 +943,7 @@ def test_adopt_restores_stop_moved_to_be():
                            "outside_band_streak": 0, "rsi_extreme_streak": 0,
                            "touched_middle": True, "stop_moved_to_be": True,
                            "entry_candle_open_time": 0},
-        "orders": {"stop_loss_id": 7, "tp1_id": None, "tp2_id": None},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": None, "tp2_id": None},
     }
     s.adopt("BTCUSDT", entry)
     assert s._managed["BTCUSDT"].stop_moved_to_be is True
@@ -915,6 +954,7 @@ def test_adopt_defaults_stop_moved_to_be_false_when_missing():
     live_state = _state(position=Position.LONG, size=D("1"))
     live_state.orders = [
         {"order_id": 7, "side": "SELL", "is_algo": True},
+        {"order_id": 70, "side": "SELL", "is_algo": True},
     ]
     s.state_manager.get_state.return_value = live_state
     entry = {
@@ -924,7 +964,7 @@ def test_adopt_defaults_stop_moved_to_be_false_when_missing():
                            "outside_band_streak": 0, "rsi_extreme_streak": 0,
                            "touched_middle": False,
                            "entry_candle_open_time": 0},  # no stop_moved_to_be key
-        "orders": {"stop_loss_id": 7, "tp1_id": None, "tp2_id": None},
+        "orders": {"stop_limit_id": 7, "stop_market_id": 70, "tp1_id": None, "tp2_id": None},
     }
     s.adopt("BTCUSDT", entry)
     assert s._managed["BTCUSDT"].stop_moved_to_be is False
