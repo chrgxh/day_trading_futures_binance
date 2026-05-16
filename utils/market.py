@@ -1,23 +1,18 @@
 """Public market data — no authentication required."""
 
 import asyncio
-import json
 import re
-import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 
-import websockets
+from binance import ThreadedWebsocketManager
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from dateutil import parser as dateutil_parser
 from loguru import logger
 
 from utils.general import with_retry
-
-_FSTREAM_URL = "wss://fstream.binance.com"
-_FSTREAM_TESTNET_URL = "wss://stream.binancefuture.com"
 
 
 def _to_ms(date_str: str) -> int:
@@ -158,11 +153,13 @@ def _interval_ms(interval: str) -> int:
 
 
 class _KlineStreamManager:
-    """Direct WebSocket connection to Binance Futures kline streams.
+    """Binance Futures kline streams via the python-binance socket manager.
 
-    Subscribes to many (symbol, interval) pairs on a single connection. On every closed
-    candle, detects time gaps against the last-seen candle for the same (symbol, interval)
-    and REST-fills missing candles before delivering the new one.
+    Subscribes to many (symbol, interval) pairs on a single multiplexed connection
+    through `ThreadedWebsocketManager`, which owns the socket URL (testnet vs
+    mainnet), its own thread + event loop, and the reconnect logic. On every closed
+    candle, detects time gaps against the last-seen candle for the same
+    (symbol, interval) and REST-fills missing candles before delivering the new one.
     """
 
     def __init__(
@@ -173,88 +170,57 @@ class _KlineStreamManager:
         on_closed_candle: Callable[[str, str, dict], None],
     ) -> None:
         self._client = client
-        self._testnet = testnet
         self._pairs = pairs
         self._on_closed_candle = on_closed_candle
         self._last_open_time: dict[tuple[str, str], int] = {}
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        # A dedicated loop per manager: ThreadedWebsocketManager otherwise
+        # defaults to asyncio.get_event_loop(), which hands every manager
+        # constructed on the main thread the *same* loop — the second one to
+        # start then fails ("Socket Manager failed to initialize").
+        self._twm = ThreadedWebsocketManager(
+            api_key=client.API_KEY,
+            api_secret=client.API_SECRET,
+            testnet=testnet,
+            loop=asyncio.new_event_loop(),
+        )
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._thread_main, daemon=True, name="kline-ws")
-        self._thread.start()
+        self._twm.start()
+        streams = [f"{s.lower()}@kline_{i}" for s, i in self._pairs]
+        self._twm.start_futures_multiplex_socket(
+            callback=self._handle_message, streams=streams,
+        )
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._loop is not None and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=10)
-
-    def _thread_main(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
         try:
-            self._loop.run_until_complete(self._stream_loop())
+            self._twm.stop()
         except Exception as exc:
-            if not self._stop.is_set():
-                logger.error("Kline WS thread error: {}", exc)
-        finally:
-            # Cancel pending tasks (websockets keepalive, recv) so they don't
-            # try to schedule callbacks on a closed loop after we close it.
-            try:
-                pending = asyncio.all_tasks(self._loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    self._loop.run_until_complete(
-                        asyncio.gather(*pending, return_exceptions=True)
-                    )
-            except Exception:
-                pass
-            self._loop.close()
+            logger.warning("Kline WS stop failed: {}", exc)
 
-    async def _stream_loop(self) -> None:
-        base = _FSTREAM_TESTNET_URL if self._testnet else _FSTREAM_URL
-        streams = "/".join(f"{s.lower()}@kline_{i}" for s, i in self._pairs)
-        url = f"{base}/stream?streams={streams}"
+    def _handle_message(self, msg: dict) -> None:
+        """Handle one multiplexed WS message (a dict from ThreadedWebsocketManager).
 
-        while not self._stop.is_set():
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=60) as ws:
-                    logger.debug("Kline WS connected: {}", url)
-                    async for raw in ws:
-                        if self._stop.is_set():
-                            return
-                        try:
-                            self._handle_message(raw)
-                        except Exception as exc:
-                            logger.error("WS kline handler error: {}", exc)
-            except asyncio.CancelledError:
+        Combined-stream payloads are wrapped as {"stream": ..., "data": ...}; the
+        socket manager also emits {"e": "error", ...} dicts on disconnect (it then
+        reconnects on its own — the gap-fill covers any candles missed meanwhile).
+        """
+        try:
+            if msg.get("e") == "error":
+                logger.warning("[ws] kline stream error: {}", msg.get("m"))
                 return
-            except Exception as exc:
-                if self._stop.is_set():
-                    return
-                logger.warning("Kline WS disconnected ({}), reconnecting in 5s", exc)
-                try:
-                    await asyncio.sleep(5)
-                except asyncio.CancelledError:
-                    return
-
-    def _handle_message(self, raw: str) -> None:
-        wrapper = json.loads(raw)
-        data = wrapper.get("data", wrapper)
-        stream = wrapper.get("stream", "")
-        if "@" not in stream:
-            return
-        symbol_part, kline_part = stream.split("@", 1)
-        symbol = symbol_part.upper()
-        interval = kline_part.split("_", 1)[1] if "_" in kline_part else ""
-        candle = parse_kline_ws(data)
-        if candle is None or not symbol or not interval:
-            return
-        self._deliver_with_gap_fill(symbol, interval, candle)
+            data = msg.get("data", msg)
+            stream = msg.get("stream", "")
+            if "@" not in stream:
+                return
+            symbol_part, kline_part = stream.split("@", 1)
+            symbol = symbol_part.upper()
+            interval = kline_part.split("_", 1)[1] if "_" in kline_part else ""
+            candle = parse_kline_ws(data)
+            if candle is None or not symbol or not interval:
+                return
+            self._deliver_with_gap_fill(symbol, interval, candle)
+        except Exception as exc:
+            logger.error("WS kline handler error: {}", exc)
 
     def _deliver_with_gap_fill(self, symbol: str, interval: str, candle: dict) -> None:
         key = (symbol, interval)

@@ -90,6 +90,6 @@ def test_start_kline_streams_connects(client, symbol):
     )
     try:
         time.sleep(3)
-        assert mgr._thread is not None and mgr._thread.is_alive()
+        assert mgr._twm.is_alive()
     finally:
         mgr.stop()

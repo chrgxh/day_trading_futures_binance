@@ -23,7 +23,7 @@ utils/
   algo_orders.py                    — conditional orders (stop/TP market & limit)
   positions.py                      — close_position
   market.py                         — OHLCV, mark price, multi-(symbol,interval) WS with gap-fill
-  user_stream.py                    — authenticated user-data WS: listenKey lifecycle + event delivery
+  user_stream.py                    — authenticated user-data WS (SDK ThreadedWebsocketManager): event delivery
   indicators.py                     — SMA, EMA, MACD, ADX, ATR, RSI, bollinger_bands, daily_anchored_vwap, resample_to_1h
 config.yaml                         — symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 .env                                — mainnet API keys (never commit)
