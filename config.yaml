@@ -158,6 +158,43 @@ strategies:
       time_exit_soft_candles: 8         # ~4h on 30m — soft exit if no mid-touch AND close wrong side of entry
       time_exit_hard_candles: 16        # ~8h on 30m — unconditional exit
 
+  - name: trend_pullback_limit
+    active: true
+    params:
+      # ---- Intervals (drive WebSocket subscriptions + buffer wiring) -------
+      entry_interval: 1h         # resting-order level + all management fire on close
+      regime_interval: 4h        # trend filter, read-only
+
+      # ---- Sizing & leverage ----------------------------------------------
+      leverage: 20                # set per-symbol at startup
+      notional_per_trade_usdt: 2000.0   # qty = notional / resting-limit price
+
+      # ---- Regime filter (regime_interval) — one loose EMA-stack gate -----
+      regime_ema_fast: 50
+      regime_ema_slow: 200
+      # long  → EMA_fast > EMA_slow AND close > EMA_slow ; short → inverse.
+
+      # ---- Entry: resting limit at the EMA pullback level -----------------
+      ema_fast: 20                      # entry-interval EMA; the limit rests here
+      atr_period: 14
+      entry_offset_atr_mult: 0.0        # push the level this many ATRs deeper into the pullback
+      entry_expiry_candles: 3           # cancel the resting order if unfilled after N candles
+
+      # ---- Exits: stop + dual fixed-R TP ----------------------------------
+      stop_atr_mult: 1.5                # R = stop distance from fill (in ATRs)
+      tp1_r_multiple: 1.0               # TP1 distance from fill (in R)
+      tp1_size_pct: 0.5                 # fraction of filled qty taken at TP1
+      tp2_r_multiple: 2.5               # TP2 distance from fill (in R)
+      tp2_size_pct: 0.5                 # remainder taken at TP2 (0 → single-TP, no runner)
+
+      # ---- Break-even SL move (fires once any TP partial-fills) -----------
+      break_even_offset_atr_mult: 0.0   # 0 = exact break-even; small +ve to cover fees
+
+      # ---- Layered stop (stop-limit + stop-market backstop) ---------------
+      # See adaptive_trend_pullback above for the rationale.
+      stop_limit_buffer_pct: 0.0        # limit price = trigger * (1 ± buffer/100); 0 → limit at trigger
+      stop_market_backstop_pct: 0.1     # backstop trigger = stop * (1 ± offset/100); 0.1 → 0.1% past stop
+
 risk_guard:
   max_concurrent_positions: 5
   max_daily_loss_usdt: 1000.0

@@ -19,13 +19,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 from loguru import logger
 
-from core.types import Position, Signal
+from core.types import Position, Signal, SymbolState
 from utils import algo_orders, orders, positions
 from utils.general import round_price
 from utils.indicators import atr
@@ -394,6 +394,118 @@ class Strategy(ABC):
         finally:
             self._managed.pop(symbol, None)
             self.state_manager.mark_change(symbol)
+
+    # ------------------------------------------------------------------
+    # Limit entry primitives
+    #
+    # A strategy can enter via a RESTING limit order — an order placed away
+    # from the market that has no position behind it until it fills. The order
+    # is registered with StateManager as a "pending entry": it is exempt from
+    # orphan cancellation, persisted with status="pending", and StateManager
+    # fires `on_fill(state)` once a position appears behind it or
+    # `on_cancel(symbol)` if it vanishes unfilled (cancelled/rejected). Both
+    # callbacks run on the StateManager worker thread.
+    #
+    # These helpers are the shared plumbing. The strategy still owns the
+    # decision of WHERE to rest the order, WHEN to expire/re-place it, and
+    # WHAT exits to place inside its on_fill callback.
+    # ------------------------------------------------------------------
+
+    def _place_limit_entry(
+        self,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        price: Decimal,
+        *,
+        on_fill: Callable[[SymbolState], None],
+        on_cancel: Callable[[str], None],
+        strategy_state: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Place a resting GTC limit ENTRY order and register it as a pending entry.
+
+        `side` is the entry side — "BUY" opens a long, "SELL" a short.
+        `strategy_state` is an opaque blob persisted with the pending store
+        entry; a strategy stores whatever it needs to place exits on fill and
+        to re-arm on restart (e.g. the ATR frozen at placement time).
+
+        Returns the new order id, or None if placement failed.
+        """
+        side_label = "LONG" if side == "BUY" else "SHORT"
+        self.state_manager.mark_change(symbol)
+        try:
+            order = orders.place_limit_order(
+                self.client, symbol, side, qty, price, time_in_force="GTC",
+            )
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.warning("{} {} limit entry placement failed @ {}: {}",
+                            self.tag, symbol, price, exc)
+            self.state_manager.mark_change(symbol)
+            return None
+        order_id = order["order_id"]
+        self.state_manager.register_pending_entry(
+            symbol,
+            order_id=order_id,
+            strategy_name=self.name,
+            side=side_label,
+            entry_price=price,
+            qty=qty,
+            strategy_state=strategy_state or {},
+            on_fill=on_fill,
+            on_cancel=on_cancel,
+        )
+        logger.info("{} {} resting {} limit entry placed — qty={} @ {} (id={})",
+                    self.tag, symbol, side_label, qty, price, order_id)
+        return order_id
+
+    def _cancel_limit_entry(self, symbol: str, order_id: int) -> None:
+        """Cancel a resting limit entry and clear its pending registration.
+
+        Uses `clear_pending_entry` (the no-callback path) — the strategy chose
+        to cancel, so `on_cancel` must NOT fire. Best-effort: a cancel failure
+        is logged and the pending registration is cleared regardless (the next
+        resync reconciles any drift).
+        """
+        self.state_manager.mark_change(symbol)
+        try:
+            orders.cancel_order(self.client, symbol, order_id)
+        except (BinanceAPIException, BinanceRequestException) as exc:
+            logger.warning("{} {} could not cancel resting limit entry {}: {}",
+                            self.tag, symbol, order_id, exc)
+        self.state_manager.clear_pending_entry(symbol)
+
+    def _rearm_limit_entry(
+        self,
+        symbol: str,
+        order_id: int,
+        side_label: str,
+        entry_price: Any,
+        qty: Any,
+        *,
+        on_fill: Callable[[SymbolState], None],
+        on_cancel: Callable[[str], None],
+        strategy_state: Optional[dict] = None,
+    ) -> None:
+        """Re-register an already-resting limit entry after a restart.
+
+        The order still exists on Binance (it was placed before the restart);
+        this only re-establishes the in-memory pending-entry exemption and the
+        on_fill / on_cancel callbacks. Called from `adopt` for store entries
+        with status="pending".
+        """
+        self.state_manager.register_pending_entry(
+            symbol,
+            order_id=order_id,
+            strategy_name=self.name,
+            side=side_label,
+            entry_price=entry_price,
+            qty=qty,
+            strategy_state=strategy_state or {},
+            on_fill=on_fill,
+            on_cancel=on_cancel,
+        )
+        logger.info("{} {} re-armed resting {} limit entry (id={})",
+                    self.tag, symbol, side_label, order_id)
 
     # ------------------------------------------------------------------
     # Persistence hooks (override if the strategy needs restart recovery)

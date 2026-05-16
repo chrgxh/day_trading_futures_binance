@@ -32,7 +32,8 @@ day-trading-bot/
 │       ├── base.py              # Strategy ABC — multi-interval buffers, signal computation, execution
 │       ├── live_trade_manager.py# Optional per-strategy post-fill lifecycle hooks
 │       ├── adaptive_trend_pullback.py  # Trend-pullback strategy
-│       └── bb_rsi_mean_reversion.py    # Bollinger-Band + RSI mean-reversion strategy
+│       ├── bb_rsi_mean_reversion.py    # Bollinger-Band + RSI mean-reversion strategy
+│       └── trend_pullback_limit.py     # Trend-pullback strategy with a resting limit entry
 ├── utils/
 │   ├── general.py               # build_client, with_retry, round_price, send_*_email, order normalizers
 │   ├── account.py               # Account state: connection, balances, positions, symbol info, leverage, trades
@@ -63,7 +64,8 @@ day-trading-bot/
 │   │   ├── test_live_trade_manager.py
 │   │   ├── test_strategy_base.py
 │   │   ├── test_adaptive_trend_pullback.py
-│   │   └── test_bb_rsi_mean_reversion.py
+│   │   ├── test_bb_rsi_mean_reversion.py
+│   │   └── test_trend_pullback_limit.py
 │   └── integration/             # Testnet integration tests
 │       ├── conftest.py
 │       ├── test_account.py
@@ -159,6 +161,14 @@ Both legs are reduceOnly. If the limit fills partially first, reduce-only sizes 
 
 Both active strategies use these for their initial stop, trail-stop replacement (adaptive), and break-even move (bb_rsi). Defaults live in `config.yaml` per strategy: `stop_limit_buffer_pct: 0.0`, `stop_market_backstop_pct: 0.1`.
 
+### Limit entry primitives (base helpers)
+A strategy can enter via a **resting limit order** — an order placed away from the market with no position behind it until it fills. Shared base helpers wrap the `StateManager` pending-entry machinery:
+- `_place_limit_entry(symbol, side, qty, price, *, on_fill, on_cancel, strategy_state=None)` — places a GTC LIMIT order and registers it via `state_manager.register_pending_entry` (exempt from orphan cancellation, persisted with `status="pending"`). `strategy_state` is the opaque blob the strategy needs to place exits on fill / re-arm on restart. Returns the order id or `None`.
+- `_cancel_limit_entry(symbol, order_id)` — cancels the resting order and calls `clear_pending_entry` (the no-callback path; the strategy chose to cancel, so `on_cancel` does not fire).
+- `_rearm_limit_entry(symbol, order_id, side_label, entry_price, qty, *, on_fill, on_cancel, strategy_state=None)` — re-registers an already-resting order after a restart (no new order placed); called from `adopt` for `status="pending"` entries.
+
+`on_fill(state)` / `on_cancel(symbol)` run on the StateManager worker thread. The strategy owns where to rest the order, when to expire/re-place it, and what exits to place on fill. `trend_pullback_limit` is the first strategy to use these.
+
 ### LiveTradeManager (optional, per-strategy)
 Base class with three override points: `on_open(symbol)`, `on_update(state)`, `on_close(symbol)`. Subscribes to `StateManager` updates. The base class has no behavior — concrete subclasses implement strategy-specific lifecycle logic (e.g. SL migration, partial-fill re-stop, stagnation exits). Configured per strategy in `config.yaml`; absent if a strategy doesn't need it.
 
@@ -195,6 +205,18 @@ Bollinger-Band + RSI mean-reversion system, intended to trade only in non-trendi
   2. **Time exit:** unconditional after `time_exit_hard_candles`; soft exit after `time_exit_soft_candles` IF `touched_middle` is still False AND the current close is on the *wrong side of entry* ("trade simply isn't working" — cleaner than an arbitrary fraction-of-R threshold).
 - **Position sizing:** `qty = notional_per_trade_usdt / entry_price`, rounded down to `step_size`. `leverage` is set per-symbol at startup from `params.leverage`.
 - **Restart recovery:** `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, `outside_band_streak`, `rsi_extreme_streak`, `touched_middle`, and `stop_moved_to_be`; `adopt` rehydrates `_ManagedPosition` and reconciles saved order IDs (`stop_limit_id` / `stop_market_id` / `tp1_id` / `tp2_id`) against live Binance orders. If either leg of the layered stop is missing, any surviving leg is cancelled and a fresh pair is placed at `entry_price ± r_distance`. Missing TPs are not recreated (their qty was already split off the original fill).
+
+### Active strategy: `trend_pullback_limit`
+Trend-pullback system entering via a **resting limit order** — the least restrictive of the three. The other two are confirmation strategies (wait for a candle to close proving the setup, stacking many gates); this one decides a level in advance and rests a passive maker order there, so it fires far more often. Intervals (`entry_interval`, `regime_interval`) and all indicator periods are configurable in `params`.
+
+- **Regime filter (regime_interval, e.g. 4h):** one loose gate — `EMA_fast > EMA_slow AND close > EMA_slow` → longs only (shorts inverse).
+- **Entry (entry_interval, e.g. 1h):** the pullback level is `EMA_fast`, optionally pushed `entry_offset_atr_mult × ATR` deeper. A resting GTC LIMIT is placed at the level via the base limit-entry helpers, but only if the current close is on the far side of it (`close > level` for longs) so the order rests as a maker rather than filling as a taker. ATR is frozen at placement and carried in the pending entry's `strategy_state`.
+- **Resting-order lifecycle** (each closed entry-interval candle): cancelled if the regime flips against it, or if unfilled after `entry_expiry_candles`.
+- **SL/TP per fill** (placed in the `on_fill` callback off the authoritative fill price): `R = stop_atr_mult × ATR`. Stop = fill ∓ R as a **layered pair** (stop-limit + stop-market backstop). TP1 = fill ± `tp1_r_multiple × R` (`tp1_size_pct` of qty, GTC reduce-only LIMIT). TP2 = fill ± `tp2_r_multiple × R` (`tp2_size_pct`, GTC reduce-only LIMIT; skipped if `tp2_size_pct == 0`).
+- **Break-even SL move:** the first closed candle on which position size has shrunk vs `initial_qty` (a TP partial-filled) replaces the layered stop at entry (± `break_even_offset_atr_mult × ATR`) for the remaining qty — place-then-cancel, never unprotected. Once TP1 fills the trade can no longer become a net loser.
+- No trailing stop and no dead-trade/invalidation gauntlet — the stop + two fixed-R TPs fully define each trade. No LiveTradeManager.
+- **Position sizing:** `qty = notional_per_trade_usdt / resting_limit_price`, rounded down to `step_size`. `leverage` set per-symbol at startup.
+- **Restart recovery:** `serialize_state` writes `entry_atr`, `r_distance`, `entry_candle_open_time`, `stop_moved_to_be`. `adopt` branches on the store entry's `status`: `"pending"` → re-arm the resting order via `_rearm_limit_entry` (or, if it filled during downtime, place the missing exits and adopt as open; or clear it if the order is gone); `"open"` → rehydrate `_ManagedPosition` and reconcile the layered stop + TP order IDs against live Binance orders, re-placing a missing layered stop pair.
 
 ### Multi-strategy on the same symbol
 Symbol ownership is absolute and short-lived. The first strategy in `config.yaml.strategies` that fires on a given symbol opens the position; every other strategy sees `state_manager.has_position(symbol) == True` and stays silent until the position closes. Strategies do not coordinate directly — they coordinate through StateManager.
