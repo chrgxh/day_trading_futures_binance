@@ -50,11 +50,12 @@ class UserDataStream:
         # defaults to asyncio.get_event_loop(), which hands every manager
         # constructed on the main thread the *same* loop — the second one to
         # start then fails ("Socket Manager failed to initialize").
+        self._loop = asyncio.new_event_loop()
         self._twm = ThreadedWebsocketManager(
             api_key=client.API_KEY,
             api_secret=client.API_SECRET,
             testnet=testnet,
-            loop=asyncio.new_event_loop(),
+            loop=self._loop,
         )
         # ThreadedWebsocketManager is a non-daemon Thread and stop() only sets
         # flags — it never joins. Tearing down an idle user-data socket through
@@ -64,6 +65,12 @@ class UserDataStream:
 
     def start(self) -> None:
         self._twm.start()
+        # The socket's ReconnectingWebsocket read loop is scheduled on whatever
+        # asyncio.get_event_loop() returns on *this* thread at construction time
+        # — not the loop handed to the manager. Make the manager's loop current
+        # here so the read loop lands on the loop the manager actually runs;
+        # otherwise it never executes and no events are ever delivered.
+        asyncio.set_event_loop(self._loop)
         self._twm.start_futures_user_socket(callback=self._handle_message)
         logger.info("[user-ws] started")
 
