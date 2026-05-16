@@ -9,8 +9,12 @@ symbols:
 # Strategies. Each strategy declares its own intervals (in params) and runs over
 # every symbol above. If two strategies fire on the same symbol simultaneously,
 # the one listed first wins (one position per symbol, absolute).
+#
+# Set `active: false` on any strategy to disable it without commenting out its
+# block. Omitting the field defaults to active: true.
 strategies:
   - name: adaptive_trend_pullback
+    active: true
     params:
       # ---- Intervals (drive WebSocket subscriptions + buffer wiring) -------
       entry_interval: 30m        # all entry, exit, and trail decisions fire on close
@@ -83,6 +87,7 @@ strategies:
       dead_trade_r_floor: 1.0           # unrealized PnL per unit < N*R
 
   - name: bb_rsi_mean_reversion
+    active: true
     params:
       # ---- Intervals (drive WebSocket subscriptions + buffer wiring) -------
       entry_interval: 30m        # all entry, exit, and time-stop decisions fire on close

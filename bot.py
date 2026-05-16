@@ -88,6 +88,9 @@ def build_strategies(
     strategies: list[Strategy] = []
     for entry in cfg["strategies"]:
         name = entry["name"]
+        if not entry.get("active", True):
+            logger.info("Skipping strategy {} (active: false)", name)
+            continue
         if name not in STRATEGIES:
             raise ValueError(f"Unknown strategy: {name!r} (available: {list(STRATEGIES)})")
         ltm_cfg = entry.get("live_trade_manager", {}) or {}

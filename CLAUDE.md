@@ -134,7 +134,7 @@ Stateless gate. `allow_open(symbol, strategy)` returns False if:
 - Cumulative realized daily loss has reached `risk_guard.max_daily_loss_usdt`. When tripped, blocks all new entries for the rest of the UTC day, sends a single warning email via Resend, resumes next UTC day automatically.
 
 ### Strategy (ABC)
-One instance per strategy entry in config. Each strategy:
+One instance per strategy entry in config (entries with `active: false` are skipped at build time; `active` defaults to `true` when omitted). Each strategy:
 - Declares one or more `intervals` (derived from `params` such as `entry_interval` and `regime_interval`) — the bot subscribes to a WebSocket stream for every `(symbol, interval)` pair across all strategies.
 - Owns a per-`(symbol, interval)` candle buffer (`self._buffers[symbol][interval]`).
 - Implements `compute_signal(symbol, candles) -> Signal | None` — pure decision logic, returns a `Signal` with `entry_price`, `stop_loss_price`, `take_profit_price` for OPEN actions.
