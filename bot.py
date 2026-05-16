@@ -18,6 +18,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 from typing import Iterable
 
 import yaml
@@ -130,7 +131,7 @@ def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) ->
     for interval, ss in by_interval.items():
         limit = max(s.candle_limit(interval) for s in ss)
         logger.info("Warmup @ {}: fetching {} candles per symbol", interval, limit)
-        for symbol in symbols:
+        for i, symbol in enumerate(symbols):
             # Fetch one extra: REST klines always include the still-forming
             # candle as the last element, which drop_forming_candle removes —
             # the kline WS only ever delivers closed candles, so a forming
@@ -139,6 +140,12 @@ def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) ->
             candles = market.drop_forming_candle(candles)
             for s in ss:
                 s.warmup(symbol, interval, candles)
+            # Pace the warmup burst: a deep-history kline call (limit > 1000)
+            # costs request weight 10, so fetching every (symbol, interval)
+            # back-to-back spikes weight in a single second and trips Binance's
+            # -1003 IP ban. A short sleep between symbols spreads the burst.
+            if i < len(symbols) - 1:
+                time.sleep(0.3)
 
 
 # ---------------------------------------------------------------------------
