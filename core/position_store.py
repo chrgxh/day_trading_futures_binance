@@ -13,6 +13,7 @@ Schema (versioned for future migrations):
       "positions": {
         "<SYMBOL>": {
           "strategy": "<strategy_name>",
+          "status": "open" | "pending",  # "pending" = resting limit entry, no position yet
           "opened_at": "<ISO-8601 UTC>",
           "side": "LONG" | "SHORT",
           "entry_price": "<decimal string>",
@@ -97,7 +98,11 @@ class PositionStore:
             self._entries = {}
             return self._entries
 
-        self._entries = {str(k): dict(v) for k, v in positions.items() if isinstance(v, dict)}
+        # `status` is additive — entries written before it existed are "open".
+        self._entries = {
+            str(k): {"status": "open", **dict(v)}
+            for k, v in positions.items() if isinstance(v, dict)
+        }
         logger.info("[positions] loaded {} entry(s) from {}", len(self._entries), self._path)
         return self._entries
 
@@ -152,12 +157,14 @@ class PositionStore:
         qty: Any,
         strategy_state: dict[str, Any],
         orders: dict[str, Any],
+        status: str = "open",
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         existing = self._entries.get(symbol, {})
         opened_at = existing.get("opened_at", now)
         self._entries[symbol] = {
             "strategy": strategy,
+            "status": status,
             "opened_at": opened_at,
             "side": side,
             "entry_price": str(entry_price),
@@ -173,6 +180,9 @@ class PositionStore:
         strategy_state: dict[str, Any] | None = None,
         orders: dict[str, Any] | None = None,
         qty: Any | None = None,
+        status: str | None = None,
+        side: str | None = None,
+        entry_price: Any | None = None,
     ) -> None:
         """Update a subset of fields for an existing entry. No-op if symbol absent."""
         entry = self._entries.get(symbol)
@@ -184,6 +194,12 @@ class PositionStore:
             entry["orders"] = dict(orders)
         if qty is not None:
             entry["qty"] = str(qty)
+        if status is not None:
+            entry["status"] = status
+        if side is not None:
+            entry["side"] = side
+        if entry_price is not None:
+            entry["entry_price"] = str(entry_price)
 
     def remove(self, symbol: str) -> bool:
         return self._entries.pop(symbol, None) is not None

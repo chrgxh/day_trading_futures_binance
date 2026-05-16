@@ -288,6 +288,99 @@ def test_resync_prunes_entries_for_unknown_strategy(client, tmp_path: Path):
         assert sm.get_owner("BTCUSDT") is None
 
 
+# ---------------------------------------------------------------------------
+# Pending entry orders (resting limit entries — no position yet)
+# ---------------------------------------------------------------------------
+
+def test_pending_entry_exempt_from_orphan_cancel(client):
+    entry_order = {"order_id": 111, "side": "BUY", "is_algo": False, "order_type": "LIMIT"}
+    orphan = {"order_id": 999, "side": "SELL", "is_algo": False, "order_type": "STOP"}
+    with patch("core.state_manager.account.get_futures_positions", return_value=[]), \
+         patch("core.state_manager.orders.get_open_orders", return_value=[entry_order, orphan]), \
+         patch("core.state_manager.orders.cancel_order") as cancel_mock, \
+         patch("core.state_manager.algo_orders.cancel_algo_order"):
+        sm = StateManager(client, ["BTCUSDT"], grace_period_secs=0)
+        sm.register_pending_entry("BTCUSDT", order_id=111, strategy_name="s",
+                                  side="BUY", entry_price="30000", qty="0.1")
+        sm._resync()
+        # Only the genuine orphan (999) is cancelled; the pending entry (111) survives.
+        cancel_mock.assert_called_once()
+        assert cancel_mock.call_args[0][2] == 999
+
+
+def test_pending_entry_fill_fires_on_fill_and_flips_store(client, tmp_path: Path):
+    filled = []
+    pos = {"symbol": "BTCUSDT", "amount": Decimal("0.1"), "entry_price": Decimal("30000"),
+           "mark_price": Decimal("30010"), "unrealized_pnl": Decimal("1"),
+           "side": "LONG", "leverage": 5, "liquidation_price": None}
+    pf = tmp_path / "positions.json"
+    with patch("core.state_manager.account.get_futures_positions", return_value=[pos]), \
+         patch("core.state_manager.orders.get_open_orders", return_value=[]), \
+         patch("core.state_manager.account.get_futures_recent_trades", return_value=[]):
+        sm = StateManager(client, ["BTCUSDT"], grace_period_secs=0, positions_file=pf)
+        sm.attach_strategy("s")
+        # Register with INTENDED values that differ from the eventual fill.
+        sm.register_pending_entry("BTCUSDT", order_id=111, strategy_name="s",
+                                  side="LONG", entry_price="29950", qty="0.2",
+                                  on_fill=filled.append)
+        assert sm.get_owner("BTCUSDT")["status"] == "pending"
+        sm._resync()  # position now visible → entry filled
+        assert len(filled) == 1
+        assert filled[0].position == Position.LONG
+        entry = sm.get_owner("BTCUSDT")
+        assert entry["status"] == "open"
+        # Store now carries the AUTHORITATIVE fill, not the intended values.
+        assert entry["side"] == "LONG"
+        assert entry["entry_price"] == "30000"
+        assert entry["qty"] == "0.1"
+
+
+def test_pending_entry_vanished_fires_on_cancel_and_drops_store(client, tmp_path: Path):
+    cancelled = []
+    pf = tmp_path / "positions.json"
+    with patch("core.state_manager.account.get_futures_positions", return_value=[]), \
+         patch("core.state_manager.orders.get_open_orders", return_value=[]), \
+         patch("core.state_manager.account.get_futures_recent_trades", return_value=[]):
+        sm = StateManager(client, ["BTCUSDT"], grace_period_secs=0, positions_file=pf)
+        sm.attach_strategy("s")
+        sm.register_pending_entry("BTCUSDT", order_id=111, strategy_name="s",
+                                  side="BUY", entry_price="30000", qty="0.1",
+                                  on_cancel=cancelled.append)
+        sm._resync()  # no position, order not in open orders → vanished unfilled
+        assert cancelled == ["BTCUSDT"]
+        assert sm.get_owner("BTCUSDT") is None
+
+
+def test_pending_entry_not_pruned_while_resting(client, tmp_path: Path):
+    entry_order = {"order_id": 111, "side": "BUY", "is_algo": False, "order_type": "LIMIT"}
+    pf = tmp_path / "positions.json"
+    with patch("core.state_manager.account.get_futures_positions", return_value=[]), \
+         patch("core.state_manager.orders.get_open_orders", return_value=[entry_order]), \
+         patch("core.state_manager.orders.cancel_order"), \
+         patch("core.state_manager.algo_orders.cancel_algo_order"):
+        sm = StateManager(client, ["BTCUSDT"], grace_period_secs=0, positions_file=pf)
+        sm.attach_strategy("s")
+        sm.register_pending_entry("BTCUSDT", order_id=111, strategy_name="s",
+                                  side="BUY", entry_price="30000", qty="0.1")
+        sm._resync()
+        # Order still resting, no position — entry must survive the prune.
+        assert sm.get_owner("BTCUSDT") is not None
+        assert sm.get_owner("BTCUSDT")["status"] == "pending"
+
+
+def test_clear_pending_entry_drops_store_without_callback(client, tmp_path: Path):
+    cancelled = []
+    pf = tmp_path / "positions.json"
+    sm = StateManager(client, ["BTCUSDT"], positions_file=pf)
+    sm.attach_strategy("s")
+    sm.register_pending_entry("BTCUSDT", order_id=111, strategy_name="s",
+                              side="BUY", entry_price="30000", qty="0.1",
+                              on_cancel=cancelled.append)
+    sm.clear_pending_entry("BTCUSDT")
+    assert sm.get_owner("BTCUSDT") is None
+    assert cancelled == []  # explicit clear does not fire on_cancel
+
+
 def test_resync_keeps_entry_for_live_position_with_known_strategy(client, tmp_path: Path):
     pf = tmp_path / "positions.json"
     pf.write_text(json.dumps({

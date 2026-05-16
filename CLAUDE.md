@@ -102,6 +102,7 @@ WebSocket-driven source of truth for live state. An authenticated Binance user-d
 - Refreshes daily net P&L and trade count (via `account.get_futures_recent_trades` per symbol for the current UTC day) on every fill event and on every resync. Daily P&L resets at UTC midnight.
 - Optionally drives a `DailyPnLReporter` (CSV + email) at UTC midnight.
 - **Persistent ownership store (`state/positions.json`):** atomically rewritten on every state refresh. After updating `SymbolState`, prunes entries whose position is gone on Binance or whose owner strategy is no longer configured (warning logged for the latter). Strategies use `register_owner` / `update_owner` / `get_owner` to record and recover the strategy-specific state they need across restart. Binance is always the source of truth; the file is a cache.
+- **Pending entry orders:** a strategy may place a resting limit ENTRY order — an order that legitimately has no position behind it yet. It calls `state_manager.register_pending_entry(symbol, order_id=..., on_fill=..., on_cancel=...)`, which (a) exempts `order_id` from orphan cancellation, (b) persists a `status="pending"` entry to the store, and (c) fires `on_fill(state)` when the order fills (a position appears) or `on_cancel(symbol)` when it vanishes unfilled (cancelled/rejected). Callbacks run on the worker thread. On fill, StateManager first re-writes the store entry with the **authoritative** `side`/`entry_price`/`qty` from the live snapshot and flips `status` to `"open"` *before* firing `on_fill` — so a crash before the strategy's `on_fill` finishes (placing exits, calling `register_owner`) still leaves a correct entry on disk for restart recovery. Pending entries are skipped by position-absence pruning (they have no position by design) but still dropped if their strategy is deconfigured. `clear_pending_entry(symbol)` drops one without firing callbacks (strategy cancelled the resting order itself). After a restart a strategy re-arms the exemption by re-calling `register_pending_entry` from `adopt`.
 
 On `start()`, runs one synchronous resync before returning so callers see accurate state immediately (covers the restart-recovery case), then launches the worker thread and the WS user-data stream.
 
@@ -111,13 +112,18 @@ A thin JSON store keyed by symbol. Schema (versioned for future migrations):
 ```
 { "version": 1, "updated_at": "<UTC ISO>", "positions": {
     "<SYMBOL>": {
-      "strategy": "<name>", "opened_at": "<UTC ISO>",
+      "strategy": "<name>", "status": "open"|"pending", "opened_at": "<UTC ISO>",
       "side": "LONG"|"SHORT", "entry_price": "<dec>", "qty": "<dec>",
       "strategy_state": { ... opaque blob owned by strategy ... },
       "orders": { "stop_limit_id": <int>, "stop_market_id": <int>, "tp1_id": <int>, ... }
     }, ...
 }}
 ```
+
+`status` is `"open"` for a live position and `"pending"` for a resting limit
+entry order with no position behind it yet (see *Pending entry orders* under
+StateManager). The field is additive — entries written before it existed load as
+`"open"`, so no schema-version bump was needed.
 
 Writes use a write-to-temp-then-rename so crashes never leave a partial file. A corrupt or wrong-version file is quarantined (`<file>.corrupt-<ts>`) and the store starts empty. Lifecycle is owned by `StateManager` — no other module touches it.
 

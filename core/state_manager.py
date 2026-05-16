@@ -17,6 +17,12 @@ A short grace period suppresses warnings/cancellations right after a strategy ha
 placed orders or closed a position, to avoid false-positive orphan flags during
 the brief window between order placement and the next refresh.
 
+A strategy may place a resting limit ENTRY order — an order that legitimately has
+no position behind it yet. It registers the order via `register_pending_entry`,
+which exempts it from orphan cancellation and fires a callback when it fills
+(a position appears) or vanishes unfilled (cancelled/rejected). Pending entries
+are persisted to the store with status="pending" so they survive a restart.
+
 Daily P&L and trade count are refreshed on every fill event and on every resync.
 Optionally drives DailyPnLReporter for midnight CSV + email reports.
 """
@@ -72,6 +78,9 @@ class StateManager:
         }
         self._grace_until: dict[str, float] = {}
         self._subscribers: list[Callable[[SymbolState], None]] = []
+        # symbol -> {order_id, on_fill, on_cancel, seen} for resting limit
+        # entry orders that have no position behind them yet.
+        self._pending_entries: dict[str, dict[str, Any]] = {}
 
         self._daily_pnl: Decimal = Decimal("0")
         self._trade_count: int = 0
@@ -238,16 +247,17 @@ class StateManager:
 
     def _prune_and_save_store(self) -> None:
         """Drop entries whose position no longer exists on Binance or whose
-        strategy is no longer configured. Then persist."""
+        strategy is no longer configured. Then persist.
+
+        Pending entries (status="pending") are exempt from position-absence
+        pruning — they have no position by design; their lifecycle is driven
+        by `_handle_pending_transition`. They are still dropped if their
+        strategy is no longer configured.
+        """
         if self._store is None:
             return
         with self._lock:
             for symbol, entry in self._store.all().items():
-                state = self._states.get(symbol)
-                if state is not None and state.position == Position.NONE:
-                    if self._store.remove(symbol):
-                        logger.info("[state] {} position closed — dropped owner entry", symbol)
-                    continue
                 owner_strategy = entry.get("strategy")
                 if owner_strategy not in self._known_strategies:
                     if self._store.remove(symbol):
@@ -256,7 +266,126 @@ class StateManager:
                             "position left untracked on Binance",
                             symbol, owner_strategy,
                         )
+                    continue
+                if entry.get("status") == "pending":
+                    continue
+                state = self._states.get(symbol)
+                if state is not None and state.position == Position.NONE:
+                    if self._store.remove(symbol):
+                        logger.info("[state] {} position closed — dropped owner entry", symbol)
             self._store.save()
+
+    # ------------------------------------------------------------------
+    # Pending entry orders (resting limit entries — no position yet)
+    # ------------------------------------------------------------------
+
+    def register_pending_entry(
+        self,
+        symbol: str,
+        *,
+        order_id: int,
+        strategy_name: str,
+        side: str,
+        entry_price: Any,
+        qty: Any,
+        strategy_state: dict[str, Any] | None = None,
+        on_fill: Callable[[SymbolState], None] | None = None,
+        on_cancel: Callable[[str], None] | None = None,
+    ) -> None:
+        """Record a resting limit entry order that has no position behind it yet.
+
+        `order_id` is exempt from orphan cancellation until it either fills
+        (a position appears → `on_fill(state)`) or disappears unfilled
+        (cancelled/rejected → `on_cancel(symbol)`). Callbacks run on the worker
+        thread. Persisted to the store with status="pending"; a strategy
+        re-calls this from `adopt` to re-arm the exemption after a restart.
+        """
+        with self._lock:
+            self._pending_entries[symbol] = {
+                "order_id": order_id,
+                "on_fill": on_fill,
+                "on_cancel": on_cancel,
+                "seen": False,
+            }
+            if self._store is not None:
+                self._store.upsert(
+                    symbol,
+                    strategy=strategy_name, side=side,
+                    entry_price=entry_price, qty=qty,
+                    strategy_state=strategy_state or {},
+                    orders={"entry_id": order_id},
+                    status="pending",
+                )
+                self._store.save()
+        logger.info("[state] {} pending entry order {} registered ({} {} @ {})",
+                    symbol, order_id, side, qty, entry_price)
+
+    def clear_pending_entry(self, symbol: str) -> None:
+        """Drop a pending entry without firing callbacks — e.g. the strategy
+        cancelled the resting order itself. Removes the store entry. No-op if
+        there is no pending entry for `symbol`."""
+        with self._lock:
+            if self._pending_entries.pop(symbol, None) is None:
+                return
+            if self._store is not None and self._store.remove(symbol):
+                self._store.save()
+        logger.info("[state] {} pending entry cleared", symbol)
+
+    def _handle_pending_transition(
+        self, symbol: str, state: SymbolState, pending: dict[str, Any]
+    ) -> None:
+        """Detect whether a registered resting entry order has filled or vanished.
+
+        Fill → a position exists: re-register the store entry with the
+        authoritative fill (side/entry_price/qty) from the live snapshot, flip it
+        to status="open", then fire `on_fill`. Writing the real fill data here —
+        rather than leaving the strategy's intended values until `on_fill` runs —
+        means a crash before `on_fill` completes still leaves a correct entry on
+        disk for restart recovery. Vanished unfilled → fire `on_cancel` and drop
+        the store entry.
+        """
+        order_id = pending["order_id"]
+
+        if state.position != Position.NONE:
+            with self._lock:
+                if self._pending_entries.pop(symbol, None) is None:
+                    return  # already handled
+                if self._store is not None:
+                    self._store.patch(
+                        symbol, status="open", side=state.position.value,
+                        entry_price=state.entry_price, qty=state.size,
+                    )
+                    self._store.save()
+            logger.info("[state] {} pending entry order {} filled — {} position open",
+                        symbol, order_id, state.position.value)
+            cb = pending.get("on_fill")
+            if cb is not None:
+                try:
+                    cb(state)
+                except Exception as exc:
+                    logger.warning("[state] {} pending on_fill callback error: {}", symbol, exc)
+            return
+
+        if any(o["order_id"] == order_id for o in state.orders):
+            pending["seen"] = True
+            return
+        # Order absent and no position. Before we have ever seen the order, a
+        # stale REST snapshot can race the placement — wait out the grace window.
+        if not pending.get("seen") and self._in_grace(symbol):
+            return
+        with self._lock:
+            if self._pending_entries.pop(symbol, None) is None:
+                return
+            if self._store is not None and self._store.remove(symbol):
+                self._store.save()
+        logger.warning("[state] {} pending entry order {} gone without a fill — cancelled/rejected",
+                        symbol, order_id)
+        cb = pending.get("on_cancel")
+        if cb is not None:
+            try:
+                cb(symbol)
+            except Exception as exc:
+                logger.warning("[state] {} pending on_cancel callback error: {}", symbol, exc)
 
     # ------------------------------------------------------------------
     # Worker loop — drains WS events, runs the periodic safety-net resync
@@ -373,11 +502,15 @@ class StateManager:
             prev = self._states.get(symbol)
             self._states[symbol] = state
             subscribers = list(self._subscribers)
+            pending = self._pending_entries.get(symbol)
 
         self._log_diff(prev, state)
 
         if not self._in_grace(symbol):
-            self._reconcile_orders(state)
+            self._reconcile_orders(state, pending["order_id"] if pending else None)
+
+        if pending is not None:
+            self._handle_pending_transition(symbol, state, pending)
 
         for cb in subscribers:
             try:
@@ -403,14 +536,21 @@ class StateManager:
             logger.info("[state] {} {} orders {} -> {}",
                         new.symbol, new.position.value, len(prev.orders), len(new.orders))
 
-    def _reconcile_orders(self, state: SymbolState) -> None:
-        """Apply the orphan-cleanup rules. Caller has already checked grace period."""
+    def _reconcile_orders(
+        self, state: SymbolState, pending_entry_id: int | None = None
+    ) -> None:
+        """Apply the orphan-cleanup rules. Caller has already checked grace period.
+
+        `pending_entry_id`, if set, is a registered resting limit entry order —
+        it legitimately has no position yet and is exempt from cancellation.
+        """
         if state.position == Position.NONE:
-            if state.orders:
-                ids = [o["order_id"] for o in state.orders]
+            orphans = [o for o in state.orders if o["order_id"] != pending_entry_id]
+            if orphans:
+                ids = [o["order_id"] for o in orphans]
                 logger.warning("[state] {} {} orphan order(s) (no position) — cancelling: {}",
-                               state.symbol, len(state.orders), ids)
-                for o in state.orders:
+                               state.symbol, len(orphans), ids)
+                for o in orphans:
                     self._cancel_order(state.symbol, o)
             return
 

@@ -138,6 +138,68 @@ def test_get_returns_copy(tmp_path: Path):
     assert store.get("BTCUSDT")["strategy_state"]["v"] == 1
 
 
+def test_upsert_defaults_status_to_open(tmp_path: Path):
+    store = PositionStore(tmp_path / "p.json")
+    store.upsert("BTCUSDT", strategy="s", side="LONG",
+                 entry_price="1", qty="1", strategy_state={}, orders={})
+    assert store.get("BTCUSDT")["status"] == "open"
+
+
+def test_upsert_pending_status_roundtrip(tmp_path: Path):
+    path = tmp_path / "p.json"
+    store = PositionStore(path)
+    store.upsert("BTCUSDT", strategy="s", side="LONG",
+                 entry_price="30000", qty="0.1", strategy_state={},
+                 orders={"entry_id": 555}, status="pending")
+    store.save()
+
+    fresh = PositionStore(path)
+    fresh.load()
+    entry = fresh.get("BTCUSDT")
+    assert entry["status"] == "pending"
+    assert entry["orders"]["entry_id"] == 555
+
+
+def test_patch_updates_status(tmp_path: Path):
+    store = PositionStore(tmp_path / "p.json")
+    store.upsert("BTCUSDT", strategy="s", side="LONG",
+                 entry_price="1", qty="1", strategy_state={}, orders={},
+                 status="pending")
+    store.patch("BTCUSDT", status="open")
+    assert store.get("BTCUSDT")["status"] == "open"
+
+
+def test_patch_updates_side_and_entry_price(tmp_path: Path):
+    store = PositionStore(tmp_path / "p.json")
+    store.upsert("BTCUSDT", strategy="s", side="LONG",
+                 entry_price="29950", qty="0.2", strategy_state={},
+                 orders={"entry_id": 1}, status="pending")
+    store.patch("BTCUSDT", status="open", side="LONG",
+                entry_price=Decimal("30000.5"), qty="0.1")
+    entry = store.get("BTCUSDT")
+    assert entry["status"] == "open"
+    assert entry["side"] == "LONG"
+    assert entry["entry_price"] == "30000.5"
+    assert entry["qty"] == "0.1"
+
+
+def test_load_defaults_missing_status_to_open(tmp_path: Path):
+    # Entries written before `status` existed must still load (as "open").
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps({
+        "version": SCHEMA_VERSION, "updated_at": "...",
+        "positions": {
+            "BTCUSDT": {
+                "strategy": "s", "opened_at": "...", "side": "LONG",
+                "entry_price": "1", "qty": "1", "strategy_state": {}, "orders": {},
+            }
+        }
+    }))
+    store = PositionStore(path)
+    store.load()
+    assert store.get("BTCUSDT")["status"] == "open"
+
+
 def test_save_creates_parent_directory(tmp_path: Path):
     nested = tmp_path / "deeply" / "nested" / "positions.json"
     store = PositionStore(nested)
