@@ -8,7 +8,7 @@ Automated futures trading bot for Binance. Multiple strategies run in parallel a
 bot.py                              — entry point: load config, wire objects, route candles
 core/
   types.py                          — Position, Action, Signal, SymbolState
-  state_manager.py                  — single Binance poller, source of truth for live state
+  state_manager.py                  — WebSocket-driven source of truth for live state
   risk_guard.py                     — entry gate: max positions, one-per-symbol, daily loss
   pnl_reporter.py                   — daily P&L CSV + email (lifecycle owned by StateManager)
   strategies/
@@ -23,6 +23,7 @@ utils/
   algo_orders.py                    — conditional orders (stop/TP market & limit)
   positions.py                      — close_position
   market.py                         — OHLCV, mark price, multi-(symbol,interval) WS with gap-fill
+  user_stream.py                    — authenticated user-data WS: listenKey lifecycle + event delivery
   indicators.py                     — SMA, EMA, MACD, ADX, ATR, RSI, bollinger_bands, daily_anchored_vwap, resample_to_1h
 config.yaml                         — symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
 .env                                — mainnet API keys (never commit)
@@ -75,9 +76,8 @@ risk_guard:
   max_daily_loss_usdt: 50.0
 
 state_manager:
-  poll_interval_secs: 10
+  resync_interval_secs: 90   # safety-net full REST resync period; state is WS-driven
   grace_period_secs: 15
-  pnl_refresh_every_n_polls: 6
   pnl_reporter:
     enabled: true
     csv_file: logs/pnl.csv
@@ -101,7 +101,7 @@ Strategies decide:
 - What action to take on each closed candle (`_tick(symbol, interval)` — override for multi-interval routing, or rely on the default which calls `compute_signal`).
 - What `entry_price`, `stop_loss_price`, and `take_profit_price` to aim for.
 - How to actually enter the position (`execute_open` — IOC, market, layered limits, whatever).
-- Whether they want a `LiveTradeManager` for post-fill lifecycle tied to StateManager poll cadence (SL migration, partial-fill handling, stagnation) — subclass `LiveTradeManager` and override `on_open` / `on_update` / `on_close`. Strategies whose exit logic is tied to closed candles (not poll cadence) should skip the LTM and manage exits directly in `_tick`.
+- Whether they want a `LiveTradeManager` for post-fill lifecycle fired on each StateManager refresh (SL migration, partial-fill handling, stagnation) — subclass `LiveTradeManager` and override `on_open` / `on_update` / `on_close`. Strategies whose exit logic is tied to closed candles should skip the LTM and manage exits directly in `_tick`.
 
 ## Running
 
@@ -117,7 +117,7 @@ docker compose up --build
 
 ## Architecture in one paragraph
 
-`StateManager` polls Binance every few seconds and is the single source of truth for live state — positions, orders, daily P&L. It cancels orphan orders and warns on untracked positions; it never tries to manage positions itself. It also owns a small JSON cache at `state/positions.json` mapping each live position to the strategy that opened it plus that strategy's saved state and exit order IDs; the file is rewritten atomically on every poll and used by strategies to resume managing positions across restarts. `RiskGuard` is a stateless gate that reads StateManager and enforces max-positions / one-per-symbol / daily-loss limits. Strategies receive closed candles via WebSocket, ask StateManager whether their symbol is free, compute a signal, and (for OPEN actions) consult RiskGuard before placing orders themselves. Each strategy can optionally attach a `LiveTradeManager` that subscribes to StateManager updates for post-fill lifecycle. The bot itself only does wiring and WebSocket routing.
+`StateManager` is the single source of truth for live state — positions, orders, daily P&L. It is driven by the authenticated Binance user-data WebSocket: account/order events trigger a targeted REST refresh of the affected symbol, and a low-frequency full REST resync runs as a safety net (and after every reconnect) to correct any event drift. It cancels orphan orders and warns on untracked positions; it never tries to manage positions itself. It also owns a small JSON cache at `state/positions.json` mapping each live position to the strategy that opened it plus that strategy's saved state and exit order IDs; the file is rewritten atomically on every state refresh and used by strategies to resume managing positions across restarts. `RiskGuard` is a stateless gate that reads StateManager and enforces max-positions / one-per-symbol / daily-loss limits. Strategies receive closed candles via WebSocket, ask StateManager whether their symbol is free, compute a signal, and (for OPEN actions) consult RiskGuard before placing orders themselves. Each strategy can optionally attach a `LiveTradeManager` that subscribes to StateManager updates for post-fill lifecycle. The bot itself only does wiring and WebSocket routing.
 
 ## Daily P&L report
 

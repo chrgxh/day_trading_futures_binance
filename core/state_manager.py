@@ -1,20 +1,29 @@
-"""StateManager — single Binance poller, source of truth for live state.
+"""StateManager — WebSocket-driven source of truth for live state.
 
-Polls positions and open orders for every configured symbol every poll_interval_secs.
-Matches orders to positions:
+An authenticated Binance user-data WebSocket (UserDataStream) pushes account and
+order events in real time. On every relevant event the affected symbol is
+REST-refreshed (one position + open-orders snapshot) so `state.orders` is always
+an authoritative snapshot rather than an incrementally-reconstructed list.
+
+A low-frequency full REST resync runs as a safety net: it corrects any drift
+from dropped events and always runs once after a (re)connect to cover the gap
+while the socket was down.
+
+Order/position matching on every refresh:
   - position with no exit orders   → warn (does not try to manage; user/owning strategy decides)
   - orders with no position        → cancel and warn (orphans)
 
-A short grace period suppresses warnings/cancellations right after a strategy has placed
-orders or closed a position, to avoid false-positive orphan flags during the brief window
-between order placement and the next poll.
+A short grace period suppresses warnings/cancellations right after a strategy has
+placed orders or closed a position, to avoid false-positive orphan flags during
+the brief window between order placement and the next refresh.
 
-Daily P&L and trade count are refreshed less frequently (pnl_refresh_every_n_polls).
+Daily P&L and trade count are refreshed on every fill event and on every resync.
 Optionally drives DailyPnLReporter for midnight CSV + email reports.
 """
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,27 +37,31 @@ from loguru import logger
 from core.position_store import PositionStore
 from core.types import Position, SymbolState
 from utils import account, algo_orders, orders
+from utils.user_stream import UserDataStream
+
+# Sentinel pushed onto the event queue after every WS (re)connect — tells the
+# worker to run a full REST resync covering anything missed while disconnected.
+_RESYNC_EVENT = "_RESYNC"
 
 
 class StateManager:
-    """Single Binance poller. Authoritative live state."""
+    """WebSocket-driven authoritative live state."""
 
     def __init__(
         self,
         client: Client,
         symbols: list[str],
         *,
-        poll_interval_secs: int = 10,
+        testnet: bool = False,
+        resync_interval_secs: int = 90,
         grace_period_secs: int = 15,
-        pnl_refresh_every_n_polls: int = 6,
         pnl_reporter: Optional["DailyPnLReporter"] = None,  # noqa: F821 (forward)
         positions_file: Path | str | None = None,
     ) -> None:
         self._client = client
         self._symbols = list(symbols)
-        self._poll_interval = poll_interval_secs
+        self._resync_interval = resync_interval_secs
         self._grace_period_secs = grace_period_secs
-        self._pnl_every = max(1, pnl_refresh_every_n_polls)
         self._pnl_reporter = pnl_reporter
 
         self._states: dict[str, SymbolState] = {
@@ -74,29 +87,39 @@ class StateManager:
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="state-manager")
+        self._last_resync = 0.0
+        self._event_queue: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="state-manager")
+        self._user_stream = UserDataStream(
+            client, testnet,
+            on_event=self._event_queue.put,
+            on_connect=lambda: self._event_queue.put({"e": _RESYNC_EVENT}),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        # Run one synchronous poll before launching the thread so callers see
+        # Run one synchronous resync before launching threads so callers see
         # accurate state immediately (e.g. positions recovered from a restart).
         try:
-            self._poll()
+            self._resync()
             self._refresh_daily_pnl()
         except Exception as exc:
-            logger.warning("[state] initial poll failed: {}", exc)
-        self._thread.start()
-        logger.info("[state] started (poll={}s, grace={}s, symbols={})",
-                    self._poll_interval, self._grace_period_secs, self._symbols)
+            logger.warning("[state] initial resync failed: {}", exc)
+        self._last_resync = time.time()
+        self._worker.start()
+        self._user_stream.start()
+        logger.info("[state] started (ws user-stream, resync={}s, grace={}s, symbols={})",
+                    self._resync_interval, self._grace_period_secs, self._symbols)
         if self._pnl_reporter is not None:
             self._pnl_reporter.start()
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=15)
+        self._user_stream.stop()
+        self._worker.join(timeout=15)
         logger.info("[state] stopped")
 
     # ------------------------------------------------------------------
@@ -104,7 +127,7 @@ class StateManager:
     # ------------------------------------------------------------------
 
     def subscribe(self, callback: Callable[[SymbolState], None]) -> None:
-        """Register a callback fired for every symbol on every poll."""
+        """Register a callback fired for a symbol whenever its state is refreshed."""
         with self._lock:
             self._subscribers.append(callback)
 
@@ -139,7 +162,7 @@ class StateManager:
 
     def mark_change(self, symbol: str) -> None:
         """Strategies call this when they place or cancel orders to suppress orphan
-        warnings/cancellations on the next poll for `grace_period_secs` seconds."""
+        warnings/cancellations on the next refresh for `grace_period_secs` seconds."""
         with self._lock:
             self._grace_until[symbol] = time.time() + self._grace_period_secs
 
@@ -236,32 +259,67 @@ class StateManager:
             self._store.save()
 
     # ------------------------------------------------------------------
-    # Polling loop
+    # Worker loop — drains WS events, runs the periodic safety-net resync
     # ------------------------------------------------------------------
 
-    def _loop(self) -> None:
-        poll_count = 0
+    def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self._poll()
-                poll_count += 1
-                if poll_count % self._pnl_every == 0:
+                event = self._event_queue.get(timeout=1.0)
+            except queue.Empty:
+                event = None
+            if self._stop.is_set():
+                break
+            try:
+                if event is not None:
+                    self._handle_event(event)
+                if time.time() - self._last_resync >= self._resync_interval:
+                    self._resync()
                     self._refresh_daily_pnl()
+                    self._last_resync = time.time()
             except Exception as exc:
-                logger.exception("[state] poll error: {}", exc)
-            self._stop.wait(self._poll_interval)
+                logger.exception("[state] worker error: {}", exc)
 
-    def _poll(self) -> None:
-        # One position-info call covers all symbols. Order calls are per symbol.
+    def _handle_event(self, event: dict) -> None:
+        """Dispatch one user-data event: REST-refresh the affected symbol(s)."""
+        etype = event.get("e")
+        if etype == _RESYNC_EVENT:
+            self._resync()
+            self._refresh_daily_pnl()
+            self._last_resync = time.time()
+            return
+
+        symbols: set[str] = set()
+        refresh_pnl = False
+        if etype == "ACCOUNT_UPDATE":
+            for p in event.get("a", {}).get("P", []):
+                symbols.add(p.get("s"))
+        elif etype == "ORDER_TRADE_UPDATE":
+            o = event.get("o", {})
+            symbols.add(o.get("s"))
+            if o.get("x") == "TRADE":  # an actual fill — realized P&L moved
+                refresh_pnl = True
+        else:
+            return  # ACCOUNT_CONFIG_UPDATE / MARGIN_CALL / etc. — nothing to do
+
+        for symbol in symbols:
+            if symbol in self._states:
+                self._refresh_symbol(symbol)
+        if refresh_pnl:
+            self._refresh_daily_pnl()
+
+    # ------------------------------------------------------------------
+    # State refresh — REST snapshots
+    # ------------------------------------------------------------------
+
+    def _resync(self) -> None:
+        """Full REST snapshot of every symbol — startup + periodic safety net."""
         try:
             positions_list = account.get_futures_positions(self._client)
         except Exception as exc:
-            logger.warning("[state] could not fetch positions: {}", exc)
+            logger.warning("[state] resync could not fetch positions: {}", exc)
             return
         pos_by_sym = {p["symbol"]: p for p in positions_list}
-
-        with self._lock:
-            subscribers = list(self._subscribers)
 
         for symbol in self._symbols:
             try:
@@ -269,46 +327,68 @@ class StateManager:
             except Exception as exc:
                 logger.warning("[state] {} could not fetch open orders: {}", symbol, exc)
                 continue
-
-            pos_data = pos_by_sym.get(symbol)
-            if pos_data is not None:
-                state = SymbolState(
-                    symbol=symbol,
-                    position=Position.LONG if pos_data["amount"] > 0 else Position.SHORT,
-                    size=abs(pos_data["amount"]),
-                    entry_price=pos_data["entry_price"],
-                    mark_price=pos_data["mark_price"],
-                    unrealized_pnl=pos_data["unrealized_pnl"],
-                    orders=open_orders,
-                )
-            else:
-                state = SymbolState(
-                    symbol=symbol, position=Position.NONE, size=Decimal("0"),
-                    entry_price=Decimal("0"), mark_price=Decimal("0"),
-                    unrealized_pnl=Decimal("0"), orders=open_orders,
-                )
-
-            with self._lock:
-                prev = self._states.get(symbol)
-                self._states[symbol] = state
-
-            self._log_diff(prev, state)
-
-            if not self._in_grace(symbol):
-                self._reconcile_orders(state)
-
-            for cb in subscribers:
-                try:
-                    cb(state)
-                except Exception as exc:
-                    logger.warning("[state] subscriber error for {}: {}", symbol, exc)
+            self._apply_symbol_state(symbol, pos_by_sym.get(symbol), open_orders)
 
         self._prune_and_save_store()
+
+    def _refresh_symbol(self, symbol: str) -> None:
+        """REST-refresh a single symbol's position + open orders (event-driven)."""
+        try:
+            positions_list = account.get_futures_positions(self._client, symbol)
+        except Exception as exc:
+            logger.warning("[state] {} could not fetch position: {}", symbol, exc)
+            return
+        try:
+            open_orders = orders.get_open_orders(self._client, symbol)
+        except Exception as exc:
+            logger.warning("[state] {} could not fetch open orders: {}", symbol, exc)
+            return
+        pos_data = next((p for p in positions_list if p["symbol"] == symbol), None)
+        self._apply_symbol_state(symbol, pos_data, open_orders)
+        self._prune_and_save_store()
+
+    def _apply_symbol_state(
+        self, symbol: str, pos_data: dict | None, open_orders: list[dict]
+    ) -> None:
+        """Commit a freshly-fetched snapshot for one symbol: store it, log the
+        diff, reconcile orphans, notify subscribers."""
+        if pos_data is not None:
+            state = SymbolState(
+                symbol=symbol,
+                position=Position.LONG if pos_data["amount"] > 0 else Position.SHORT,
+                size=abs(pos_data["amount"]),
+                entry_price=pos_data["entry_price"],
+                mark_price=pos_data["mark_price"],
+                unrealized_pnl=pos_data["unrealized_pnl"],
+                orders=open_orders,
+            )
+        else:
+            state = SymbolState(
+                symbol=symbol, position=Position.NONE, size=Decimal("0"),
+                entry_price=Decimal("0"), mark_price=Decimal("0"),
+                unrealized_pnl=Decimal("0"), orders=open_orders,
+            )
+
+        with self._lock:
+            prev = self._states.get(symbol)
+            self._states[symbol] = state
+            subscribers = list(self._subscribers)
+
+        self._log_diff(prev, state)
+
+        if not self._in_grace(symbol):
+            self._reconcile_orders(state)
+
+        for cb in subscribers:
+            try:
+                cb(state)
+            except Exception as exc:
+                logger.warning("[state] subscriber error for {}: {}", symbol, exc)
 
     def _log_diff(self, prev: SymbolState | None, new: SymbolState) -> None:
         """Log only when something meaningful changed."""
         if prev is None:
-            # First-ever poll for this symbol. Log only if it's not the boring "flat + no orders" case.
+            # First-ever snapshot for this symbol. Log only if it's not the boring "flat + no orders" case.
             if new.position != Position.NONE or new.orders:
                 logger.info("[state] {} initial: position={} size={} entry={} orders={}",
                             new.symbol, new.position.value, new.size, new.entry_price, len(new.orders))

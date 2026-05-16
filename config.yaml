@@ -158,12 +158,14 @@ risk_guard:
   max_daily_loss_usdt: 1000.0
 
 state_manager:
-  poll_interval_secs: 10
+  # Live state is driven by the authenticated user-data WebSocket. This is the
+  # period of the safety-net full REST resync that corrects any event drift and
+  # always runs after a reconnect.
+  resync_interval_secs: 90
   grace_period_secs: 15
-  pnl_refresh_every_n_polls: 6
   # Persistent ownership store: maps live positions -> owning strategy + saved
-  # strategy_state + saved exit order IDs. Rewritten on every poll. On restart,
-  # strategies adopt entries whose positions still exist on Binance.
+  # strategy_state + saved exit order IDs. Rewritten on every state refresh. On
+  # restart, strategies adopt entries whose positions still exist on Binance.
   positions_file: state/positions.json
   pnl_reporter:
     enabled: true

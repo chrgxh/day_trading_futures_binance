@@ -3,7 +3,7 @@
 Startup order:
   1. Load config + env, configure logging, build Binance client.
   2. Fetch symbol info (one batched exchange-info call).
-  3. Build StateManager (begins polling Binance).
+  3. Build StateManager (WS user-data stream + periodic REST resync).
   4. Build RiskGuard.
   5. Build configured strategies (each with an optional LiveTradeManager).
   6. Warmup: prefetch REST candles for every unique (symbol, interval) pair.
@@ -168,9 +168,9 @@ def _run() -> None:
 
     state_manager = StateManager(
         client, symbols,
-        poll_interval_secs=int(sm_cfg.get("poll_interval_secs", 10)),
+        testnet=env["testnet"],
+        resync_interval_secs=int(sm_cfg.get("resync_interval_secs", 90)),
         grace_period_secs=int(sm_cfg.get("grace_period_secs", 15)),
-        pnl_refresh_every_n_polls=int(sm_cfg.get("pnl_refresh_every_n_polls", 6)),
         pnl_reporter=pnl_reporter,
         positions_file=sm_cfg.get("positions_file"),
     )
@@ -189,11 +189,12 @@ def _run() -> None:
     warmup_strategies(client, strategies, symbols)
 
     # Strategies are now built (state_manager.attach_strategy called for each)
-    # and warmed up. Start polling — the first sync poll prunes entries whose
-    # position is gone on Binance or whose strategy is no longer configured.
+    # and warmed up. Start the state manager — the first sync resync prunes
+    # entries whose position is gone on Binance or whose strategy is no longer
+    # configured, then the WS user-data stream takes over.
     state_manager.start()
 
-    # With _states populated from the first sync poll, each strategy can adopt
+    # With _states populated from the first sync resync, each strategy can adopt
     # its persisted positions and reconcile saved order IDs against live state.
     for s in strategies:
         s.adopt_pre_existing()
