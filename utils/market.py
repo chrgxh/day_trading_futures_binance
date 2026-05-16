@@ -183,6 +183,11 @@ class _KlineStreamManager:
             testnet=testnet,
             loop=asyncio.new_event_loop(),
         )
+        # ThreadedWebsocketManager is a non-daemon Thread and stop() only sets
+        # flags — it never joins. A stuck SDK socket teardown would otherwise
+        # block interpreter exit on shutdown; the stream carries no
+        # shutdown-critical state, so mark it daemon.
+        self._twm.daemon = True
 
     def start(self) -> None:
         self._twm.start()

@@ -56,6 +56,11 @@ class UserDataStream:
             testnet=testnet,
             loop=asyncio.new_event_loop(),
         )
+        # ThreadedWebsocketManager is a non-daemon Thread and stop() only sets
+        # flags — it never joins. Tearing down an idle user-data socket through
+        # the SDK can stall, which would block interpreter exit on shutdown.
+        # The socket carries no shutdown-critical state, so mark it daemon.
+        self._twm.daemon = True
 
     def start(self) -> None:
         self._twm.start()
