@@ -131,7 +131,12 @@ def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) ->
         limit = max(s.candle_limit(interval) for s in ss)
         logger.info("Warmup @ {}: fetching {} candles per symbol", interval, limit)
         for symbol in symbols:
-            candles = market.get_futures_ohlcv(client, symbol, interval, limit=limit)
+            # Fetch one extra: REST klines always include the still-forming
+            # candle as the last element, which drop_forming_candle removes —
+            # the kline WS only ever delivers closed candles, so a forming
+            # candle seeded here would stay stale until it finally closes.
+            candles = market.get_futures_ohlcv(client, symbol, interval, limit=limit + 1)
+            candles = market.drop_forming_candle(candles)
             for s in ss:
                 s.warmup(symbol, interval, candles)
 

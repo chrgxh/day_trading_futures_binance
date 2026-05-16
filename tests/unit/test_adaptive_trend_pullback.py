@@ -638,8 +638,9 @@ def test_regime_summary_returns_diagnostic_string():
     long_ok, short_ok, summary = s._regime_summary("BTCUSDT")
     assert long_ok is True
     assert short_ok is False
-    assert "close=" in summary
-    assert "slope=" in summary
+    assert "regime@4h" in summary
+    assert "close(4h)=" in summary
+    assert "_slope[" in summary
 
 
 def test_regime_summary_warmup_reports_candle_count():

@@ -160,7 +160,7 @@ class TrendPullbackLimit(Strategy):
             return
 
         if self.state_manager.has_position(symbol):
-            logger.info("{} {} {} NO-ENTRY foreign-position — symbol already held",
+            logger.info("{} {} tick@{} NO-ENTRY foreign-position — symbol already held",
                         self.tag, symbol, self._entry_interval)
             return
 
@@ -200,25 +200,26 @@ class TrendPullbackLimit(Strategy):
         short → EMA_fast < EMA_slow AND close < EMA_slow.
         """
         p = self.params
+        rt = self._regime_interval
         candles = self._buffers[symbol].get(self._regime_interval) or []
         ema_fast_p = int(p.get("regime_ema_fast", 50))
         ema_slow_p = int(p.get("regime_ema_slow", 200))
 
         needed = ema_slow_p + 10
         if len(candles) < needed:
-            return False, False, f"warmup ({len(candles)}/{needed} candles)"
+            return False, False, f"regime@{rt} warmup ({len(candles)}/{needed} candles)"
 
         closes = [c["close"] for c in candles]
         fast = ema(closes, ema_fast_p)
         slow = ema(closes, ema_slow_p)
         if not fast or not slow:
-            return False, False, "ema-warmup"
+            return False, False, f"regime@{rt} ema-warmup"
 
         close_now = float(closes[-1])
         long_ok = fast[-1] > slow[-1] and close_now > slow[-1]
         short_ok = fast[-1] < slow[-1] and close_now < slow[-1]
-        diag = (f"close={close_now:.4f} EMA{ema_fast_p}={fast[-1]:.4f} "
-                f"EMA{ema_slow_p}={slow[-1]:.4f}")
+        diag = (f"regime@{rt} close({rt})={close_now:.4f} "
+                f"EMA{ema_fast_p}({rt})={fast[-1]:.4f} EMA{ema_slow_p}({rt})={slow[-1]:.4f}")
         return long_ok, short_ok, diag
 
     def _entry_level_and_atr(self, symbol: str) -> Optional[tuple[float, float, float]]:
@@ -250,13 +251,13 @@ class TrendPullbackLimit(Strategy):
         """
         long_ok, short_ok, regime_diag = self._regime_summary(symbol)
         if not long_ok and not short_ok:
-            logger.info("{} {} {} NO-ENTRY regime — {}",
+            logger.info("{} {} tick@{} NO-ENTRY regime — {}",
                         self.tag, symbol, self._entry_interval, regime_diag)
             return None
 
         lva = self._entry_level_and_atr(symbol)
         if lva is None:
-            logger.info("{} {} {} NO-ENTRY warmup — entry indicators not ready",
+            logger.info("{} {} tick@{} NO-ENTRY warmup — entry indicators not ready",
                         self.tag, symbol, self._entry_interval)
             return None
         ema_now, atr_now, close_now = lva
@@ -268,7 +269,7 @@ class TrendPullbackLimit(Strategy):
         if is_long:
             level = ema_now - offset_mult * atr_now
             if close_now <= level:
-                logger.info("{} {} {} NO-ENTRY close below pullback level "
+                logger.info("{} {} tick@{} NO-ENTRY close below pullback level "
                             "(close={:.4f} level={:.4f}) — would fill as taker",
                             self.tag, symbol, self._entry_interval, close_now, level)
                 return None
@@ -276,7 +277,7 @@ class TrendPullbackLimit(Strategy):
         else:
             level = ema_now + offset_mult * atr_now
             if close_now >= level:
-                logger.info("{} {} {} NO-ENTRY close above pullback level "
+                logger.info("{} {} tick@{} NO-ENTRY close above pullback level "
                             "(close={:.4f} level={:.4f}) — would fill as taker",
                             self.tag, symbol, self._entry_interval, close_now, level)
                 return None

@@ -58,6 +58,7 @@ day-trading-bot/
 │   ├── unit/                    # Fast unit tests — no network
 │   │   ├── test_indicators.py
 │   │   ├── test_general.py
+│   │   ├── test_market.py
 │   │   ├── test_state_manager.py
 │   │   ├── test_position_store.py
 │   │   ├── test_risk_guard.py
@@ -90,7 +91,7 @@ day-trading-bot/
 ## Architecture
 
 ### Bot.py (thin orchestrator)
-Loads config, builds the Binance client, fetches symbol info once, builds `StateManager` (which loads `state/positions.json`), builds `RiskGuard`, builds the configured strategies (each `attach_strategy`s itself to StateManager via the base class), prefetches warmup candles per unique `(symbol, interval)`, then calls `state_manager.start()` (sync resync + WS user-data stream + worker thread) and `strategy.adopt_pre_existing()` for each strategy to rehydrate any positions carried across restart. Finally opens a single WebSocket connection covering every `(symbol, interval)` pair and routes closed candles to matching strategies. No strategy logic, no risk logic, no order placement.
+Loads config, builds the Binance client, fetches symbol info once, builds `StateManager` (which loads `state/positions.json`), builds `RiskGuard`, builds the configured strategies (each `attach_strategy`s itself to StateManager via the base class), prefetches warmup candles per unique `(symbol, interval)` (dropping the trailing still-forming candle via `market.drop_forming_candle` — REST klines always include it, but the kline WS only delivers closed candles, so a forming candle seeded into a buffer would stay stale until it finally closes), then calls `state_manager.start()` (sync resync + WS user-data stream + worker thread) and `strategy.adopt_pre_existing()` for each strategy to rehydrate any positions carried across restart. Finally opens a single WebSocket connection covering every `(symbol, interval)` pair and routes closed candles to matching strategies. No strategy logic, no risk logic, no order placement.
 
 ### StateManager
 WebSocket-driven source of truth for live state. An authenticated Binance user-data WebSocket (`utils/user_stream.UserDataStream`) pushes `ACCOUNT_UPDATE` (position/balance changes) and `ORDER_TRADE_UPDATE` (order lifecycle) events in real time. A single worker thread drains the event queue:

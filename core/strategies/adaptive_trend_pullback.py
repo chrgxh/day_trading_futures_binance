@@ -158,7 +158,7 @@ class AdaptiveTrendPullback(Strategy):
             return
 
         if self.state_manager.has_position(symbol):
-            logger.info("{} {} {} NO-ENTRY foreign-position — symbol already held by another strategy",
+            logger.info("{} {} tick@{} NO-ENTRY foreign-position — symbol already held by another strategy",
                         self.tag, symbol, self._entry_interval)
             return
 
@@ -192,13 +192,13 @@ class AdaptiveTrendPullback(Strategy):
     def _compute_entry(self, symbol: str) -> Optional[tuple[Signal, float]]:
         long_ok, short_ok, regime_str = self._regime_summary(symbol)
         if not long_ok and not short_ok:
-            logger.info("{} {} {} NO-ENTRY regime — {}",
+            logger.info("{} {} tick@{} NO-ENTRY regime — {}",
                         self.tag, symbol, self._entry_interval, regime_str)
             return None
 
         ind = self._entry_indicators(symbol)
         if ind is None:
-            logger.info("{} {} {} NO-ENTRY warmup — entry indicators not ready",
+            logger.info("{} {} tick@{} NO-ENTRY warmup — entry indicators not ready",
                         self.tag, symbol, self._entry_interval)
             return None
 
@@ -215,15 +215,15 @@ class AdaptiveTrendPullback(Strategy):
                 return self._build_signal(symbol, ind, Action.OPEN_SHORT)
 
         if long_ok and short_ok:
-            logger.info("{} {} {} NO-ENTRY long-reject={}({}) short-reject={}({})",
+            logger.info("{} {} tick@{} NO-ENTRY long-reject={}({}) short-reject={}({})",
                         self.tag, symbol, self._entry_interval,
                         long_fail[0], long_fail[1], short_fail[0], short_fail[1])
         elif long_ok:
-            logger.info("{} {} {} NO-ENTRY long-reject — {} ({})",
+            logger.info("{} {} tick@{} NO-ENTRY long-reject — {} ({})",
                         self.tag, symbol, self._entry_interval,
                         long_fail[0], long_fail[1])
         else:
-            logger.info("{} {} {} NO-ENTRY short-reject — {} ({})",
+            logger.info("{} {} tick@{} NO-ENTRY short-reject — {} ({})",
                         self.tag, symbol, self._entry_interval,
                         short_fail[0], short_fail[1])
         return None
@@ -245,15 +245,16 @@ class AdaptiveTrendPullback(Strategy):
         ema_slow = int(p.get("regime_ema_slow", 200))
         slope_lookback = int(p.get("regime_slope_lookback", 5))
 
+        rt = self._regime_interval
         needed = ema_slow + slope_lookback + 1
         if len(candles) < needed:
-            return False, False, f"warmup ({len(candles)}/{needed} candles)"
+            return False, False, f"regime@{rt} warmup ({len(candles)}/{needed} candles)"
 
         closes = [c["close"] for c in candles]
         fast_series = ema(closes, ema_fast)
         slow_series = ema(closes, ema_slow)
         if len(fast_series) <= slope_lookback or not slow_series:
-            return False, False, "ema-warmup"
+            return False, False, f"regime@{rt} ema-warmup"
 
         close_now = float(closes[-1])
         ema_fast_now = fast_series[-1]
@@ -263,8 +264,11 @@ class AdaptiveTrendPullback(Strategy):
 
         long_ok = close_now > ema_slow_now and ema_fast_now > ema_slow_now and slope > 0
         short_ok = close_now < ema_slow_now and ema_fast_now < ema_slow_now and slope < 0
-        summary = (f"close={close_now:.4f} ema_slow={ema_slow_now:.4f} "
-                   f"ema_fast={ema_fast_now:.4f} slope={slope:+.4f}")
+        summary = (
+            f"regime@{rt} close({rt})={close_now:.4f} "
+            f"EMA{ema_fast}({rt})={ema_fast_now:.4f} EMA{ema_slow}({rt})={ema_slow_now:.4f} "
+            f"EMA{ema_fast}_slope[{slope_lookback}b]={slope:+.4f}"
+        )
         return long_ok, short_ok, summary
 
     def _entry_indicators(self, symbol: str) -> Optional[_EntryIndicators]:

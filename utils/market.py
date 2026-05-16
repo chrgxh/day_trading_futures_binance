@@ -123,6 +123,31 @@ def get_futures_ohlcv(
         raise
 
 
+def drop_forming_candle(candles: list[dict]) -> list[dict]:
+    """Drop a trailing still-forming candle, if present.
+
+    Binance REST klines always include the currently-forming candle as the
+    last element. Warmup must exclude it: the kline WebSocket delivers only
+    *closed* candles (``parse_kline_ws`` gates on ``k["x"]``), so a forming
+    candle seeded into a strategy buffer would never be refreshed until it
+    finally closes — leaving the strategy evaluating a stale, partial candle
+    for up to one full interval after startup.
+
+    Args:
+        candles: OHLCV candle dicts as returned by ``get_futures_ohlcv``.
+
+    Returns:
+        The list without its trailing candle if that candle has not closed yet
+        (``close_time`` at or after the current time); otherwise unchanged.
+    """
+    if not candles:
+        return candles
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if candles[-1]["close_time"] >= now_ms:
+        return candles[:-1]
+    return candles
+
+
 def parse_kline_ws(msg: dict) -> dict | None:
     """Parse a Binance WebSocket kline event and return the candle dict if the candle is closed.
 

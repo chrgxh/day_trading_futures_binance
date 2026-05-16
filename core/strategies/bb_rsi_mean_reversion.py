@@ -207,7 +207,7 @@ class BBRsiMeanReversion(Strategy):
             return
 
         if self.state_manager.has_position(symbol):
-            logger.info("{} {} {} NO-ENTRY foreign-position — symbol already held by another strategy",
+            logger.info("{} {} tick@{} NO-ENTRY foreign-position — symbol already held by another strategy",
                         self.tag, symbol, self._entry_interval)
             return
 
@@ -251,19 +251,19 @@ class BBRsiMeanReversion(Strategy):
     ) -> Optional[tuple[Signal, float, float, float, float]]:
         regime_ok, regime_str = self._regime_summary(symbol)
         if not regime_ok:
-            logger.info("{} {} {} NO-ENTRY regime — {}",
+            logger.info("{} {} tick@{} NO-ENTRY regime — {}",
                         self.tag, symbol, self._entry_interval, regime_str)
             return None
 
         macro_direction, macro_str = self._macro_direction(symbol)
         if macro_direction == "NEUTRAL":
-            logger.info("{} {} {} NO-ENTRY macro — {}",
+            logger.info("{} {} tick@{} NO-ENTRY macro — {}",
                         self.tag, symbol, self._entry_interval, macro_str)
             return None
 
         ind = self._entry_indicators(symbol)
         if ind is None:
-            logger.info("{} {} {} NO-ENTRY warmup — entry indicators not ready",
+            logger.info("{} {} tick@{} NO-ENTRY warmup — entry indicators not ready",
                         self.tag, symbol, self._entry_interval)
             return None
 
@@ -271,7 +271,7 @@ class BBRsiMeanReversion(Strategy):
             long_fail = self._first_failed_long_gate(symbol, ind)
             if long_fail is None:
                 return self._build_signal(symbol, ind, Action.OPEN_LONG)
-            logger.info("{} {} {} NO-ENTRY macro-UP long-reject={}({})",
+            logger.info("{} {} tick@{} NO-ENTRY macro-UP long-reject={}({})",
                         self.tag, symbol, self._entry_interval,
                         long_fail[0], long_fail[1])
             return None
@@ -280,7 +280,7 @@ class BBRsiMeanReversion(Strategy):
         short_fail = self._first_failed_short_gate(symbol, ind)
         if short_fail is None:
             return self._build_signal(symbol, ind, Action.OPEN_SHORT)
-        logger.info("{} {} {} NO-ENTRY macro-DOWN short-reject={}({})",
+        logger.info("{} {} tick@{} NO-ENTRY macro-DOWN short-reject={}({})",
                     self.tag, symbol, self._entry_interval,
                     short_fail[0], short_fail[1])
         return None
@@ -296,6 +296,7 @@ class BBRsiMeanReversion(Strategy):
         trade.
         """
         p = self.params
+        rt = self._regime_interval
         candles = self._buffers[symbol].get(self._regime_interval) or []
         adx_period = int(p.get("regime_adx_period", 14))
         adx_max_range = float(p.get("regime_adx_max_range", 20.0))
@@ -306,32 +307,35 @@ class BBRsiMeanReversion(Strategy):
 
         needed = max(adx_period * 2 + 5, ema_slow_p + 5)
         if len(candles) < needed:
-            return False, f"warmup ({len(candles)}/{needed} candles)"
+            return False, f"regime@{rt} warmup ({len(candles)}/{needed} candles)"
 
         adx_series = adx(candles, adx_period)
         if not adx_series:
-            return False, "adx-warmup"
+            return False, f"regime@{rt} adx-warmup"
         adx_now = adx_series[-1]
 
         if adx_now > adx_min_trend:
-            return False, f"trending (ADX={adx_now:.2f} > {adx_min_trend})"
+            return False, f"regime@{rt} trending (ADX{adx_period}({rt})={adx_now:.2f} > {adx_min_trend})"
         if adx_now > adx_max_range:
-            return False, f"gray-zone (ADX={adx_now:.2f} in ({adx_max_range}, {adx_min_trend}])"
+            return False, (f"regime@{rt} gray-zone "
+                           f"(ADX{adx_period}({rt})={adx_now:.2f} in ({adx_max_range}, {adx_min_trend}])")
 
         closes = [c["close"] for c in candles]
         fast = ema(closes, ema_fast_p)
         slow = ema(closes, ema_slow_p)
         if not fast or not slow:
-            return False, "ema-warmup"
+            return False, f"regime@{rt} ema-warmup"
         close_now = float(closes[-1])
         if close_now <= 0:
-            return False, "invalid-close"
+            return False, f"regime@{rt} invalid-close"
         sep = abs(fast[-1] - slow[-1]) / close_now
         if sep > flatness_pct:
-            return False, (f"trending-emas (sep={sep*100:.2f}% > "
-                           f"{flatness_pct*100:.2f}%, ADX={adx_now:.2f})")
+            return False, (f"regime@{rt} trending-emas "
+                           f"(EMA{ema_fast_p}/EMA{ema_slow_p}({rt}) sep={sep*100:.2f}% > "
+                           f"{flatness_pct*100:.2f}%, ADX{adx_period}={adx_now:.2f})")
 
-        return True, f"range (ADX={adx_now:.2f}, ema_sep={sep*100:.2f}%)"
+        return True, (f"regime@{rt} range (ADX{adx_period}({rt})={adx_now:.2f}, "
+                      f"EMA{ema_fast_p}/EMA{ema_slow_p} sep={sep*100:.2f}%)")
 
     def _regime_adx_now(self, symbol: str) -> Optional[float]:
         """Just the current ADX on the regime interval. None if not warmed up."""
@@ -348,25 +352,27 @@ class BBRsiMeanReversion(Strategy):
         NEUTRAL: anything else → skip all entries (avoids whipsaw in ambiguous macro).
         """
         p = self.params
+        mt = self._macro_interval
         candles = self._buffers[symbol].get(self._macro_interval) or []
         ema_fast_p = int(p.get("macro_ema_fast", 50))
         ema_slow_p = int(p.get("macro_ema_slow", 200))
 
         needed = ema_slow_p + 10
         if len(candles) < needed:
-            return "NEUTRAL", f"warmup ({len(candles)}/{needed} candles)"
+            return "NEUTRAL", f"macro@{mt} warmup ({len(candles)}/{needed} candles)"
 
         closes = [c["close"] for c in candles]
         fast = ema(closes, ema_fast_p)
         slow = ema(closes, ema_slow_p)
         if not fast or not slow:
-            return "NEUTRAL", "ema-warmup"
+            return "NEUTRAL", f"macro@{mt} ema-warmup"
 
         close_now = float(closes[-1])
         ema_fast_now = fast[-1]
         ema_slow_now = slow[-1]
-        diag = (f"close={close_now:.4f} EMA{ema_fast_p}={ema_fast_now:.4f} "
-                f"EMA{ema_slow_p}={ema_slow_now:.4f}")
+        diag = (f"macro@{mt} close({mt})={close_now:.4f} "
+                f"EMA{ema_fast_p}({mt})={ema_fast_now:.4f} "
+                f"EMA{ema_slow_p}({mt})={ema_slow_now:.4f}")
 
         if close_now > ema_slow_now and ema_fast_now > ema_slow_now:
             return "UP", f"macro-UP ({diag})"
