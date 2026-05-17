@@ -213,6 +213,13 @@ state_manager:
     enabled: true
     csv_file: logs/pnl.csv
 
+warmup_cache:
+  # Persist warmup candle buffers to a single JSON file so a restart re-fetches
+  # only the candles that closed while the bot was down, instead of the full
+  # history. Cuts the cold-start REST burst that trips Binance's -1003 IP ban.
+  enabled: true
+  file: state/warmup_cache.json
+
 logging:
   level: INFO
   log_file: logs/bot.log

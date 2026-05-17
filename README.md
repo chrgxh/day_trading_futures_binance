@@ -120,6 +120,12 @@ docker compose up --build
 
 `StateManager` is the single source of truth for live state — positions, orders, daily P&L. It is driven by the authenticated Binance user-data WebSocket: account/order events trigger a targeted REST refresh of the affected symbol, and a low-frequency full REST resync runs as a safety net (and after every reconnect) to correct any event drift. It cancels orphan orders and warns on untracked positions; it never tries to manage positions itself. It also owns a small JSON cache at `state/positions.json` mapping each live position to the strategy that opened it plus that strategy's saved state and exit order IDs; the file is rewritten atomically on every state refresh and used by strategies to resume managing positions across restarts. `RiskGuard` is a stateless gate that reads StateManager and enforces max-positions / one-per-symbol / daily-loss limits. Strategies receive closed candles via WebSocket, ask StateManager whether their symbol is free, compute a signal, and (for OPEN actions) consult RiskGuard before placing orders themselves. Each strategy can optionally attach a `LiveTradeManager` that subscribes to StateManager updates for post-fill lifecycle. The bot itself only does wiring and WebSocket routing.
 
+## Warmup cache
+
+At startup each strategy's candle buffers are seeded from REST history. To avoid the cold-start request burst (which can trip Binance's `-1003` IP ban — especially on the CloudFront-fronted testnet, where the rate-limit bucket is shared across clients on the same edge POP), the buffers are cached to a single JSON file (`state/warmup_cache.json`). A restart then re-fetches only the candles that closed while the bot was down — often a handful, or none. Toggle via the `warmup_cache` block in `config.yaml`.
+
+`python -m scripts.prefetch_warmup` populates the cache without starting the bot — useful to retry warmup independently after a ban, or to prefetch from a different IP and copy `state/warmup_cache.json` to the server.
+
 ## Daily P&L report
 
 At 00:00:05 UTC each day the bot:

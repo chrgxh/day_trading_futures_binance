@@ -25,6 +25,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
+from core.warmup_cache import WarmupCache
 from core.risk_guard import RiskGuard
 from core.state_manager import StateManager
 from core.strategies import STRATEGIES
@@ -121,7 +122,15 @@ def unique_intervals(strategies: Iterable[Strategy]) -> list[str]:
     return seen
 
 
-def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) -> None:
+def warmup_strategies(
+    client, strategies: list[Strategy], symbols: list[str], cache: WarmupCache,
+) -> None:
+    """Seed every strategy's candle buffers via the warmup cache.
+
+    `cache.get_warmup` serves each (symbol, interval) from the disk cache,
+    re-fetching only the candles that closed since the last run (or all of
+    them, when the cache is empty/stale/disabled).
+    """
     # Group (strategy, interval) requests by interval; fetch enough candles per
     # symbol to satisfy the most-demanding strategy at that interval.
     by_interval: dict[str, list[Strategy]] = {}
@@ -130,20 +139,16 @@ def warmup_strategies(client, strategies: list[Strategy], symbols: list[str]) ->
             by_interval.setdefault(interval, []).append(s)
     for interval, ss in by_interval.items():
         limit = max(s.candle_limit(interval) for s in ss)
-        logger.info("Warmup @ {}: fetching {} candles per symbol", interval, limit)
+        logger.info("Warmup @ {}: up to {} candles per symbol", interval, limit)
         for i, symbol in enumerate(symbols):
-            # Fetch one extra: REST klines always include the still-forming
-            # candle as the last element, which drop_forming_candle removes —
-            # the kline WS only ever delivers closed candles, so a forming
-            # candle seeded here would stay stale until it finally closes.
-            candles = market.get_futures_ohlcv(client, symbol, interval, limit=limit + 1)
-            candles = market.drop_forming_candle(candles)
+            candles = cache.get_warmup(client, symbol, interval, limit)
             for s in ss:
                 s.warmup(symbol, interval, candles)
-            # Pace the warmup burst: a deep-history kline call (limit > 1000)
+            # Pace any REST burst: a deep-history kline call (limit > 1000)
             # costs request weight 10, so fetching every (symbol, interval)
             # back-to-back spikes weight in a single second and trips Binance's
-            # -1003 IP ban. A short sleep between symbols spreads the burst.
+            # -1003 IP ban. A short sleep between symbols spreads the burst —
+            # harmless and near-free on a cache hit (no REST call made).
             if i < len(symbols) - 1:
                 time.sleep(0.3)
 
@@ -201,7 +206,12 @@ def _run() -> None:
         cfg, client=client, sym_infos=sym_infos,
         state_manager=state_manager, risk_guard=risk_guard, symbols=symbols,
     )
-    warmup_strategies(client, strategies, symbols)
+
+    wc_cfg = cfg.get("warmup_cache", {}) or {}
+    cache_path = wc_cfg.get("file", "state/warmup_cache.json") if wc_cfg.get("enabled", True) else None
+    warmup_cache = WarmupCache(cache_path)
+    warmup_strategies(client, strategies, symbols, warmup_cache)
+    warmup_cache.save()  # persist any gap-filled buffers before the run begins
 
     # Strategies are now built (state_manager.attach_strategy called for each)
     # and warmed up. Start the state manager — the first sync resync prunes
@@ -242,12 +252,16 @@ def _run() -> None:
             if item is None:
                 break
             symbol, interval, candle = item
+            warmup_cache.update(symbol, interval, candle)
             for s in by_interval.get(interval, []):
                 if symbol in s.symbols:
                     s.on_candle(symbol, interval, candle)
     finally:
         state_manager.stop()
         twm.stop()
+        # Persist the live candle buffers so the next start re-fetches only the
+        # candles that closed while the bot was down (see core/warmup_cache.py).
+        warmup_cache.save()
         logger.info("Shutdown complete.")
 
 

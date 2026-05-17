@@ -25,6 +25,7 @@ day-trading-bot/
 │   ├── types.py                 # Position, Action, Signal, SymbolState dataclasses
 │   ├── state_manager.py         # Single Binance poller, source of truth for live state
 │   ├── position_store.py        # Persistent JSON store: symbol → owning strategy + state + order IDs
+│   ├── warmup_cache.py          # Disk cache for warmup candles — restart re-fetches only the gap
 │   ├── risk_guard.py            # Entry gate: max positions, one-per-symbol, daily loss
 │   ├── pnl_reporter.py          # Daily P&L CSV + email report (lifecycle owned by StateManager)
 │   └── strategies/
@@ -43,7 +44,9 @@ day-trading-bot/
 │   ├── market.py                # Public market data: OHLCV, mark price, multi-(symbol,interval) WS with gap recovery
 │   ├── user_stream.py           # Authenticated user-data WS (SDK ThreadedWebsocketManager): account/order event delivery
 │   └── indicators.py            # Raw indicators (SMA, EMA, MACD, ADX, ATR, RSI, bollinger_bands, daily_anchored_vwap, resample_to_1h)
-├── config.yaml                  # symbols, strategies list (each declares its own intervals), risk_guard, state_manager, logging
+├── config.yaml                  # symbols, strategies list (each declares its own intervals), risk_guard, state_manager, warmup_cache, logging
+├── scripts/
+│   └── prefetch_warmup.py        # Standalone warmup-cache prefetch (no bot lifecycle)
 ├── .env                         # Secrets ONLY — never committed
 ├── .env.example
 ├── .env.testnet                 # Testnet secrets for integration tests — never committed
@@ -76,7 +79,7 @@ day-trading-bot/
 │       ├── test_positions.py
 │       └── test_notifications.py
 ├── logs/                        # Mounted volume, not in image
-├── state/                       # Mounted volume — positions.json (owning-strategy cache)
+├── state/                       # Mounted volume — positions.json (owning-strategy cache) + warmup_cache.json (candle cache)
 └── sandbox.ipynb                # Manual testnet notebook
 ```
 
@@ -91,7 +94,7 @@ day-trading-bot/
 ## Architecture
 
 ### Bot.py (thin orchestrator)
-Loads config, builds the Binance client, fetches symbol info once, builds `StateManager` (which loads `state/positions.json`), builds `RiskGuard`, builds the configured strategies (each `attach_strategy`s itself to StateManager via the base class), prefetches warmup candles per unique `(symbol, interval)` (dropping the trailing still-forming candle via `market.drop_forming_candle` — REST klines always include it, but the kline WS only delivers closed candles, so a forming candle seeded into a buffer would stay stale until it finally closes), then calls `state_manager.start()` (sync resync + WS user-data stream + worker thread) and `strategy.adopt_pre_existing()` for each strategy to rehydrate any positions carried across restart. Finally opens a single WebSocket connection covering every `(symbol, interval)` pair and routes closed candles to matching strategies. No strategy logic, no risk logic, no order placement.
+Loads config, builds the Binance client, fetches symbol info once, builds `StateManager` (which loads `state/positions.json`), builds `RiskGuard`, builds the configured strategies (each `attach_strategy`s itself to StateManager via the base class), prefetches warmup candles per unique `(symbol, interval)` via the warmup disk cache (see *WarmupCache* — the trailing still-forming candle is dropped via `market.drop_forming_candle`: REST klines always include it, but the kline WS only delivers closed candles, so a forming candle seeded into a buffer would stay stale until it finally closes), then calls `state_manager.start()` (sync resync + WS user-data stream + worker thread) and `strategy.adopt_pre_existing()` for each strategy to rehydrate any positions carried across restart. Finally opens a single WebSocket connection covering every `(symbol, interval)` pair and routes closed candles to matching strategies. On shutdown the live candle buffers are flushed back to the warmup cache. No strategy logic, no risk logic, no order placement.
 
 ### StateManager
 WebSocket-driven source of truth for live state. An authenticated Binance user-data WebSocket (`utils/user_stream.UserDataStream`) pushes `ACCOUNT_UPDATE` (position/balance changes) and `ORDER_TRADE_UPDATE` (order lifecycle) events in real time. A single worker thread drains the event queue:
@@ -129,6 +132,18 @@ StateManager). The field is additive — entries written before it existed load 
 `"open"`, so no schema-version bump was needed.
 
 Writes use a write-to-temp-then-rename so crashes never leave a partial file. A corrupt or wrong-version file is quarantined (`<file>.corrupt-<ts>`) and the store starts empty. Lifecycle is owned by `StateManager` — no other module touches it.
+
+### WarmupCache (`core/warmup_cache.py`)
+A `WarmupCache` object backed by a single JSON file (`state/warmup_cache.json` by default) holding every `(symbol, interval)` candle buffer under string keys `"<SYMBOL>|<interval>"`. Configured by the `warmup_cache` block in `config.yaml` (`enabled`, `file`); constructed with `path=None` when disabled, in which case it always full-fetches and `update`/`save` are no-ops.
+
+A cold start otherwise fetches every strategy buffer in full — a burst of weighted kline calls that, on the CloudFront-fronted **testnet** (`testnet.binancefuture.com` is a CNAME to AWS CloudFront), shares a rate-limit bucket with every other client on the same edge POP and reliably trips Binance's `-1003` IP ban regardless of the bot's own request volume. The cache makes a restart re-fetch only the candles that closed while the bot was down.
+
+The object owns the whole lifecycle — `bot.py` calls only these three methods, no cache-vs-fetch logic leaks into the orchestrator:
+- `get_warmup(client, symbol, interval, limit)` — the read-or-fetch entry point used by `warmup_strategies`. Reads the in-memory buffer (loaded from the file at construction), computes how many candles closed since (`elapsed = (now − last_open_time) // interval_ms`), and: `elapsed ≤ 1` → cache hit, no REST call; `1 < elapsed < limit` → gap-fetch only the missing candles and `_merge` (de-dup by `open_time`); no/short (`< limit`)/too-stale (`elapsed ≥ limit`) cache → full fetch. Result trimmed to `limit`, trailing forming candle dropped.
+- `update(symbol, interval, candle)` — called from the bot's candle-routing loop on every closed candle; appends it to the in-memory buffer (replacing on duplicate `open_time`) and trims the oldest past `candle_limit`. Memory only.
+- `save()` — atomically rewrites the whole file (write-to-temp-then-rename). Called by `bot._run` after warmup and on shutdown; `get_warmup` does **not** persist, so the candle-routing loop never blocks on disk I/O.
+- The cache stores **only closed candles**; each buffer is capped at `candle_limit`, so the file is a fixed-size rolling window (~2 MB total) that never grows. A missing/corrupt/wrong-version file logs a warning and starts empty — the cache is an optimisation, never a correctness dependency.
+- `scripts/prefetch_warmup.py` is a standalone entry point: it builds the configured strategies and runs `warmup_strategies` to populate the cache **without** starting the bot. Retryable independently of the bot lifecycle on a `-1003`, and can be run from a different IP — copy `state/warmup_cache.json` to the server and the bot starts with zero warmup REST.
 
 ### RiskGuard
 Stateless gate. `allow_open(symbol, strategy)` returns False if:
