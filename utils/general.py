@@ -1,6 +1,7 @@
 """Shared primitives — client factory, retry wrapper, and order normalizers."""
 
 import os
+import re
 import time
 import traceback
 from datetime import datetime
@@ -53,6 +54,49 @@ def send_crash_email(exc: BaseException) -> str | None:
         return email_id
     except Exception as mail_exc:
         logger.error("Failed to send crash email: {}", mail_exc)
+        return None
+
+
+def send_ban_email(exc: Exception, sleep_secs: float) -> str | None:
+    """Send a notification email when a Binance -1003 IP ban is hit.
+
+    Reads RESEND_API_KEY, CRASH_NOTIFY_EMAIL, and CRASH_NOTIFY_FROM_EMAIL from
+    the environment. Logs a warning and returns None if any are missing so a
+    misconfigured notifier never masks the ban itself.
+
+    Args:
+        exc: The -1003 exception raised by the banned Binance call.
+        sleep_secs: How long with_retry will sleep before retrying.
+
+    Returns:
+        The Resend email ID on success, or None if skipped or failed.
+    """
+    api_key = os.getenv("RESEND_API_KEY")
+    to_email = os.getenv("CRASH_NOTIFY_EMAIL")
+    from_email = os.getenv("CRASH_NOTIFY_FROM_EMAIL")
+    if not api_key or not to_email or not from_email:
+        logger.warning("Ban email not sent — RESEND_API_KEY, CRASH_NOTIFY_EMAIL, or CRASH_NOTIFY_FROM_EMAIL not set.")
+        return None
+
+    resend.api_key = api_key
+    body = (
+        f"<p>The bot hit a Binance <b>-1003</b> IP ban. It will sleep "
+        f"<b>{sleep_secs:.0f}s</b> until the ban lifts, then retry.</p>"
+        f"<pre>{type(exc).__name__}: {exc}</pre>"
+    )
+
+    try:
+        response = resend.Emails.send({
+            "from": from_email,
+            "to": [to_email],
+            "subject": "[Bot] Binance IP ban (-1003)",
+            "html": body,
+        })
+        email_id = response["id"]
+        logger.info("Ban notification email sent to {}. id={}", to_email, email_id)
+        return email_id
+    except Exception as mail_exc:
+        logger.error("Failed to send ban email: {}", mail_exc)
         return None
 
 
@@ -176,8 +220,45 @@ def build_client(api_key: str, api_secret: str, testnet: bool = True) -> Client:
     return client
 
 
+# Binance -1003 ban messages carry the unban time as an epoch-ms integer, e.g.
+# "...IP(1.2.3.4) banned until 1778975969998. Please use the websocket...".
+_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
+
+# Safety cap on ban waits: guards against a malformed/garbage timestamp pinning
+# us in sleep for hours. A genuine escalated -1003 ban rarely exceeds this.
+_MAX_BAN_WAIT_SECS = 1800.0
+
+# A single banned window can trip -1003 on many consecutive calls; throttle the
+# notification so one ban episode sends one email, not one per failed request.
+_BAN_EMAIL_THROTTLE_SECS = 900.0
+_last_ban_email_at: float = 0.0
+
+
+def _ban_wait_secs(exc: Exception) -> float | None:
+    """Return seconds to wait out a Binance -1003 IP ban, or None if not a ban.
+
+    Parses the "banned until <epoch-ms>" timestamp from the exception message
+    and returns how long from now until the ban lifts (never negative).
+
+    Args:
+        exc: The exception raised by a failed Binance call.
+
+    Returns:
+        Seconds until the ban expires, or None if `exc` is not a -1003 ban.
+    """
+    match = _BAN_UNTIL_RE.search(str(exc))
+    if match is None:
+        return None
+    ban_until = int(match.group(1)) / 1000.0
+    return max(ban_until - time.time(), 0.0)
+
+
 def with_retry(fn, retries: int = 3, backoff: float = 2.0):
     """Call fn(), retrying up to `retries` times with exponential backoff.
+
+    On a Binance -1003 IP ban the fixed backoff is abandoned: retrying before
+    the ban lifts cannot succeed and each rejected request can extend the ban,
+    so we sleep until the ban's own "banned until" timestamp instead.
 
     Args:
         fn: Zero-argument callable to attempt.
@@ -197,6 +278,22 @@ def with_retry(fn, retries: int = 3, backoff: float = 2.0):
             return fn()
         except (BinanceAPIException, BinanceRequestException, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
             last_exc = exc
+            ban_wait = _ban_wait_secs(exc)
+            if ban_wait is not None:
+                # -1003 IP ban: wait out the exact ban window (+1s slack)
+                # rather than hammering it with the exponential backoff.
+                global _last_ban_email_at
+                sleep_for = min(ban_wait + 1.0, _MAX_BAN_WAIT_SECS)
+                logger.warning(
+                    "Attempt {}/{} hit IP ban (-1003): {}. Sleeping {:.1f}s until the ban lifts.",
+                    attempt, retries, exc, sleep_for,
+                )
+                now = time.time()
+                if now - _last_ban_email_at >= _BAN_EMAIL_THROTTLE_SECS:
+                    _last_ban_email_at = now
+                    send_ban_email(exc, sleep_for)
+                time.sleep(sleep_for)
+                continue
             logger.warning("Attempt {}/{} failed: {}. Retrying in {}s.", attempt, retries, exc, delay)
             time.sleep(delay)
             delay *= 2
